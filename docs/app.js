@@ -73,24 +73,12 @@ function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
 function showLogin() {
-  // 顯示登入層
   loginLayer.classList.remove('hidden');
-  loginLayer.style.display = 'flex';   // 你的登入框若本來是 flex 置中，改回 flex
-  loginLayer.style.opacity = '1';
-  loginLayer.style.pointerEvents = 'auto';
-
   app.classList.add('hidden');
-  app.style.filter = 'blur(0)'; // 保險，不做模糊
 }
 function showApp() {
-  // 隱藏登入層（雙保險）
   loginLayer.classList.add('hidden');
-  loginLayer.style.display = 'none';
-  loginLayer.style.opacity = '0';
-  loginLayer.style.pointerEvents = 'none';
-
   app.classList.remove('hidden');
-  app.style.filter = 'none';
 }
 
 // 登入/登出事件
