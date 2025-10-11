@@ -1,5 +1,5 @@
 // ====== 調整這個成你的後端 API 網址 ======
-const API_BASE = 'http://localhost:8787/api';
+const API_BASE = 'https://s87878790ccc-tech.github.io/LUNCH2/';
 
 // ====== DOM ======
 const app = document.getElementById('app');
