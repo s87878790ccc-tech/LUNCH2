@@ -20,7 +20,7 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // ====== Middleware ======
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true })); // 上線後改成白名單（下方說明）
+app.use(cors({ origin: true, credentials: true })); // 上線可改白名單
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
@@ -80,17 +80,7 @@ CREATE TABLE IF NOT EXISTS audit_logs(
 );
 `);
 
-// seed admin
-(function seedAdmin(){
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(process.env.ADMIN_DEFAULT_USER || 'admin');
-  if (!u) {
-    const hash = bcrypt.hashSync(process.env.ADMIN_DEFAULT_PASS || 'admin123', 10);
-    db.prepare('INSERT INTO users(username, password_hash, role) VALUES(?,?,?)')
-      .run(process.env.ADMIN_DEFAULT_USER || 'admin', hash, 'admin');
-    console.log('[seed] admin created:', process.env.ADMIN_DEFAULT_USER || 'admin');
-  }
-})();
-
+// ====== Helpers ======
 function nowISO(){ return new Date().toISOString(); }
 function sign(user){ return jwt.sign({ uid:user.id, username:user.username, role:user.role }, JWT_SECRET, { expiresIn: '7d' }); }
 function auth(required=true){
@@ -114,8 +104,6 @@ function logAction(user, action, details, req){
     .run(user?.uid || null, action, details ? JSON.stringify(details) : null,
          req.ip, req.headers['user-agent'] || '', nowISO());
 }
-
-// helpers
 function ensureOrder(seat){
   let o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
   if (!o) {
@@ -125,6 +113,31 @@ function ensureOrder(seat){
   }
   return o;
 }
+// 一般使用者只能操作自己的座號
+function seatAllowed(req, seatNumber) {
+  if (req.user?.role === 'admin') return true;
+  const mySeat = Number(req.user?.username);
+  return mySeat === Number(seatNumber);
+}
+
+// ====== Seed users ======
+(function seedAdmin(){
+  const u = db.prepare('SELECT * FROM users WHERE username=?').get(process.env.ADMIN_DEFAULT_USER || 'admin');
+  if (!u) {
+    const hash = bcrypt.hashSync(process.env.ADMIN_DEFAULT_PASS || 'admin123', 10);
+    db.prepare('INSERT INTO users(username, password_hash, role) VALUES(?,?,?)')
+      .run(process.env.ADMIN_DEFAULT_USER || 'admin', hash, 'admin');
+    console.log('[seed] admin created:', process.env.ADMIN_DEFAULT_USER || 'admin');
+  }
+})();
+
+(function seedSeatUsers(){
+  const defaultPass = process.env.SEAT_DEFAULT_PASS || '123456';
+  const hash = bcrypt.hashSync(defaultPass, 10);
+  const insert = db.prepare('INSERT OR IGNORE INTO users(username, password_hash, role) VALUES(?,?,?)');
+  for (let s = 1; s <= 36; s++) insert.run(String(s), hash, 'user');
+  console.log('[seed] seat users 1~36 ready (default pass = 123456)');
+})();
 
 // ===== Auth =====
 app.post('/api/auth/login', (req,res)=>{
@@ -214,24 +227,17 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, (req,res)=>{
   res.json({ ok:true });
 });
 
-// ===== Orders =====
-function ensureOrder(seat){
-  let o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
-  if (!o) {
-    db.prepare('INSERT INTO orders(seat, submitted, created_at, updated_at) VALUES(?,?,?,?)')
-      .run(seat, 0, nowISO(), nowISO());
-    o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
-  }
-  return o;
-}
-app.get('/api/orders/:seat', auth(false), (req,res)=>{
+// ===== Orders（需登入；一般使用者僅能操作自己的座號）=====
+app.get('/api/orders/:seat', auth(), (req,res)=>{
   const seat = Number(req.params.seat);
+  if (!seatAllowed(req, seat)) return res.status(403).json({ message:'forbidden' });
   const o = ensureOrder(seat);
   const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(o.id);
   res.json({ seat, submitted: !!o.submitted, items: items.map(i=>({id:i.id,name:i.name,unitPrice:i.unit_price,qty:i.qty})) });
 });
 app.put('/api/orders/:seat', auth(), (req,res)=>{
   const seat = Number(req.params.seat);
+  if (!seatAllowed(req, seat)) return res.status(403).json({ message:'forbidden' });
   const { submitted, items } = req.body || {};
   const tx = db.transaction(()=>{
     const o = ensureOrder(seat);
@@ -247,7 +253,9 @@ app.put('/api/orders/:seat', auth(), (req,res)=>{
   logAction(req.user, 'order.update', {seat, submitted, itemsCount: items?.length||0}, req);
   res.json({ ok:true });
 });
-app.get('/api/reports/aggregate', auth(false), (req,res)=>{
+
+// ===== Reports / Missing（僅 admin）=====
+app.get('/api/reports/aggregate', auth(), requireAdmin, (req,res)=>{
   const rows = db.prepare(`
     SELECT name, SUM(qty) AS totalQty, SUM(unit_price*qty) AS totalMoney
     FROM order_items oi
@@ -258,7 +266,7 @@ app.get('/api/reports/aggregate', auth(false), (req,res)=>{
   const total = rows.reduce((s,r)=>s + (r.totalMoney||0), 0);
   res.json({ items: rows, classTotal: total });
 });
-app.get('/api/reports/missing', auth(false), (req,res)=>{
+app.get('/api/reports/missing', auth(), requireAdmin, (req,res)=>{
   const missing = [];
   for(let s=1;s<=36;s++){
     const r = db.prepare('SELECT submitted FROM orders WHERE seat=?').get(s);
@@ -267,7 +275,7 @@ app.get('/api/reports/missing', auth(false), (req,res)=>{
   res.json({ missing });
 });
 
-// ===== Users (admin) =====
+// ===== Users =====
 app.post('/api/users', auth(), requireAdmin, (req, res) => {
   const { username, password, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
@@ -307,12 +315,13 @@ app.put('/api/users/:id/password', auth(), (req, res) => {
   res.json({ ok:true });
 });
 
-// ===== Logs (admin) =====
+// ===== Logs（admin）=====
 app.get('/api/logs', auth(), requireAdmin, (req,res)=>{
   const rows = db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 500').all();
   res.json({ logs: rows });
 });
 
+// ===== Root =====
 app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
 });
