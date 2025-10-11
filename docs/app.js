@@ -127,6 +127,28 @@ logoutBtn.onclick = () => {
   localStorage.removeItem('jwt'); token = null; showLogin();
 };
 
+createUserBtn?.addEventListener('click', async () => {
+  if (!state.me || state.me.role !== 'admin') {
+    alert('權限不足：只有管理員可以建立新帳號');
+    return;
+  }
+  const username = newUserName.value.trim();
+  const password = newUserPass.value;
+  const role     = newUserRole.value;
+  if (!username || !password || password.length < 6) {
+    alert('請填帳號與密碼(>=6)');
+    return;
+  }
+  try {
+    await createUser(username, password, role);
+    newUserName.value = ''; newUserPass.value = '';
+    await loadUsers();
+    alert('已建立');
+  } catch (e) {
+    alert('建立失敗：' + e.message);
+  }
+});
+
 // ====== Auth / API ======
 async function api(path, options = {}) {
   const res = await fetch(API_BASE + path, {
@@ -150,13 +172,21 @@ function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
   const isAdmin = user.role === 'admin';
-  // 一般：只看 訂單/使用者；Admin：全部可見
+
+  // Tab 顯示
   tabOrders.classList.toggle('hidden', false);
   tabUsers.classList.toggle('hidden', false);
   tabMenus.classList.toggle('hidden', !isAdmin);
   tabReports.classList.toggle('hidden', !isAdmin);
   tabLogs.classList.toggle('hidden', !isAdmin);
+
+  // 區塊顯示：標上 .only-admin / .only-user 的區塊，就會自動切換
+  document.querySelectorAll('.only-admin')
+    .forEach(el => el.classList.toggle('hidden', !isAdmin));
+  document.querySelectorAll('.only-user')
+    .forEach(el => el.classList.toggle('hidden', isAdmin));
 }
+
 
 // ====== UI 切頁 ======
 function switchTab(which){
