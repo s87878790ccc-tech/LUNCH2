@@ -65,6 +65,50 @@ const newUserRole = document.getElementById('newUserRole');
 const createUserBtn = document.getElementById('createUserBtn');
 const usersTableBody = document.getElementById('usersTableBody');
 
+// ====== 基礎：Auth 狀態與 UI 顯示 ======
+let token = localStorage.getItem('jwt') || null;   // 讀取既有 JWT
+apiBaseHint.textContent = `API: ${API_BASE}`;
+
+function authHeader() {
+  return token ? { 'Authorization': 'Bearer ' + token } : {};
+}
+function showLogin() {
+  loginLayer.classList.remove('hidden');
+  app.classList.add('hidden');
+}
+function showApp() {
+  loginLayer.classList.add('hidden');
+  app.classList.remove('hidden');
+}
+
+// 登入/登出事件
+loginBtn.onclick = async () => {
+  loginMsg.textContent = '';
+  try {
+    const data = await api('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: loginUser.value.trim(),
+        password: loginPass.value
+      })
+    });
+    token = data.token;
+    localStorage.setItem('jwt', token);
+    onLoginUser(data.user);
+    await initApp();
+    switchTab('orders');
+    showApp();
+  } catch (e) {
+    loginMsg.textContent = '登入失敗：' + e.message;
+  }
+};
+
+logoutBtn.onclick = () => {
+  localStorage.removeItem('jwt');
+  token = null;
+  showLogin();
+};
+
 // ====== Auth / API ======
 async function api(path, options = {}) {
   const res = await fetch(API_BASE + path, {
