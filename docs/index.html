@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>班級午餐訂單系統（前端）</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- 登入層 -->
+  <div id="loginLayer" class="layer">
+    <div class="card w400">
+      <h2>後台登入</h2>
+      <input id="loginUser" placeholder="帳號" />
+      <input id="loginPass" placeholder="密碼" type="password" />
+      <button id="loginBtn" class="primary">登入</button>
+      <div id="loginMsg" class="muted small"></div>
+    </div>
+  </div>
+
+  <!-- 主畫面 -->
+  <div id="app" class="hidden">
+    <div class="topbar">
+      <div class="left">
+        <strong>🍱 班級午餐訂單系統</strong>
+        <span class="muted small" id="apiBaseHint"></span>
+      </div>
+      <div class="right">
+        <button id="tabOrders" class="tab active">訂單</button>
+        <button id="tabMenus" class="tab">菜單</button>
+        <button id="tabReports" class="tab">後台</button>
+        <button id="tabLogs" class="tab hidden">Logs</button>
+        <button id="tabUsers" class="tab hidden">使用者</button>
+        <span id="whoami" class="pill"></span>
+        <button id="logoutBtn">登出</button>
+      </div>
+    </div>
+
+    <!-- 訂單頁 -->
+    <section id="pageOrders">
+      <div class="grid">
+        <div class="card">
+          <h3>點餐</h3>
+          <div class="row">
+            <label>座號
+              <select id="seatSelect"></select>
+            </label>
+            <button id="toggleSubmitted" class="ghost">標記完成</button>
+            <button id="clearSeat" class="danger">清空本座</button>
+          </div>
+
+          <div class="hr"></div>
+
+          <details open>
+            <summary><strong>由菜單代號新增</strong> <span class="muted small">（輸入代號與數量，如 <span class="kbd">1</span>、<span class="kbd">2</span>）</span></summary>
+            <div class="row mt8">
+              <input id="codeInput" type="number" min="1" placeholder="代號" class="w120" />
+              <input id="qtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
+              <button id="addByCode" class="primary">加入</button>
+            </div>
+            <div id="menuView" class="small muted mt8"></div>
+          </details>
+
+          <details>
+            <summary><strong>手動新增餐點</strong></summary>
+            <div class="row mt8">
+              <input id="manualName" placeholder="品名" />
+              <input id="manualPrice" type="number" placeholder="單價" class="w140" />
+              <input id="manualQty" type="number" placeholder="數量" value="1" class="w120" />
+              <button id="addManual" class="ghost">新增</button>
+            </div>
+          </details>
+
+          <div class="hr"></div>
+
+          <h3>本座訂單</h3>
+          <table id="orderTable">
+            <thead>
+              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
+            </thead>
+            <tbody></tbody>
+            <tfoot>
+              <tr><th colspan="4" style="text-align:right">小計</th><th id="seatSubtotal">0</th><th></th></tr>
+            </tfoot>
+          </table>
+        </div>
+
+        <div class="card">
+          <div class="section-title">
+            <h3>目前菜單</h3>
+            <span id="activeMenuName" class="pill">(未選擇)</span>
+          </div>
+          <div id="activeMenuList" class="small muted"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 菜單頁 -->
+    <section id="pageMenus" class="hidden">
+      <div class="card">
+        <h3>菜單管理</h3>
+        <div class="row">
+          <select id="menuSelect"></select>
+          <button id="useMenu" class="primary">切換啟用</button>
+          <button id="addMenu" class="ghost">新增菜單</button>
+        </div>
+        <div class="row mt8">
+          <input id="menuNewName" placeholder="新菜單名稱 / 重新命名" />
+          <button id="renameMenu">重新命名</button>
+          <button id="dupMenu">複製</button>
+          <button id="delMenu" class="danger">刪除</button>
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row">
+          <input id="itemName" placeholder="品名" />
+          <input id="itemPrice" type="number" placeholder="價格" class="w140" />
+          <button id="addItem">新增項目</button>
+        </div>
+
+        <table id="menuTable" class="mt8">
+          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 後台頁（彙整＋缺單） -->
+    <section id="pageReports" class="hidden">
+      <div class="grid">
+        <div class="card">
+          <h3>品項彙整</h3>
+          <table id="aggTable">
+            <thead><tr><th>品名</th><th>總數</th><th>總金額</th></tr></thead>
+            <tbody></tbody>
+            <tfoot><tr><th colspan="2" style="text-align:right">全班合計</th><th id="classTotal">0</th></tr></tfoot>
+          </table>
+        </div>
+
+        <div class="card">
+          <h3>尚未完成訂單名單</h3>
+          <div id="missingList" class="muted"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Logs（僅 admin） -->
+    <section id="pageLogs" class="hidden">
+      <div class="card">
+        <h3>審計紀錄（最近 500 筆）</h3>
+        <table id="logsTable">
+          <thead>
+            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP</th><th>UA</th></tr>
+          </thead>
+        <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 使用者管理（僅 admin） -->
+    <section id="pageUsers" class="hidden">
+      <div class="card">
+        <h3>新增使用者</h3>
+        <div class="row">
+          <input id="newUserName" placeholder="帳號" />
+          <input id="newUserPass" placeholder="密碼 (>=6)" type="password" />
+          <select id="newUserRole">
+            <option value="user">user</option>
+            <option value="admin">admin</option>
+          </select>
+          <button id="createUserBtn" class="primary">建立</button>
+        </div>
+      </div>
+
+      <div class="card mt8">
+        <h3>使用者列表</h3>
+        <table>
+          <thead><tr><th>ID</th><th>帳號</th><th>角色</th><th>重設密碼</th></tr></thead>
+          <tbody id="usersTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
