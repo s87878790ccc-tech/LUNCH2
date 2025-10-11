@@ -313,4 +313,8 @@ app.get('/api/logs', auth(), requireAdmin, (req,res)=>{
   res.json({ logs: rows });
 });
 
+app.get('/', (req, res) => {
+  res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
+});
+
 app.listen(PORT, ()=> console.log(`API listening on http://localhost:${PORT}`));
