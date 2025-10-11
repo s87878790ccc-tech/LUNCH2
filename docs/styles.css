@@ -35,3 +35,9 @@ th{color:var(--muted);font-weight:600}
 .section-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 
 #menuView .pill{margin-right:6px;margin-bottom:6px}
+/* 確保加上 hidden 就一定消失 */
+#loginLayer.hidden {
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
