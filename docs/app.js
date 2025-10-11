@@ -65,8 +65,8 @@ const newUserRole = document.getElementById('newUserRole');
 const createUserBtn = document.getElementById('createUserBtn');
 const usersTableBody = document.getElementById('usersTableBody');
 
-// ====== 基礎：Auth 狀態與 UI 顯示 ======
-let token = localStorage.getItem('jwt') || null;   // 讀取既有 JWT
+// ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
+let token = localStorage.getItem('jwt') || null;   // 讀既有 JWT
 apiBaseHint.textContent = `API: ${API_BASE}`;
 
 function authHeader() {
@@ -121,7 +121,7 @@ async function api(path, options = {}) {
   const ct = res.headers.get('content-type') || '';
   let data = null;
   if (ct.includes('application/json') && raw) {
-    try { data = JSON.parse(raw); } catch { /* 非 JSON 就保持 null */ }
+    try { data = JSON.parse(raw); } catch {}
   }
 
   if (res.status === 401) {
@@ -131,12 +131,10 @@ async function api(path, options = {}) {
   }
 
   if (!res.ok) {
-    // 失敗時丟出更友善的錯誤訊息
     const msg = data?.message || raw || `${res.status} ${res.statusText}`;
     throw new Error(msg);
   }
 
-  // 成功回傳：依 content-type 返回資料
   return data ?? raw;
 }
 
@@ -243,7 +241,7 @@ async function resetPassword(userId, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
 }
 
-// ====== Render ======
+// ====== Render（畫面）=====
 function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
 function renderSeats(){
   seatSelect.innerHTML = '';
@@ -538,8 +536,12 @@ usersTableBody.addEventListener('click', async (e)=>{
 });
 
 // ====== 初始化 ======
-function renderStatic(){
+function renderSeatsThenDefault(){ // 小封裝，供 bootstrap/登入後使用
   renderSeats();
+  if (!seatSelect.value) seatSelect.value = '1';
+}
+function renderStatic(){
+  renderSeatsThenDefault();
 }
 async function initApp(){
   await loadMenus();
@@ -550,7 +552,7 @@ async function initApp(){
   await renderMissing();
 }
 
-// 自動登入驗證
+// 自動登入驗證（一定要在最下方，且在宣告 token 之後）
 (async function bootstrap(){
   renderStatic();
   if (!token) return showLogin();
