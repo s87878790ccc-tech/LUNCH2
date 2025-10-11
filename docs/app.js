@@ -1,5 +1,5 @@
 // ====== 調整這個成你的後端 API 網址 ======
-const API_BASE = 'https://lunch2.onrender.com/';
+const API_BASE = 'https://lunch2.onrender.com/api';
 
 // ====== DOM ======
 const app = document.getElementById('app');
@@ -66,45 +66,35 @@ const createUserBtn = document.getElementById('createUserBtn');
 const usersTableBody = document.getElementById('usersTableBody');
 
 // ====== Auth / API ======
-let token = localStorage.getItem('jwt') || null;
-apiBaseHint.textContent = `API: ${API_BASE}`;
-
-function authHeader(){ return token ? { 'Authorization':'Bearer '+token } : {}; }
-async function api(path, options={}){
-  const res = await fetch(API_BASE+path, {
+async function api(path, options = {}) {
+  const res = await fetch(API_BASE + path, {
     ...options,
-    headers: { 'Content-Type':'application/json', ...authHeader(), ...(options.headers||{}) }
+    headers: { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) }
   });
+
+  // 一次性讀 body（避免重複讀取）
+  const raw = await res.text();
+  const ct = res.headers.get('content-type') || '';
+  let data = null;
+  if (ct.includes('application/json') && raw) {
+    try { data = JSON.parse(raw); } catch { /* 非 JSON 就保持 null */ }
+  }
+
   if (res.status === 401) {
     localStorage.removeItem('jwt'); token = null;
-    showLogin(); throw new Error('unauthorized');
+    showLogin();
+    throw new Error(data?.message || 'unauthorized');
   }
-  if (!res.ok) {
-    let t;
-    try{ t = await res.json(); }catch{ t = await res.text(); }
-    throw new Error(t?.message || t || res.status);
-  }
-  const ct = res.headers.get('content-type') || '';
-  return ct.includes('application/json') ? res.json() : res.text();
-}
-function showLogin(){ loginLayer.classList.remove('hidden'); app.classList.add('hidden'); }
-function showApp(){   loginLayer.classList.add('hidden');    app.classList.remove('hidden'); }
 
-loginBtn.onclick = async ()=>{
-  loginMsg.textContent = '';
-  try{
-    const data = await api('/auth/login', { method:'POST',
-      body: JSON.stringify({ username: loginUser.value.trim(), password: loginPass.value })});
-    token = data.token; localStorage.setItem('jwt', token);
-    onLoginUser(data.user);
-    await initApp();
-    switchTab('orders');
-    showApp();
-  }catch(e){
-    loginMsg.textContent = '登入失敗：' + e.message;
+  if (!res.ok) {
+    // 失敗時丟出更友善的錯誤訊息
+    const msg = data?.message || raw || `${res.status} ${res.statusText}`;
+    throw new Error(msg);
   }
-};
-logoutBtn.onclick = ()=>{ localStorage.removeItem('jwt'); token=null; showLogin(); };
+
+  // 成功回傳：依 content-type 返回資料
+  return data ?? raw;
+}
 
 // ====== 狀態 ======
 const MIN_SEAT=1, MAX_SEAT=36;
