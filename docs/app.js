@@ -1,5 +1,5 @@
 // ====== 調整這個成你的後端 API 網址 ======
-const API_BASE = 'https://s87878790ccc-tech.github.io/LUNCH2/';
+const API_BASE = 'https://lunch2.onrender.com/';
 
 // ====== DOM ======
 const app = document.getElementById('app');
