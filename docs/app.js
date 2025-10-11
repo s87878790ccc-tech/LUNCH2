@@ -4,7 +4,6 @@ const API_BASE = 'https://lunch2.onrender.com/api';
 // ====== DOM ======
 const app = document.getElementById('app');
 const loginLayer = document.getElementById('loginLayer');
-// 讓登入層成為全畫面遮罩 + 置中容器
 function initLoginLayerStyles() {
   Object.assign(loginLayer.style, {
     position: 'fixed',
@@ -102,16 +101,13 @@ function showApp() {
 }
 initLoginLayerStyles();
 
-// 登入/登出事件
+// 登入/登出
 loginBtn.onclick = async () => {
   loginMsg.textContent = '';
   try {
     const data = await api('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({
-        username: loginUser.value.trim(),
-        password: loginPass.value
-      })
+      body: JSON.stringify({ username: loginUser.value.trim(), password: loginPass.value })
     });
     token = data.token;
     localStorage.setItem('jwt', token);
@@ -124,30 +120,10 @@ loginBtn.onclick = async () => {
   }
 };
 logoutBtn.onclick = () => {
-  localStorage.removeItem('jwt'); token = null; showLogin();
+  localStorage.removeItem('jwt');
+  token = null;
+  showLogin();
 };
-
-createUserBtn?.addEventListener('click', async () => {
-  if (!state.me || state.me.role !== 'admin') {
-    alert('權限不足：只有管理員可以建立新帳號');
-    return;
-  }
-  const username = newUserName.value.trim();
-  const password = newUserPass.value;
-  const role     = newUserRole.value;
-  if (!username || !password || password.length < 6) {
-    alert('請填帳號與密碼(>=6)');
-    return;
-  }
-  try {
-    await createUser(username, password, role);
-    newUserName.value = ''; newUserPass.value = '';
-    await loadUsers();
-    alert('已建立');
-  } catch (e) {
-    alert('建立失敗：' + e.message);
-  }
-});
 
 // ====== Auth / API ======
 async function api(path, options = {}) {
@@ -159,34 +135,42 @@ async function api(path, options = {}) {
   const ct = res.headers.get('content-type') || '';
   let data = null;
   if (ct.includes('application/json') && raw) { try { data = JSON.parse(raw); } catch {} }
-  if (res.status === 401) { localStorage.removeItem('jwt'); token = null; showLogin(); throw new Error(data?.message || 'unauthorized'); }
-  if (!res.ok) { const msg = data?.message || raw || `${res.status} ${res.statusText}`; throw new Error(msg); }
+
+  if (res.status === 401) {
+    localStorage.removeItem('jwt'); token = null;
+    showLogin();
+    throw new Error(data?.message || 'unauthorized');
+  }
+  if (!res.ok) {
+    const msg = data?.message || raw || `${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
   return data ?? raw;
 }
 
 // ====== 狀態 ======
 const MIN_SEAT=1, MAX_SEAT=36;
-const state = { me:null, menus:[], activeMenuId:null, ordersCache:new Map() };
-
+const state = {
+  me: null,
+  menus: [],
+  activeMenuId: null,
+  ordersCache: new Map(),
+};
 function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
   const isAdmin = user.role === 'admin';
-
-  // Tab 顯示
-  tabOrders.classList.toggle('hidden', false);
+  tabLogs.classList.toggle('hidden', !isAdmin);
   tabUsers.classList.toggle('hidden', false);
   tabMenus.classList.toggle('hidden', !isAdmin);
   tabReports.classList.toggle('hidden', !isAdmin);
-  tabLogs.classList.toggle('hidden', !isAdmin);
 
-  // 區塊顯示：標上 .only-admin / .only-user 的區塊，就會自動切換
+  // 區塊顯示控制（HTML 中的 only-admin / only-user）
   document.querySelectorAll('.only-admin')
     .forEach(el => el.classList.toggle('hidden', !isAdmin));
   document.querySelectorAll('.only-user')
     .forEach(el => el.classList.toggle('hidden', isAdmin));
 }
-
 
 // ====== UI 切頁 ======
 function switchTab(which){
@@ -202,7 +186,7 @@ function switchTab(which){
     btn.classList.toggle('active', k===which);
     page.classList.toggle('hidden', k!==which);
   }
-  if (which==='reports') { ensureInspectorUI(); renderAgg(); renderMissing(); }
+  if (which==='reports') { renderAgg(); renderMissing(); }
   if (which==='logs') { renderLogs(); }
   if (which==='users') { loadUsers(); }
 }
@@ -218,28 +202,78 @@ async function loadMenus(){
   state.menus = data.menus || [];
   state.activeMenuId = data.activeMenuId ?? (state.menus[0]?.id ?? null);
 }
-async function setActiveMenu(menuId){ await api('/settings/active-menu', { method:'PUT', body: JSON.stringify({ menuId }) }); state.activeMenuId = menuId; }
-async function createMenu(name){ const m = await api('/menus', { method:'POST', body: JSON.stringify({ name })}); state.menus.push(m); }
-async function renameMenuReq(id, name){ await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify({ name })}); const m = state.menus.find(x=>x.id===id); if (m) m.name = name; }
-async function deleteMenuReq(id){ await api(`/menus/${id}`, { method:'DELETE' }); state.menus = state.menus.filter(x=>x.id!==id); if (state.activeMenuId===id) state.activeMenuId = state.menus[0]?.id ?? null; }
-async function addMenuItemReq(menuId, name, price){ const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price })}); const m = state.menus.find(x=>x.id===menuId); if (m) m.items.push(it); }
-async function updateMenuItemReq(itemId, name, price){ await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price })}); for (const m of state.menus) { const it = m.items.find(i=>i.id===itemId); if (it) { it.name=name; it.price=Number(price); break; } } }
-async function deleteMenuItemReq(itemId){ await api(`/menu-items/${itemId}`, { method:'DELETE' }); for (const m of state.menus) m.items = m.items.filter(i=>i.id!==itemId); }
-async function getOrder(seat){ if (state.ordersCache.has(seat)) return state.ordersCache.get(seat); const o = await api(`/orders/${seat}`); state.ordersCache.set(seat, o); return o; }
-async function saveOrder(seat, order){ await api(`/orders/${seat}`, { method:'PUT', body: JSON.stringify(order) }); state.ordersCache.set(seat, order); }
+async function setActiveMenu(menuId){
+  await api('/settings/active-menu', { method:'PUT', body: JSON.stringify({ menuId }) });
+  state.activeMenuId = menuId;
+}
+async function createMenu(name){
+  const m = await api('/menus', { method:'POST', body: JSON.stringify({ name })});
+  state.menus.push(m);
+}
+async function renameMenuReq(id, name){
+  await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify({ name })});
+  const m = state.menus.find(x=>x.id===id); if (m) m.name = name;
+}
+async function deleteMenuReq(id){
+  await api(`/menus/${id}`, { method:'DELETE' });
+  state.menus = state.menus.filter(x=>x.id!==id);
+  if (state.activeMenuId===id) state.activeMenuId = state.menus[0]?.id ?? null;
+}
+async function addMenuItemReq(menuId, name, price){
+  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price })});
+  const m = state.menus.find(x=>x.id===menuId);
+  if (m) m.items.push(it);
+}
+async function updateMenuItemReq(itemId, name, price){
+  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price })});
+  for (const m of state.menus) {
+    const it = m.items.find(i=>i.id===itemId);
+    if (it) { it.name=name; it.price=Number(price); break; }
+  }
+}
+async function deleteMenuItemReq(itemId){
+  await api(`/menu-items/${itemId}`, { method:'DELETE' });
+  for (const m of state.menus) m.items = m.items.filter(i=>i.id!==itemId);
+}
+async function getOrder(seat){
+  if (state.ordersCache.has(seat)) return state.ordersCache.get(seat);
+  const o = await api(`/orders/${seat}`);
+  state.ordersCache.set(seat, o);
+  return o;
+}
+async function saveOrder(seat, order){
+  await api(`/orders/${seat}`, { method:'PUT', body: JSON.stringify(order) });
+  state.ordersCache.set(seat, order);
+}
 async function getAggregate(){ return api('/reports/aggregate'); }
 async function getMissing(){ return api('/reports/missing'); }
 
-// ====== Logs & Users（admin/user）=====
+// ====== Logs & Users（admin）=====
 async function getLogs(){ return api('/logs'); }
-async function listUsers(){ return api('/users'); }
-async function createUser(username, password, role){ return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })}); }
-// 支援一般用戶帶 oldPassword
-async function resetPassword(userId, newPassword, oldPassword){
-  return api(`/users/${userId}/password`, {
-    method:'PUT',
-    body: JSON.stringify(oldPassword ? { oldPassword, newPassword } : { newPassword })
-  });
+async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}){
+  const p = new URLSearchParams({ q, role, status, page, pageSize });
+  return api('/users?'+p.toString());
+}
+async function createUser(username, password, role){
+  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
+}
+async function resetPasswordAdmin(userId, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
+}
+async function resetPasswordSelf(userId, oldPassword, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
+}
+async function setUserStatus(userId, status){
+  return api(`/users/${userId}/status`, { method:'PATCH', body: JSON.stringify({ status })});
+}
+async function setUserRole(userId, role){
+  return api(`/users/${userId}/role`, { method:'PATCH', body: JSON.stringify({ role })});
+}
+async function deleteUser(userId){
+  return api(`/users/${userId}`, { method:'DELETE' });
+}
+async function bulkDelete(ids){
+  return api('/users/bulk-delete', { method:'DELETE', body: JSON.stringify({ ids })});
 }
 
 // ====== Render（畫面）=====
@@ -256,15 +290,18 @@ function renderSeats(){
 function renderActiveMenu() {
   const m = state.menus.find(x=>x.id===state.activeMenuId);
   activeMenuName.textContent = m ? m.name : '(未選擇)';
-  const list = (m?.items||[]).map(it => `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
-  activeMenuList.innerHTML = list || '(此菜單沒有項目)'; menuView.innerHTML = list;
+  const list = (m?.items||[]).map(it =>
+    `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
+  activeMenuList.innerHTML = list || '(此菜單沒有項目)';
+  menuView.innerHTML = list;
 }
 function renderMenuPage(){
   menuSelect.innerHTML = state.menus.map((m,i)=>`<option value="${m.id}">${i+1}. ${m.name}</option>`).join('');
   if (state.activeMenuId) menuSelect.value = String(state.activeMenuId);
   menuTableBody.innerHTML = '';
-  const m = state.menus.find(x=>x.id===state.activeMenuId); if (!m) return;
-  m.items.forEach(it=>{
+  const m = state.menus.find(x=>x.id===state.activeMenuId);
+  if (!m) return;
+  m.items.forEach((it)=>{
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${it.code}</td>
@@ -296,7 +333,8 @@ async function renderSeatOrder(){
 }
 async function renderAgg(){
   const data = await getAggregate();
-  aggTableBody.innerHTML = data.items.map(r=> `<tr><td>${r.name}</td><td>${fmt(r.totalQty)}</td><td>${fmt(r.totalMoney)}</td></tr>`).join('');
+  aggTableBody.innerHTML = data.items.map(r=>
+    `<tr><td>${r.name}</td><td>${fmt(r.totalQty)}</td><td>${fmt(r.totalMoney)}</td></tr>`).join('');
   classTotalEl.textContent = fmt(data.classTotal);
 }
 async function renderMissing(){
@@ -304,119 +342,221 @@ async function renderMissing(){
   const arr = data.missing||[];
   missingList.textContent = arr.length ? `座號：${arr.join(', ')}` : '全部人都完成填單！';
 }
+
+// Logs：中文化 + 相對時間 + 簡短 details
+function timeAgo(iso){
+  const d = new Date(iso);
+  const diff = (Date.now() - d.getTime())/1000;
+  if (diff < 60) return `${Math.floor(diff)} 秒前`;
+  if (diff < 3600) return `${Math.floor(diff/60)} 分鐘前`;
+  if (diff < 86400) return `${Math.floor(diff/3600)} 小時前`;
+  return `${Math.floor(diff/86400)} 天前`;
+}
+function fmtTime(iso){
+  const d = new Date(iso);
+  const s = d.toLocaleString('zh-TW', { hour12:false });
+  return `${s}（${timeAgo(iso)}）`;
+}
+const ACTION_MAP = {
+  'login':'登入',
+  'menu.create':'建立菜單',
+  'menu.update':'修改菜單',
+  'menu.delete':'刪除菜單',
+  'menu.item.create':'新增菜單品項',
+  'menu.item.update':'修改菜單品項',
+  'menu.item.delete':'刪除菜單品項',
+  'settings.activeMenu':'切換啟用菜單',
+  'order.update':'更新訂單',
+  'user.create':'建立使用者',
+  'user.delete':'刪除使用者',
+  'user.bulkDelete':'批次刪除使用者',
+  'user.changePassword':'變更密碼',
+  'user.status':'變更狀態',
+  'user.role':'變更角色',
+};
+function briefDetails(raw){
+  if (!raw) return '';
+  try{
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const pairs = [];
+    for (const [k,v] of Object.entries(obj)) {
+      let val = v;
+      if (typeof v === 'object' && v !== null) val = JSON.stringify(v);
+      if (String(val).length > 40) val = String(val).slice(0,40) + '…';
+      pairs.push(`${k}=${val}`);
+    }
+    return pairs.join('  ');
+  }catch{
+    return String(raw);
+  }
+}
 async function renderLogs(){
-  logsTableBody.innerHTML = '<tr><td colspan="7">載入中…</td></tr>';
+  logsTableBody.innerHTML = '<tr><td colspan="6">載入中…</td></tr>';
   try{
     const data = await getLogs();
+    if (!data.logs?.length) {
+      logsTableBody.innerHTML = '<tr><td colspan="6" class="muted">目前沒有紀錄</td></tr>';
+      return;
+    }
     logsTableBody.innerHTML = data.logs.map(l=>{
-      let details = l.details;
-      try{ if(details) details = JSON.stringify(JSON.parse(details), null, 2) }catch{}
+      const actionName = ACTION_MAP[l.action] || l.action;
+      const detailsStr = briefDetails(l.details);
+      const who = l.user_id ? `#${l.user_id}` : '（系統）';
       return `<tr>
         <td>${l.id}</td>
-        <td>${l.ts}</td>
-        <td>${l.user_id ?? ''}</td>
-        <td>${l.action}</td>
-        <td><pre style="white-space:pre-wrap;margin:0">${details||''}</pre></td>
-        <td>${l.ip||''}</td>
-        <td class="small muted">${(l.ua||'').slice(0,80)}</td>
+        <td>${fmtTime(l.ts)}</td>
+        <td>${who}</td>
+        <td><span class="tag">${actionName}</span></td>
+        <td><div class="small" style="white-space:pre-wrap">${detailsStr}</div></td>
+        <td class="small muted">
+          <div>${l.ip||''}</div>
+          <div>${(l.ua||'').slice(0,80)}</div>
+        </td>
       </tr>`;
     }).join('');
   }catch(e){
-    logsTableBody.innerHTML = `<tr><td colspan="7">讀取失敗：${e.message}</td></tr>`;
+    logsTableBody.innerHTML = `<tr><td colspan="6">讀取失敗：${e.message}</td></tr>`;
   }
 }
 
-// ====== 後台：單一座號檢視（僅 admin）======
-let inspectWrap = null;
-function ensureInspectorUI() {
-  if (state.me?.role !== 'admin') { if (inspectWrap) inspectWrap.innerHTML = ''; return; }
-  if (!inspectWrap) { inspectWrap = document.createElement('div'); inspectWrap.id = 'inspectWrap'; pageReports.prepend(inspectWrap); }
-  inspectWrap.innerHTML = `
-    <div class="card" style="margin-bottom:12px;">
-      <div style="display:flex;gap:8px;align-items:center;">
-        <strong>單一座號檢視</strong>
-        <label>座號 <input id="inspectSeat" type="number" min="1" max="36" value="1" class="w120"/></label>
-        <button id="inspectBtn">查看</button>
-      </div>
-      <div style="margin-top:8px;">
-        <table class="table small">
-          <thead><tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th></tr></thead>
-          <tbody id="inspectTable"><tr><td colspan="5" class="muted">請輸入座號後查看</td></tr></tbody>
-        </table>
-        <div style="text-align:right;padding:6px 0;">小計：<span id="inspectSubtotal">0</span></div>
-      </div>
-    </div>`;
-  document.getElementById('inspectBtn').onclick = () => renderInspect();
-}
-async function renderInspect() {
-  const seat = Number(document.getElementById('inspectSeat').value || 1);
-  try {
-    const o = await getOrder(seat);
-    const tbody = document.getElementById('inspectTable');
-    let subtotal = 0;
-    if (!o.items.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="muted">此座號目前沒有品項</td></tr>';
-    } else {
-      tbody.innerHTML = o.items.map((it, i) => {
-        const line = it.unitPrice * it.qty; subtotal += line;
-        return `<tr>
-          <td>${i+1}</td><td>${it.name}</td><td>${fmt(it.unitPrice)}</td><td>${fmt(it.qty)}</td><td>${fmt(line)}</td>
-        </tr>`;
-      }).join('');
-    }
-    document.getElementById('inspectSubtotal').textContent = fmt(subtotal);
-  } catch(e) {
-    document.getElementById('inspectTable').innerHTML = `<tr><td colspan="5">讀取失敗：${e.message}</td></tr>`;
-    document.getElementById('inspectSubtotal').textContent = '0';
+// ====== 使用者頁（admin 強化）======
+const usersView = { q:'', role:'', status:'', page:1, pageSize:20, rows:[], total:0 };
+
+function renderUsersAdminTable(){
+  usersTableBody.innerHTML = usersView.rows.map(u=>`
+    <tr>
+      <td><input type="checkbox" class="pickUser" data-id="${u.id}"/></td>
+      <td>${u.id}</td>
+      <td>${u.username}</td>
+      <td>
+        <select class="roleSel" data-id="${u.id}">
+          <option value="user" ${u.role==='user'?'selected':''}>user</option>
+          <option value="admin" ${u.role==='admin'?'selected':''}>admin</option>
+        </select>
+      </td>
+      <td>
+        <select class="statusSel" data-id="${u.id}">
+          <option value="active" ${u.status==='active'?'selected':''}>啟用</option>
+          <option value="disabled" ${u.status==='disabled'?'selected':''}>停用</option>
+        </select>
+      </td>
+      <td class="small">${u.last_login_at ? new Date(u.last_login_at).toLocaleString('zh-TW',{hour12:false}) : '-'}</td>
+      <td class="small">${u.created_at ? new Date(u.created_at).toLocaleString('zh-TW',{hour12:false}) : '-'}</td>
+      <td>
+        <input type="password" placeholder="新密碼(>=6)" id="reset_${u.id}" />
+        <button class="resetPwd" data-id="${u.id}">重設</button>
+      </td>
+      <td>
+        <button class="danger delUser" data-id="${u.id}" data-name="${u.username}" data-role="${u.role}">刪除</button>
+      </td>
+    </tr>
+  `).join('');
+
+  // 分頁
+  const pages = Math.max(1, Math.ceil(usersView.total / usersView.pageSize));
+  const pager = document.getElementById('usersPager');
+  if (pager){
+    pager.innerHTML = `
+      <button id="pgPrev" ${usersView.page<=1?'disabled':''}>上一頁</button>
+      <span>第 ${usersView.page} / ${pages} 頁（共 ${usersView.total} 筆）</span>
+      <button id="pgNext" ${usersView.page>=pages?'disabled':''}>下一頁</button>
+    `;
+    document.getElementById('pgPrev').onclick = ()=>{ if(usersView.page>1){ usersView.page--; loadUsers(); } };
+    document.getElementById('pgNext').onclick = ()=>{ if(usersView.page<pages){ usersView.page++; loadUsers(); } };
   }
 }
 
-// ====== Users（依角色渲染）======
 async function loadUsers(){
   const isAdmin = state.me?.role === 'admin';
   if (!isAdmin) {
-    // 一般用戶：只允許改自己的密碼（需舊密碼）
+    // 一般使用者：只顯示自助改密碼區塊（HTML 需有 only-user 區塊）
     usersTableBody.innerHTML = `
       <tr>
-        <td>${state.me.id ?? ''}</td>
-        <td>${state.me.username}</td>
-        <td>${state.me.role}</td>
-        <td>
-          <input type="password" placeholder="舊密碼" id="old_${state.me.uid||state.me.id||'me'}" />
-          <input type="password" placeholder="新密碼(>=6)" id="new_${state.me.uid||state.me.id||'me'}" />
-          <button id="selfResetBtn">變更</button>
+        <td colspan="4">
+          <div class="card only-user">
+            <h4>變更我的密碼</h4>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <input type="password" id="selfOldPwd" placeholder="舊密碼" />
+              <input type="password" id="selfNewPwd" placeholder="新密碼(>=6)" />
+              <button id="selfChangeBtn">送出</button>
+            </div>
+          </div>
         </td>
-      </tr>`;
-    const btn = document.getElementById('selfResetBtn');
-    btn.onclick = async () => {
-      const oid = state.me.uid || state.me.id;
-      const oldPwd = document.getElementById(`old_${oid}`).value;
-      const newPwd = document.getElementById(`new_${oid}`).value;
-      if (!oldPwd || !newPwd || newPwd.length < 6) return alert('請輸入舊密碼與新密碼(>=6)');
-      try { await resetPassword(oid, newPwd, oldPwd); alert('已更新密碼，請重新登入'); logoutBtn.click(); }
-      catch(e){ alert('變更失敗：'+e.message); }
+      </tr>
+    `;
+    const btn = document.getElementById('selfChangeBtn');
+    btn.onclick = async ()=>{
+      const oldP = document.getElementById('selfOldPwd').value;
+      const newP = document.getElementById('selfNewPwd').value;
+      if (!newP || newP.length<6) return alert('新密碼至少 6 碼');
+      try{ await resetPasswordSelf(state.me.id, oldP, newP); alert('已更新'); }
+      catch(e){ alert('失敗：'+e.message); }
     };
     return;
   }
 
-  // 管理員：使用者清單 + 重設密碼
-  usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
+  // 建立工具列（只建一次）
+  if (!document.getElementById('usersToolbar')) {
+    const toolbar = document.createElement('div');
+    toolbar.id = 'usersToolbar';
+    toolbar.className = 'card only-admin';
+    toolbar.style.marginBottom = '8px';
+    toolbar.innerHTML = `
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="userQ" placeholder="搜尋帳號關鍵字" />
+        <select id="userRole">
+          <option value="">角色(全部)</option>
+          <option value="user">user</option>
+          <option value="admin">admin</option>
+        </select>
+        <select id="userStatus">
+          <option value="">狀態(全部)</option>
+          <option value="active">啟用</option>
+          <option value="disabled">停用</option>
+        </select>
+        <button id="userSearch">搜尋</button>
+        <button id="userClear">清除</button>
+        <div style="flex:1"></div>
+        <button id="bulkDel" class="danger">刪除勾選</button>
+      </div>
+      <div id="usersPager" style="margin-top:6px"></div>
+    `;
+    pageUsers.prepend(toolbar);
+
+    document.getElementById('userSearch').onclick = ()=>{ 
+      usersView.q = document.getElementById('userQ').value.trim();
+      usersView.role = document.getElementById('userRole').value;
+      usersView.status = document.getElementById('userStatus').value;
+      usersView.page = 1;
+      loadUsers();
+    };
+    document.getElementById('userClear').onclick = ()=>{
+      document.getElementById('userQ').value='';
+      document.getElementById('userRole').value='';
+      document.getElementById('userStatus').value='';
+      usersView.q=''; usersView.role=''; usersView.status=''; usersView.page=1; loadUsers();
+    };
+    document.getElementById('bulkDel').onclick = async ()=>{
+      const ids = [...document.querySelectorAll('.pickUser:checked')].map(x=>Number(x.dataset.id));
+      if (!ids.length) return alert('請先勾選要刪除的帳號');
+      if (!confirm(`確定刪除 ${ids.length} 個帳號？`)) return;
+      try{ await bulkDelete(ids); await loadUsers(); alert('已刪除'); }catch(e){ alert('刪除失敗：'+e.message); }
+    };
+  }
+
+  // 載入資料
+  usersTableBody.innerHTML = '<tr><td colspan="9">載入中…</td></tr>';
   try{
-    const data = await listUsers();
-    usersTableBody.innerHTML = data.users.map(u=>`
-      <tr>
-        <td>${u.id}</td>
-        <td>${u.username}</td>
-        <td>${u.role}</td>
-        <td>
-          <input type="password" placeholder="新密碼(>=6)" id="reset_${u.id}" />
-          <button class="resetPwd" data-id="${u.id}">重設</button>
-        </td>
-      </tr>`).join('');
+    const resp = await listUsersAdv(usersView);
+    usersView.rows = resp.users || [];
+    usersView.total = Number(resp.total || 0);
+    renderUsersAdminTable();
   }catch(e){
-    usersTableBody.innerHTML = `<tr><td colspan="4">失敗：${e.message}</td></tr>`;
+    usersTableBody.innerHTML = `<tr><td colspan="9">失敗：${e.message}</td></tr>`;
   }
 }
+
+// 使用者表格事件
 usersTableBody.addEventListener('click', async (e)=>{
   const t=e.target;
   if (t.classList.contains('resetPwd')) {
@@ -424,27 +564,60 @@ usersTableBody.addEventListener('click', async (e)=>{
     const input = document.getElementById(`reset_${id}`);
     const pwd = input.value;
     if (!pwd || pwd.length<6) return alert('新密碼至少 6 碼');
-    try{ await resetPassword(id, pwd); input.value=''; alert('已重設'); }
+    try{ await resetPasswordAdmin(id, pwd); input.value=''; alert('已重設'); loadUsers(); }
     catch(err){ alert('重設失敗：'+err.message); }
+  }
+  if (t.classList.contains('delUser')) {
+    const id   = Number(t.dataset.id);
+    const name = t.dataset.name || '';
+    const role = t.dataset.role || '';
+    if (!confirm(`確定要刪除使用者「${name}」（${role}）？`)) return;
+    try{ await deleteUser(id); await loadUsers(); alert('已刪除'); }
+    catch(err){ alert('刪除失敗：' + err.message); }
+  }
+});
+usersTableBody.addEventListener('change', async (e)=>{
+  const t = e.target;
+  if (t.classList.contains('roleSel')) {
+    const id = Number(t.dataset.id);
+    const role = t.value;
+    try{ await setUserRole(id, role); alert('角色已更新'); }
+    catch(err){ alert('更新角色失敗：'+err.message); loadUsers(); }
+  }
+  if (t.classList.contains('statusSel')) {
+    const id = Number(t.dataset.id);
+    const status = t.value;
+    try{ await setUserStatus(id, status); alert('狀態已更新'); }
+    catch(err){ alert('更新狀態失敗：'+err.message); loadUsers(); }
+  }
+});
+
+// 全選
+document.addEventListener('change', (e)=>{
+  if (e.target && e.target.id === 'pickAll') {
+    const checked = e.target.checked;
+    document.querySelectorAll('.pickUser').forEach(cb => cb.checked = checked);
   }
 });
 
 // ====== 事件 ======
 seatSelect.addEventListener('change', ()=>{ renderSeatOrder(); });
-
 toggleSubmitted.addEventListener('click', async ()=>{
   const seat = Number(seatSelect.value||1);
   const o = await getOrder(seat);
   o.submitted = !o.submitted;
   await saveOrder(seat, o);
-  await renderSeatOrder(); await renderMissing();
+  await renderSeatOrder();
+  await renderMissing();
 });
 clearSeat.addEventListener('click', async ()=>{
   const seat = Number(seatSelect.value||1);
   if (!confirm(`確定清空座號 ${seat} 的訂單？`)) return;
   await saveOrder(seat, { submitted:false, items:[] });
   state.ordersCache.delete(seat);
-  await renderSeatOrder(); await renderAgg(); await renderMissing();
+  await renderSeatOrder();
+  await renderAgg();
+  await renderMissing();
 });
 addByCode.addEventListener('click', async ()=>{
   const m = state.menus.find(x=>x.id===state.activeMenuId);
@@ -497,42 +670,71 @@ orderTableBody.addEventListener('click', async (e)=>{
     await renderSeatOrder(); await renderAgg();
   }
 });
-useMenu.addEventListener('click', async ()=>{ const id = Number(menuSelect.value); await setActiveMenu(id); renderActiveMenu(); renderMenuPage(); });
-addMenu.addEventListener('click', async ()=>{ const name = menuNewName.value.trim() || `新菜單 ${state.menus.length+1}`; await createMenu(name); await loadMenus(); renderActiveMenu(); renderMenuPage(); alert('已建立並置於清單尾端'); });
-renameMenu.addEventListener('click', async ()=>{ const id = Number(menuSelect.value); const name = menuNewName.value.trim(); if (!name) return alert('請輸入新名稱'); await renameMenuReq(id, name); await loadMenus(); renderActiveMenu(); renderMenuPage(); });
+useMenu.addEventListener('click', async ()=>{
+  const id = Number(menuSelect.value);
+  await setActiveMenu(id);
+  renderActiveMenu();
+  renderMenuPage();
+});
+addMenu.addEventListener('click', async ()=>{
+  const name = menuNewName.value.trim() || `新菜單 ${state.menus.length+1}`;
+  await createMenu(name);
+  await loadMenus();
+  renderActiveMenu(); renderMenuPage();
+  alert('已建立並置於清單尾端');
+});
+renameMenu.addEventListener('click', async ()=>{
+  const id = Number(menuSelect.value);
+  const name = menuNewName.value.trim();
+  if (!name) return alert('請輸入新名稱');
+  await renameMenuReq(id, name);
+  await loadMenus();
+  renderActiveMenu(); renderMenuPage();
+});
 dupMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
-  const src = state.menus.find(x=>x.id===id); if (!src) return;
+  const src = state.menus.find(x=>x.id===id);
+  if (!src) return;
   await createMenu(src.name + '（副本）');
   const newMenu = state.menus[state.menus.length-1];
   for (const it of src.items) await addMenuItemReq(newMenu.id, it.name, it.price);
-  await loadMenus(); renderActiveMenu(); renderMenuPage(); alert('已建立副本');
+  await loadMenus();
+  renderActiveMenu(); renderMenuPage();
+  alert('已建立副本');
 });
-delMenu.addEventListener('click', async ()=>{ const id = Number(menuSelect.value); if (!confirm('確定刪除此菜單？')) return; await deleteMenuReq(id); await loadMenus(); renderActiveMenu(); renderMenuPage(); });
-menuTableBody.addEventListener('input', async (e)=>{
-  const t=e.target;
-  if (t.classList.contains('nameEdit') || t.classList.contains('priceEdit')) {
-    const id = Number(t.dataset.id);
-    const tr = t.closest('tr');
-    const name = tr.querySelector('.nameEdit').value;
-    const price= Number(tr.querySelector('.priceEdit').value||0);
-    await updateMenuItemReq(id, name, price);
-    await loadMenus(); renderActiveMenu(); renderMenuPage(); renderAgg();
-  }
+delMenu.addEventListener('click', async ()=>{
+  const id = Number(menuSelect.value);
+  if (!confirm('確定刪除此菜單？')) return;
+  await deleteMenuReq(id);
+  await loadMenus();
+  renderActiveMenu(); renderMenuPage();
 });
-menuTableBody.addEventListener('click', async (e)=>{
-  const t=e.target;
-  if (t.classList.contains('delItem')) {
-    const id = Number(t.dataset.id);
-    await deleteMenuItemReq(id);
-    await loadMenus(); renderActiveMenu(); renderMenuPage();
-  }
+addItem.addEventListener('click', async ()=>{
+  const mId = Number(menuSelect.value);
+  const name = itemName.value.trim();
+  const price = Number(itemPrice.value||0);
+  if (!name) return alert('請輸入品名');
+  if (price<0) return alert('價格需 >= 0');
+  await addMenuItemReq(mId, name, price);
+  itemName.value=''; itemPrice.value='';
+  await loadMenus();
+  renderActiveMenu(); renderMenuPage();
 });
 
 // ====== 初始化 ======
-function renderSeatsThenDefault(){ renderSeats(); if (!seatSelect.value) seatSelect.value = '1'; }
+function renderSeatsThenDefault(){
+  renderSeats();
+  if (!seatSelect.value) seatSelect.value = '1';
+}
 function renderStatic(){ renderSeatsThenDefault(); }
-async function initApp(){ await loadMenus(); renderActiveMenu(); renderMenuPage(); await renderSeatOrder(); if (state.me?.role==='admin'){ await renderAgg(); await renderMissing(); } }
+async function initApp(){
+  await loadMenus();
+  renderActiveMenu();
+  renderMenuPage();
+  await renderSeatOrder();
+  await renderAgg();
+  await renderMissing();
+}
 
 // 自動登入驗證
 (async function bootstrap(){

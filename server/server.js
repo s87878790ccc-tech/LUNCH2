@@ -11,7 +11,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-const PORT = process.env.PORT || 8787;
+const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 
 // ====== Logging ======
@@ -20,7 +20,7 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // ====== Middleware ======
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true })); // 上線可改白名單
+app.use(cors({ origin: true, credentials: true })); // 上線建議改成白名單
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
@@ -30,6 +30,8 @@ app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'lunch.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
+
+function nowISO(){ return new Date().toISOString(); }
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(
@@ -54,7 +56,6 @@ CREATE TABLE IF NOT EXISTS settings(
   active_menu_id INTEGER
 );
 INSERT OR IGNORE INTO settings(id, active_menu_id) VALUES(1, NULL);
-
 CREATE TABLE IF NOT EXISTS orders(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   seat INTEGER NOT NULL UNIQUE,
@@ -80,8 +81,42 @@ CREATE TABLE IF NOT EXISTS audit_logs(
 );
 `);
 
-// ====== Helpers ======
-function nowISO(){ return new Date().toISOString(); }
+// ---- schema upgrades (idempotent) ----
+try { db.exec(`ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN created_at TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN updated_at TEXT`); } catch {}
+try { db.exec(`ALTER TABLE users ADD COLUMN last_login_at TEXT`); } catch {}
+db.exec(`
+  UPDATE users
+  SET created_at = COALESCE(created_at, '${nowISO()}'),
+      updated_at = COALESCE(updated_at, '${nowISO()}')
+  WHERE 1=1;
+`);
+
+// seed admin
+(function seedAdmin(){
+  const name = process.env.ADMIN_DEFAULT_USER || 'admin';
+  const pass = process.env.ADMIN_DEFAULT_PASS || 'admin123';
+  const u = db.prepare('SELECT * FROM users WHERE username=?').get(name);
+  if (!u) {
+    const hash = bcrypt.hashSync(pass, 10);
+    db.prepare('INSERT INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)')
+      .run(name, hash, 'admin', 'active', nowISO(), nowISO());
+    console.log('[seed] admin created:', name);
+  }
+})();
+
+// 1~36 座號帳號（role=user, 密碼 123456）
+(function seedSeatUsers(){
+  const defaultPass = process.env.SEAT_DEFAULT_PASS || '123456';
+  const hash = bcrypt.hashSync(defaultPass, 10);
+  const insert = db.prepare('INSERT OR IGNORE INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)');
+  for (let s = 1; s <= 36; s++) {
+    insert.run(String(s), hash, 'user', 'active', nowISO(), nowISO());
+  }
+  console.log('[seed] seat users 1~36 ready (default pass = 123456)');
+})();
+
 function sign(user){ return jwt.sign({ uid:user.id, username:user.username, role:user.role }, JWT_SECRET, { expiresIn: '7d' }); }
 function auth(required=true){
   return (req,res,next)=>{
@@ -104,6 +139,8 @@ function logAction(user, action, details, req){
     .run(user?.uid || null, action, details ? JSON.stringify(details) : null,
          req.ip, req.headers['user-agent'] || '', nowISO());
 }
+
+// helpers
 function ensureOrder(seat){
   let o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
   if (!o) {
@@ -113,31 +150,6 @@ function ensureOrder(seat){
   }
   return o;
 }
-// 一般使用者只能操作自己的座號
-function seatAllowed(req, seatNumber) {
-  if (req.user?.role === 'admin') return true;
-  const mySeat = Number(req.user?.username);
-  return mySeat === Number(seatNumber);
-}
-
-// ====== Seed users ======
-(function seedAdmin(){
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(process.env.ADMIN_DEFAULT_USER || 'admin');
-  if (!u) {
-    const hash = bcrypt.hashSync(process.env.ADMIN_DEFAULT_PASS || 'admin123', 10);
-    db.prepare('INSERT INTO users(username, password_hash, role) VALUES(?,?,?)')
-      .run(process.env.ADMIN_DEFAULT_USER || 'admin', hash, 'admin');
-    console.log('[seed] admin created:', process.env.ADMIN_DEFAULT_USER || 'admin');
-  }
-})();
-
-(function seedSeatUsers(){
-  const defaultPass = process.env.SEAT_DEFAULT_PASS || '123456';
-  const hash = bcrypt.hashSync(defaultPass, 10);
-  const insert = db.prepare('INSERT OR IGNORE INTO users(username, password_hash, role) VALUES(?,?,?)');
-  for (let s = 1; s <= 36; s++) insert.run(String(s), hash, 'user');
-  console.log('[seed] seat users 1~36 ready (default pass = 123456)');
-})();
 
 // ===== Auth =====
 app.post('/api/auth/login', (req,res)=>{
@@ -145,7 +157,13 @@ app.post('/api/auth/login', (req,res)=>{
   if (!username || !password) return res.status(400).json({message:'username/password required'});
   const u = db.prepare('SELECT * FROM users WHERE username=?').get(username);
   if (!u) return res.status(401).json({message:'invalid credentials'});
+  if (u.status !== 'active') return res.status(403).json({message:'account disabled'});
   if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({message:'invalid credentials'});
+
+  // update last_login_at
+  db.prepare('UPDATE users SET last_login_at=?, updated_at=? WHERE id=?')
+    .run(nowISO(), nowISO(), u.id);
+
   const token = sign(u);
   logAction({uid:u.id}, 'login', {username}, req);
   res.json({ token, user: { id:u.id, username:u.username, role:u.role } });
@@ -173,7 +191,7 @@ app.post('/api/menus', auth(), requireAdmin, (req,res)=>{
 app.put('/api/menus/:id', auth(), requireAdmin, (req,res)=>{
   const id = Number(req.params.id);
   const { name } = req.body || {};
-  db.prepare('UPDATE menus SET name=? WHERE id=?').run(name, id);
+  db.prepare('UPDATE menus SET name=?, ROWID=ROWID WHERE id=?').run(name, id);
   logAction(req.user, 'menu.update', {id, name}, req);
   res.json({ ok:true });
 });
@@ -227,17 +245,15 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, (req,res)=>{
   res.json({ ok:true });
 });
 
-// ===== Orders（需登入；一般使用者僅能操作自己的座號）=====
-app.get('/api/orders/:seat', auth(), (req,res)=>{
+// ===== Orders =====
+app.get('/api/orders/:seat', auth(false), (req,res)=>{
   const seat = Number(req.params.seat);
-  if (!seatAllowed(req, seat)) return res.status(403).json({ message:'forbidden' });
   const o = ensureOrder(seat);
   const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(o.id);
   res.json({ seat, submitted: !!o.submitted, items: items.map(i=>({id:i.id,name:i.name,unitPrice:i.unit_price,qty:i.qty})) });
 });
 app.put('/api/orders/:seat', auth(), (req,res)=>{
   const seat = Number(req.params.seat);
-  if (!seatAllowed(req, seat)) return res.status(403).json({ message:'forbidden' });
   const { submitted, items } = req.body || {};
   const tx = db.transaction(()=>{
     const o = ensureOrder(seat);
@@ -253,9 +269,7 @@ app.put('/api/orders/:seat', auth(), (req,res)=>{
   logAction(req.user, 'order.update', {seat, submitted, itemsCount: items?.length||0}, req);
   res.json({ ok:true });
 });
-
-// ===== Reports / Missing（僅 admin）=====
-app.get('/api/reports/aggregate', auth(), requireAdmin, (req,res)=>{
+app.get('/api/reports/aggregate', auth(false), (req,res)=>{
   const rows = db.prepare(`
     SELECT name, SUM(qty) AS totalQty, SUM(unit_price*qty) AS totalMoney
     FROM order_items oi
@@ -266,7 +280,7 @@ app.get('/api/reports/aggregate', auth(), requireAdmin, (req,res)=>{
   const total = rows.reduce((s,r)=>s + (r.totalMoney||0), 0);
   res.json({ items: rows, classTotal: total });
 });
-app.get('/api/reports/missing', auth(), requireAdmin, (req,res)=>{
+app.get('/api/reports/missing', auth(false), (req,res)=>{
   const missing = [];
   for(let s=1;s<=36;s++){
     const r = db.prepare('SELECT submitted FROM orders WHERE seat=?').get(s);
@@ -276,6 +290,7 @@ app.get('/api/reports/missing', auth(), requireAdmin, (req,res)=>{
 });
 
 // ===== Users =====
+// 建立使用者（僅 admin）
 app.post('/api/users', auth(), requireAdmin, (req, res) => {
   const { username, password, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
@@ -283,15 +298,41 @@ app.post('/api/users', auth(), requireAdmin, (req, res) => {
   const exists = db.prepare('SELECT 1 FROM users WHERE username=?').get(username);
   if (exists) return res.status(409).json({ message: 'username already exists' });
   const hash = bcrypt.hashSync(password, 10);
-  const info = db.prepare('INSERT INTO users(username, password_hash, role) VALUES(?,?,?)')
-                 .run(username, hash, r);
+  const now = nowISO();
+  const info = db.prepare('INSERT INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)')
+                 .run(username, hash, r, 'active', now, now);
   logAction(req.user, 'user.create', { id: info.lastInsertRowid, username, role:r }, req);
-  res.json({ id: info.lastInsertRowid, username, role:r });
+  res.json({ id: info.lastInsertRowid, username, role:r, status:'active' });
 });
+
+// 列表（admin）：搜尋 / 篩選 / 分頁
 app.get('/api/users', auth(), requireAdmin, (req, res) => {
-  const rows = db.prepare('SELECT id, username, role FROM users ORDER BY id ASC').all();
-  res.json({ users: rows });
+  const q = (req.query.q || '').trim();
+  const role = (req.query.role || '').trim();
+  const status = (req.query.status || '').trim();
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 20)));
+
+  const where = [];
+  const params = {};
+  if (q) { where.push(`(username LIKE @kw)`); params['kw'] = `%${q}%`; }
+  if (role === 'admin' || role === 'user') { where.push(`role=@role`); params['role'] = role; }
+  if (status === 'active' || status === 'disabled') { where.push(`status=@status`); params['status'] = status; }
+
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM users ${whereSql}`).get(params).c;
+  const rows = db.prepare(`
+    SELECT id, username, role, status, created_at, updated_at, last_login_at
+    FROM users
+    ${whereSql}
+    ORDER BY id ASC
+    LIMIT @limit OFFSET @offset
+  `).all({ ...params, limit: pageSize, offset: (page-1)*pageSize });
+
+  res.json({ users: rows, total, page, pageSize });
 });
+
+// 自助或 admin 變更密碼
 app.put('/api/users/:id/password', auth(), (req, res) => {
   const targetId = Number(req.params.id);
   const { oldPassword, newPassword } = req.body || {};
@@ -310,18 +351,88 @@ app.put('/api/users/:id/password', auth(), (req, res) => {
   }
 
   const hash = bcrypt.hashSync(newPassword, 10);
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash, targetId);
+  db.prepare('UPDATE users SET password_hash=?, updated_at=? WHERE id=?').run(hash, nowISO(), targetId);
   logAction(req.user, 'user.changePassword', { targetId, by:'admin?'+isAdmin }, req);
   res.json({ ok:true });
 });
 
-// ===== Logs（admin）=====
+// 變更狀態（admin）
+app.patch('/api/users/:id/status', auth(), requireAdmin, (req,res)=>{
+  const id = Number(req.params.id);
+  const { status } = req.body || {};
+  if (!['active','disabled'].includes(status)) return res.status(400).json({message:'bad status'});
+  if (req.user.uid === id) return res.status(400).json({message:'無法變更自己的狀態'});
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+  if (!u) return res.status(404).json({message:'user not found'});
+  db.prepare('UPDATE users SET status=?, updated_at=? WHERE id=?').run(status, nowISO(), id);
+  logAction(req.user, 'user.status', { targetId:id, status }, req);
+  res.json({ ok:true });
+});
+
+// 變更角色（admin）
+app.patch('/api/users/:id/role', auth(), requireAdmin, (req,res)=>{
+  const id = Number(req.params.id);
+  const { role } = req.body || {};
+  if (!['admin','user'].includes(role)) return res.status(400).json({message:'bad role'});
+  if (req.user.uid === id) return res.status(400).json({message:'無法變更自己的角色'});
+
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+  if (!u) return res.status(404).json({message:'user not found'});
+
+  if (u.role === 'admin' && role === 'user') {
+    const adminCount = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role='admin'").get().c;
+    if (adminCount <= 1) return res.status(400).json({message:'系統至少需要一位管理員'});
+  }
+
+  db.prepare('UPDATE users SET role=?, updated_at=? WHERE id=?').run(role, nowISO(), id);
+  logAction(req.user, 'user.role', { targetId:id, from:u.role, to:role }, req);
+  res.json({ ok:true });
+});
+
+// 單筆刪除（admin）
+app.delete('/api/users/:id', auth(), requireAdmin, (req, res) => {
+  const targetId = Number(req.params.id);
+  if (req.user && req.user.uid === targetId) {
+    return res.status(400).json({ message: '無法刪除自己' });
+  }
+  const u = db.prepare('SELECT * FROM users WHERE id=?').get(targetId);
+  if (!u) return res.status(404).json({ message: 'user not found' });
+  if (u.role === 'admin') {
+    const adminCount = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role='admin'").get().c;
+    if (adminCount <= 1) {
+      return res.status(400).json({ message: '系統至少需要一位管理員，無法刪除' });
+    }
+  }
+  db.prepare('DELETE FROM users WHERE id=?').run(targetId);
+  logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
+  res.json({ ok: true });
+});
+
+// 批次刪除（admin）
+app.delete('/api/users/bulk-delete', auth(), requireAdmin, (req,res)=>{
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
+  if (!ids.length) return res.status(400).json({message:'ids required'});
+  if (ids.includes(req.user.uid)) return res.status(400).json({message:'包含自己，無法刪除'});
+
+  const admins = db.prepare(`SELECT id FROM users WHERE role='admin'`).all().map(x=>x.id);
+  const remainingAdmins = admins.filter(id => !ids.includes(id));
+  if (remainingAdmins.length === 0) return res.status(400).json({message:'不能刪除所有管理員'});
+
+  const tx = db.transaction(()=>{
+    const del = db.prepare('DELETE FROM users WHERE id=?');
+    ids.forEach(id=> del.run(id));
+  });
+  tx();
+  logAction(req.user, 'user.bulkDelete', { ids }, req);
+  res.json({ ok:true, deleted: ids.length });
+});
+
+// ===== Logs =====
 app.get('/api/logs', auth(), requireAdmin, (req,res)=>{
   const rows = db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 500').all();
   res.json({ logs: rows });
 });
 
-// ===== Root =====
 app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
 });
