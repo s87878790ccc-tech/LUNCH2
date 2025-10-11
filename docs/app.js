@@ -4,6 +4,20 @@ const API_BASE = 'https://lunch2.onrender.com/api';
 // ====== DOM ======
 const app = document.getElementById('app');
 const loginLayer = document.getElementById('loginLayer');
+// 讓登入層成為全畫面遮罩 + 置中容器
+function initLoginLayerStyles() {
+  Object.assign(loginLayer.style, {
+    position: 'fixed',
+    inset: '0',                 // top/right/bottom/left = 0
+    width: '100vw',
+    height: '100vh',
+    display: 'none',            // 預設隱藏；showLogin 會打開
+    alignItems: 'center',       // 垂直置中
+    justifyContent: 'center',   // 水平置中
+    pointerEvents: 'none',      // 隱藏時避免擋住點擊
+    zIndex: '9999'
+  });
+}
 const loginUser = document.getElementById('loginUser');
 const loginPass = document.getElementById('loginPass');
 const loginBtn  = document.getElementById('loginBtn');
@@ -72,14 +86,25 @@ apiBaseHint.textContent = `API: ${API_BASE}`;
 function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
+
 function showLogin() {
   loginLayer.classList.remove('hidden');
+  loginLayer.style.display = 'flex';      // 打開並置中
+  loginLayer.style.pointerEvents = 'auto';
   app.classList.add('hidden');
+  app.style.filter = 'none';
 }
+
 function showApp() {
   loginLayer.classList.add('hidden');
+  loginLayer.style.display = 'none';      // 完全隱藏
+  loginLayer.style.pointerEvents = 'none';
   app.classList.remove('hidden');
+  app.style.filter = 'none';
 }
+
+// ⚠️ 一定要在 bootstrap 之前先初始化樣式
+initLoginLayerStyles();
 
 // 登入/登出事件
 loginBtn.onclick = async () => {
