@@ -41,3 +41,12 @@ th{color:var(--muted);font-weight:600}
   opacity: 0 !important;
   pointer-events: none !important;
 }
+/* 手機：按鈕與輸入加大 */
+@media (max-width: 768px){
+  input, select, button { padding: 12px 14px; font-size:18px; border-radius:14px; }
+  .w120 { width: 140px; } .w140{ width: 160px; }
+  .tab { padding:10px 12px; }
+}
+/* 觸控代號鍵盤區塊 */
+.touch-pad{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px }
+.touch-pad button{ min-width:64px }
