@@ -32,9 +32,20 @@ if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
+
+// 讓連線字串一定包含 sslmode=require
+const withSSL =
+  DATABASE_URL.includes('sslmode=') 
+    ? DATABASE_URL
+    : DATABASE_URL + (DATABASE_URL.includes('?') ? '&' : '?') + 'sslmode=require';
+
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Supabase 需要 SSL
+  connectionString: withSSL,
+  ssl: {
+    require: true,             // 明確要求 TLS
+    rejectUnauthorized: false, // 不驗憑證鏈（Supabase 常用）
+  },
+  keepAlive: true,
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
