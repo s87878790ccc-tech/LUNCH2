@@ -2,7 +2,7 @@ require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const helmet = require('helmet');
@@ -13,6 +13,7 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
+const DATABASE_URL = process.env.DATABASE_URL;
 
 // ====== Logging ======
 const LOG_DIR = path.join(__dirname, 'logs');
@@ -20,136 +21,127 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
 // ====== Middleware ======
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true })); // 上線建議改白名單
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
-// ====== DB ======
-const dbPath = process.env.DB_PATH || path.join(__dirname, 'lunch.db');
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
+// ====== DB (pg) ======
+if (!DATABASE_URL) {
+  console.error('Missing DATABASE_URL in env');
+  process.exit(1);
+}
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Supabase 需要 SSL
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+});
 
 const nowISO = () => new Date().toISOString();
 
-db.exec(`
-CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'admin',
-  status TEXT NOT NULL DEFAULT 'active',
-  created_at TEXT,
-  updated_at TEXT,
-  last_login_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS menus(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS menu_items(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  menu_id INTEGER NOT NULL,
-  code INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  price INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS settings(
-  id INTEGER PRIMARY KEY CHECK (id=1),
-  active_menu_id INTEGER,
-  open_days TEXT,     -- JSON array [0..6] (0=Sun)
-  open_start TEXT,    -- 'HH:MM'
-  open_end TEXT       -- 'HH:MM'
-);
-INSERT OR IGNORE INTO settings(id, active_menu_id, open_days, open_start, open_end)
-VALUES(1, NULL, '["1","2","3","4","5"]', '07:00', '12:00');
-
-CREATE TABLE IF NOT EXISTS orders(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  seat INTEGER NOT NULL UNIQUE,
-  submitted INTEGER NOT NULL DEFAULT 0,
-  internal_only INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS order_items(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  order_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  unit_price INTEGER NOT NULL,
-  qty INTEGER NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  action TEXT NOT NULL,
-  details TEXT,
-  ip TEXT,
-  ua TEXT,
-  ts TEXT NOT NULL
-);
-`);
-
-// idempotent upgrades
-try { db.exec(`ALTER TABLE orders ADD COLUMN internal_only INTEGER NOT NULL DEFAULT 0`); } catch {}
-
-// seed admin
-(function seedAdmin() {
-  const name = process.env.ADMIN_DEFAULT_USER || 'admin';
-  const pass = process.env.ADMIN_DEFAULT_PASS || 'admin123';
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(name);
-  if (!u) {
-    const hash = bcrypt.hashSync(pass, 10);
-    db.prepare('INSERT INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)')
-      .run(name, hash, 'admin', 'active', nowISO(), nowISO());
-    console.log('[seed] admin created:', name);
+async function q(sql, params = []) {
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
+async function one(sql, params = []) {
+  const { rows } = await pool.query(sql, params);
+  return rows[0] || null;
+}
+async function tx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
-})();
+}
+async function t_one(client, sql, params = []) {
+  const { rows } = await client.query(sql, params);
+  return rows[0] || null;
+}
+async function t_q(client, sql, params = []) {
+  const { rows } = await client.query(sql, params);
+  return rows;
+}
 
-// 1~36 座號帳號（role=user, 密碼 123456）
-(function seedSeatUsers() {
-  const defaultPass = process.env.SEAT_DEFAULT_PASS || '123456';
-  const hash = bcrypt.hashSync(defaultPass, 10);
-  const insert = db.prepare('INSERT OR IGNORE INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)');
+// ====== bootstrap（seed）======
+async function seed() {
+  const adminName = process.env.ADMIN_DEFAULT_USER || 'admin';
+  const adminPass = process.env.ADMIN_DEFAULT_PASS || 'admin123';
+  const seatPass = process.env.SEAT_DEFAULT_PASS || '123456';
+
+  // admin
+  const u = await one('select * from users where username=$1', [adminName]);
+  if (!u) {
+    const hash = await bcrypt.hash(adminPass, 10);
+    await q(
+      `insert into users(username, password_hash, role, status, created_at, updated_at)
+       values ($1,$2,'admin','active',now(),now())`,
+      [adminName, hash]
+    );
+    console.log('[seed] admin created:', adminName);
+  }
+
+  // 1~36 users
+  const hashSeat = await bcrypt.hash(seatPass, 10);
   for (let s = 1; s <= 36; s++) {
-    insert.run(String(s), hash, 'user', 'active', nowISO(), nowISO());
+    await q(
+      `insert into users(username, password_hash, role, status, created_at, updated_at)
+       values ($1,$2,'user','active',now(),now())
+       on conflict (username) do nothing`,
+      [String(s), hashSeat]
+    );
   }
   console.log('[seed] seat users 1~36 ready (default pass = 123456)');
-})();
+}
 
-const sign = (user) => jwt.sign({ uid:user.id, username:user.username, role:user.role }, JWT_SECRET, { expiresIn: '7d' });
-
+function sign(user) {
+  return jwt.sign({ uid: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+}
 function auth(required = true) {
   return (req, res, next) => {
     const h = req.headers.authorization || '';
     const token = h.startsWith('Bearer ') ? h.slice(7) : null;
     if (!token) return required ? res.status(401).json({ message: 'no token' }) : next();
-    try { req.user = jwt.verify(token, JWT_SECRET); return next(); }
-    catch { return res.status(401).json({ message: 'invalid token' }); }
+    try {
+      req.user = jwt.verify(token, JWT_SECRET);
+      next();
+    } catch {
+      return res.status(401).json({ message: 'invalid token' });
+    }
   };
 }
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
   next();
 }
-function logAction(user, action, details, req) {
-  db.prepare(`INSERT INTO audit_logs(user_id, action, details, ip, ua, ts)
-              VALUES(?,?,?,?,?,?)`)
-    .run(user?.uid || null, action, details ? JSON.stringify(details) : null,
-         req.ip, req.headers['user-agent'] || '', nowISO());
+async function logAction(user, action, details, req) {
+  await q(
+    `insert into audit_logs(user_id, action, details, ip, ua, ts)
+     values ($1,$2,$3,$4,$5,now())`,
+    [user?.uid || null, action, details ? JSON.stringify(details) : null, req.ip, req.headers['user-agent'] || '']
+  );
 }
 
 // helpers
-function ensureOrder(seat) {
-  let o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
+async function ensureOrder(seat) {
+  let o = await one('select * from orders where seat=$1', [seat]);
   if (!o) {
-    db.prepare('INSERT INTO orders(seat, submitted, internal_only, created_at, updated_at) VALUES(?,?,?,?,?)')
-      .run(seat, 0, 0, nowISO(), nowISO());
-    o = db.prepare('SELECT * FROM orders WHERE seat=?').get(seat);
+    o = await one(
+      `insert into orders(seat, submitted, internal_only, created_at, updated_at)
+       values ($1,false,false,now(),now())
+       returning *`,
+      [seat]
+    );
   }
   return o;
 }
@@ -157,254 +149,266 @@ function userCanAccessSeat(user, seat) {
   if (!user) return false;
   if (user.role === 'admin') return true;
   const n = Number(user.username);
-  return Number.isInteger(n) && n === seat; // 一般帳號：帳號=座號
+  return Number.isInteger(n) && n === seat;
 }
-function isOpenNow() {
-  const s = db.prepare('SELECT open_days, open_start, open_end FROM settings WHERE id=1').get();
+async function isOpenNow() {
+  const s = await one('select open_days, open_start, open_end from settings where id=1');
   if (!s) return true;
-  const openDays = JSON.parse(s.open_days || '[]').map(Number); // [0..6]
+  const openDays = (s.open_days || []).map(Number);
   const now = new Date();
   const day = now.getDay(); // 0..6
   if (!openDays.includes(day)) return false;
-
-  const hhmm = (d) => String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  const hhmm = (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   const cur = hhmm(now);
   const start = s.open_start || '00:00';
-  const end   = s.open_end   || '23:59';
-  return (start <= cur && cur <= end);
+  const end = s.open_end || '23:59';
+  return start <= cur && cur <= end;
 }
 
 // ===== Auth =====
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
-  const u = db.prepare('SELECT * FROM users WHERE username=?').get(username);
+
+  const u = await one('select * from users where username=$1', [username]);
   if (!u) return res.status(401).json({ message: 'invalid credentials' });
   if (u.status !== 'active') return res.status(403).json({ message: 'account disabled' });
-  if (!bcrypt.compareSync(password, u.password_hash)) return res.status(401).json({ message: 'invalid credentials' });
 
-  db.prepare('UPDATE users SET last_login_at=?, updated_at=? WHERE id=?')
-    .run(nowISO(), nowISO(), u.id);
+  const ok = await bcrypt.compare(password, u.password_hash);
+  if (!ok) return res.status(401).json({ message: 'invalid credentials' });
+
+  await q('update users set last_login_at=now(), updated_at=now() where id=$1', [u.id]);
 
   const token = sign(u);
-  logAction({ uid: u.id }, 'login', { username }, req);
-  res.json({ token, user: { id:u.id, username:u.username, role:u.role } });
+  await logAction({ uid: u.id }, 'login', { username }, req);
+  res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
 });
-app.get('/api/auth/me', auth(), (req, res) => res.json({ user: req.user }));
+
+app.get('/api/auth/me', auth(), async (req, res) => {
+  res.json({ user: req.user });
+});
 
 // ===== Settings (admin) =====
-app.get('/api/settings/open-window', auth(), requireAdmin, (req, res) => {
-  const s = db.prepare('SELECT open_days, open_start, open_end FROM settings WHERE id=1').get();
+app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
+  const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
-    openDays: s?.open_days ? JSON.parse(s.open_days) : ["1","2","3","4","5"],
+    openDays: s?.open_days || ["1","2","3","4","5"],
     openStart: s?.open_start || '07:00',
     openEnd: s?.open_end || '12:00',
   });
 });
-app.put('/api/settings/open-window', auth(), requireAdmin, (req, res) => {
+app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const { openDays, openStart, openEnd } = req.body || {};
-  const days = Array.isArray(openDays) ? openDays.map(String) : ["1","2","3","4","5"];
-  db.prepare('UPDATE settings SET open_days=?, open_start=?, open_end=? WHERE id=1')
-    .run(JSON.stringify(days), openStart || '07:00', openEnd || '12:00');
-  logAction(req.user, 'settings.openWindow', { openDays:days, openStart, openEnd }, req);
+  const days = Array.isArray(openDays) ? openDays : ["1","2","3","4","5"];
+  await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
+  await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
   res.json({ ok: true });
 });
 
 // ===== Menus =====
-app.get('/api/menus', auth(false), (req, res) => {
-  const menus = db.prepare('SELECT * FROM menus').all();
-  const items = db.prepare('SELECT * FROM menu_items ORDER BY menu_id, code').all();
-  const setting = db.prepare('SELECT active_menu_id FROM settings WHERE id=1').get();
+app.get('/api/menus', auth(false), async (req, res) => {
+  const menus = await q('select * from menus order by id asc');
+  const items = await q('select * from menu_items order by menu_id asc, code asc');
+  const setting = await one('select active_menu_id from settings where id=1');
   const grouped = menus.map(m => ({
     id: m.id, name: m.name,
-    items: items.filter(x => x.menu_id === m.id).map(x => ({ id:x.id, code:x.code, name:x.name, price:x.price }))
+    items: items.filter(x => x.menu_id === m.id).map(x => ({ id: x.id, code: x.code, name: x.name, price: x.price }))
   }));
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
-app.post('/api/menus', auth(), requireAdmin, (req, res) => {
+app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
   const { name } = req.body || {};
   if (!name) return res.status(400).json({ message: 'name required' });
-  const info = db.prepare('INSERT INTO menus(name) VALUES(?)').run(name);
-  logAction(req.user, 'menu.create', { id: info.lastInsertRowid, name }, req);
-  res.json({ id: info.lastInsertRowid, name, items: [] });
+  const row = await one('insert into menus(name) values ($1) returning id', [name]);
+  await logAction(req.user, 'menu.create', { id: row.id, name }, req);
+  res.json({ id: row.id, name, items: [] });
 });
-app.put('/api/menus/:id', auth(), requireAdmin, (req, res) => {
+app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { name } = req.body || {};
-  db.prepare('UPDATE menus SET name=? WHERE id=?').run(name, id);
-  logAction(req.user, 'menu.update', { id, name }, req);
+  await q('update menus set name=$1 where id=$2', [name, id]);
+  await logAction(req.user, 'menu.update', { id, name }, req);
   res.json({ ok: true });
 });
-app.delete('/api/menus/:id', auth(), requireAdmin, (req, res) => {
+app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const tx = db.transaction(() => {
-    db.prepare('DELETE FROM menu_items WHERE menu_id=?').run(id);
-    db.prepare('DELETE FROM menus WHERE id=?').run(id);
-    const s = db.prepare('SELECT active_menu_id FROM settings WHERE id=1').get();
-    if (s?.active_menu_id === id) db.prepare('UPDATE settings SET active_menu_id=NULL WHERE id=1').run();
+  await tx(async (c) => {
+    await c.query('delete from menu_items where menu_id=$1', [id]);
+    await c.query('delete from menus where id=$1', [id]);
+    const s = await t_one(c, 'select active_menu_id from settings where id=1');
+    if (s?.active_menu_id === id) await c.query('update settings set active_menu_id=null where id=1');
   });
-  tx();
-  logAction(req.user, 'menu.delete', { id }, req);
+  await logAction(req.user, 'menu.delete', { id }, req);
   res.json({ ok: true });
 });
-app.post('/api/menus/:id/items', auth(), requireAdmin, (req, res) => {
+app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
   const { name, price } = req.body || {};
   if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
-  const max = db.prepare('SELECT COALESCE(MAX(code),0) AS c FROM menu_items WHERE menu_id=?').get(menuId).c;
-  const info = db.prepare('INSERT INTO menu_items(menu_id, code, name, price) VALUES(?,?,?,?)')
-    .run(menuId, max + 1, name, Number(price));
-  logAction(req.user, 'menu.item.create', { menuId, itemId: info.lastInsertRowid, name, price }, req);
-  res.json({ id: info.lastInsertRowid, code: max + 1, name, price: Number(price) });
+  const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
+  const row = await one(
+    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
+    [menuId, Number(max.c) + 1, name, Number(price)]
+  );
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
+  res.json(row);
 });
-app.put('/api/menu-items/:itemId', auth(), requireAdmin, (req, res) => {
+app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
   const { name, price } = req.body || {};
-  db.prepare('UPDATE menu_items SET name=?, price=? WHERE id=?').run(name, Number(price), itemId);
-  logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
+  await q('update menu_items set name=$1, price=$2 where id=$3', [name, Number(price), itemId]);
+  await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
   res.json({ ok: true });
 });
-app.delete('/api/menu-items/:itemId', auth(), requireAdmin, (req, res) => {
+app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const row = db.prepare('SELECT menu_id FROM menu_items WHERE id=?').get(itemId);
+  const row = await one('select menu_id from menu_items where id=$1', [itemId]);
   if (row) {
-    const tx = db.transaction(() => {
-      db.prepare('DELETE FROM menu_items WHERE id=?').run(itemId);
-      const items = db.prepare('SELECT id FROM menu_items WHERE menu_id=? ORDER BY code').all(row.menu_id);
-      items.forEach((it, idx) => db.prepare('UPDATE menu_items SET code=? WHERE id=?').run(idx + 1, it.id));
+    await tx(async (c) => {
+      await c.query('delete from menu_items where id=$1', [itemId]);
+      const items = await t_q(c, 'select id from menu_items where menu_id=$1 order by code asc, id asc', [row.menu_id]);
+      for (let i = 0; i < items.length; i++) {
+        await c.query('update menu_items set code=$1 where id=$2', [i + 1, items[i].id]);
+      }
     });
-    tx();
   }
-  logAction(req.user, 'menu.item.delete', { itemId }, req);
+  await logAction(req.user, 'menu.item.delete', { itemId }, req);
   res.json({ ok: true });
 });
-app.put('/api/settings/active-menu', auth(), requireAdmin, (req, res) => {
+app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
   const { menuId } = req.body || {};
-  db.prepare('UPDATE settings SET active_menu_id=? WHERE id=1').run(menuId ?? null);
-  logAction(req.user, 'settings.activeMenu', { menuId }, req);
+  await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
+  await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
 });
 
 // ===== Orders =====
-app.get('/api/orders/:seat', auth(), (req, res) => {
+app.get('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
 
-  const o = ensureOrder(seat);
-  const items = db.prepare('SELECT * FROM order_items WHERE order_id=?').all(o.id);
+  const o = await ensureOrder(seat);
+  const items = await q('select * from order_items where order_id=$1 order by id asc', [o.id]);
   res.json({
     seat,
     submitted: !!o.submitted,
     internalOnly: !!o.internal_only,
-    items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
+    items: items.map(i => ({ id: i.id, name: i.name, unitPrice: i.unit_price, qty: i.qty })),
   });
 });
 
-app.put('/api/orders/:seat', auth(), (req, res) => {
+app.put('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
 
-  // 非 admin 要在開放時段內才能送單
-  if (req.user.role !== 'admin' && !isOpenNow()) {
+  if (req.user.role !== 'admin' && !(await isOpenNow())) {
     return res.status(403).json({ message: 'not in open window' });
   }
 
   const { items = [], internalOnly = false } = req.body || {};
-  const tx = db.transaction(() => {
-    const o = ensureOrder(seat);
+  await tx(async (c) => {
+    const o = await t_one(c, 'select * from orders where seat=$1', [seat]) || await t_one(
+      c,
+      `insert into orders(seat, submitted, internal_only, created_at, updated_at)
+       values ($1,false,false,now(),now()) returning *`,
+      [seat]
+    );
 
     let finalItems = items;
-    let flag = internalOnly ? 1 : 0;
+    let flag = internalOnly ? true : false;
 
     if (internalOnly) {
-      // 強制只有「內訂」一筆、單價0、數量1
       finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
     }
+    const submitted = finalItems.length > 0;
 
-    const submitted = finalItems.length > 0 ? 1 : 0;
-
-    db.prepare('UPDATE orders SET submitted=?, internal_only=?, updated_at=? WHERE id=?')
-      .run(submitted, flag, nowISO(), o.id);
-
-    db.prepare('DELETE FROM order_items WHERE order_id=?').run(o.id);
-    finalItems.forEach(it => {
-      db.prepare('INSERT INTO order_items(order_id, name, unit_price, qty) VALUES(?,?,?,?)')
-        .run(o.id, String(it.name), Number(it.unitPrice), Number(it.qty));
-    });
+    await c.query('update orders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
+      submitted, flag, o.id,
+    ]);
+    await c.query('delete from order_items where order_id=$1', [o.id]);
+    for (const it of finalItems) {
+      await c.query(
+        'insert into order_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+        [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
+      );
+    }
   });
-  tx();
-  logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items||[]).length }, req);
+
+  await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items || []).length }, req);
   res.json({ ok: true });
 });
 
 // 報表（僅 admin）
-app.get('/api/reports/aggregate', auth(), requireAdmin, (req, res) => {
-  const rows = db.prepare(`
-    SELECT name, SUM(qty) AS totalQty, SUM(unit_price*qty) AS totalMoney
-    FROM order_items oi
-    JOIN orders o ON oi.order_id=o.id
-    GROUP BY name
-    ORDER BY totalMoney DESC, name ASC
-  `).all();
+app.get('/api/reports/aggregate', auth(), requireAdmin, async (req, res) => {
+  const rows = await q(
+    `select name, sum(qty)::int as "totalQty", sum(unit_price*qty)::int as "totalMoney"
+     from order_items oi
+     join orders o on oi.order_id=o.id
+     group by name
+     order by "totalMoney" desc, name asc`
+  );
   const total = rows.reduce((s, r) => s + (r.totalMoney || 0), 0);
   res.json({ items: rows, classTotal: total });
 });
-app.get('/api/reports/missing', auth(), requireAdmin, (req, res) => {
+app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
+  const rows = await q('select seat, submitted from orders');
+  const submittedSet = new Set(rows.filter(r => r.submitted).map(r => r.seat));
   const missing = [];
-  for (let s = 1; s <= 36; s++) {
-    const r = db.prepare('SELECT submitted FROM orders WHERE seat=?').get(s);
-    if (!r || !r.submitted) missing.push(s);
-  }
+  for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
   res.json({ missing });
 });
 
 // ===== Users =====
-app.post('/api/users', auth(), requireAdmin, (req, res) => {
+app.post('/api/users', auth(), requireAdmin, async (req, res) => {
   const { username, password, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
   const r = (role === 'admin' || role === 'user') ? role : 'user';
-  const exists = db.prepare('SELECT 1 FROM users WHERE username=?').get(username);
-  if (exists) return res.status(409).json({ message: 'username already exists' });
-  const hash = bcrypt.hashSync(password, 10);
-  const now = nowISO();
-  const info = db.prepare('INSERT INTO users(username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?)')
-    .run(username, hash, r, 'active', now, now);
-  logAction(req.user, 'user.create', { id: info.lastInsertRowid, username, role: r }, req);
-  res.json({ id: info.lastInsertRowid, username, role: r, status: 'active' });
+  const exist = await one('select 1 from users where username=$1', [username]);
+  if (exist) return res.status(409).json({ message: 'username already exists' });
+  const hash = await bcrypt.hash(password, 10);
+  const row = await one(
+    `insert into users(username, password_hash, role, status, created_at, updated_at)
+     values ($1,$2,$3,'active',now(),now())
+     returning id, username, role, status`,
+    [username, hash, r]
+  );
+  await logAction(req.user, 'user.create', { id: row.id, username, role: r }, req);
+  res.json(row);
 });
 
-app.get('/api/users', auth(), requireAdmin, (req, res) => {
-  const q = (req.query.q || '').trim();
+app.get('/api/users', auth(), requireAdmin, async (req, res) => {
+  const qkw = (req.query.q || '').trim();
   const role = (req.query.role || '').trim();
   const status = (req.query.status || '').trim();
   const page = Math.max(1, Number(req.query.page || 1));
   const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 20)));
 
-  const where = [];
-  const params = {};
-  if (q) { where.push(`(username LIKE @kw)`); params['kw'] = `%${q}%`; }
-  if (role === 'admin' || role === 'user') { where.push(`role=@role`); params['role'] = role; }
-  if (status === 'active' || status === 'disabled') { where.push(`status=@status`); params['status'] = status; }
+  const clauses = [];
+  const params = [];
+  if (qkw) { params.push(`%${qkw}%`); clauses.push(`username ilike $${params.length}`); }
+  if (role === 'admin' || role === 'user') { params.push(role); clauses.push(`role=$${params.length}`); }
+  if (status === 'active' || status === 'disabled') { params.push(status); clauses.push(`status=$${params.length}`); }
+  const where = clauses.length ? 'where ' + clauses.join(' and ') : '';
 
-  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const total = db.prepare(`SELECT COUNT(*) AS c FROM users ${whereSql}`).get(params).c;
-  const rows = db.prepare(`
-    SELECT id, username, role, status, created_at, updated_at, last_login_at
-    FROM users
-    ${whereSql}
-    ORDER BY id ASC
-    LIMIT @limit OFFSET @offset
-  `).all({ ...params, limit: pageSize, offset: (page - 1) * pageSize });
-
-  res.json({ users: rows, total, page, pageSize });
+  const totalRow = await one(`select count(*)::int as c from users ${where}`, params);
+  params.push(pageSize, (page - 1) * pageSize);
+  const rows = await q(
+    `select id, username, role, status, created_at, updated_at, last_login_at
+     from users
+     ${where}
+     order by id asc
+     limit $${params.length - 1} offset $${params.length}`,
+    params
+  );
+  res.json({ users: rows, total: totalRow.c, page, pageSize });
 });
 
-app.put('/api/users/:id/password', auth(), (req, res) => {
+app.put('/api/users/:id/password', auth(), async (req, res) => {
   const targetId = Number(req.params.id);
   const { oldPassword, newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ message: 'newPassword too short' });
 
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(targetId);
+  const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
 
   const isAdmin = req.user && req.user.role === 'admin';
@@ -413,88 +417,103 @@ app.put('/api/users/:id/password', auth(), (req, res) => {
 
   if (!isAdmin) {
     if (!oldPassword) return res.status(400).json({ message: 'oldPassword required' });
-    if (!bcrypt.compareSync(oldPassword, u.password_hash)) return res.status(401).json({ message: 'oldPassword incorrect' });
+    const ok = await bcrypt.compare(oldPassword, u.password_hash);
+    if (!ok) return res.status(401).json({ message: 'oldPassword incorrect' });
   }
 
-  const hash = bcrypt.hashSync(newPassword, 10);
-  db.prepare('UPDATE users SET password_hash=?, updated_at=? WHERE id=?').run(hash, nowISO(), targetId);
-  logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
+  const hash = await bcrypt.hash(newPassword, 10);
+  await q('update users set password_hash=$1, updated_at=now() where id=$2', [hash, targetId]);
+  await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
   res.json({ ok: true });
 });
 
-app.patch('/api/users/:id/status', auth(), requireAdmin, (req, res) => {
+app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { status } = req.body || {};
   if (!['active', 'disabled'].includes(status)) return res.status(400).json({ message: 'bad status' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的狀態' });
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+
+  const u = await one('select * from users where id=$1', [id]);
   if (!u) return res.status(404).json({ message: 'user not found' });
-  db.prepare('UPDATE users SET status=?, updated_at=? WHERE id=?').run(status, nowISO(), id);
-  logAction(req.user, 'user.status', { targetId: id, status }, req);
+
+  await q('update users set status=$1, updated_at=now() where id=$2', [status, id]);
+  await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
 });
 
-app.patch('/api/users/:id/role', auth(), requireAdmin, (req, res) => {
+app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { role } = req.body || {};
   if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: 'bad role' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的角色' });
 
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+  const u = await one('select * from users where id=$1', [id]);
   if (!u) return res.status(404).json({ message: 'user not found' });
 
   if (u.role === 'admin' && role === 'user') {
-    const adminCount = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role='admin'").get().c;
-    if (adminCount <= 1) return res.status(400).json({ message: '系統至少需要一位管理員' });
+    const a = await one(`select count(*)::int as c from users where role='admin'`);
+    if (a.c <= 1) return res.status(400).json({ message: '系統至少需要一位管理員' });
   }
 
-  db.prepare('UPDATE users SET role=?, updated_at=? WHERE id=?').run(role, nowISO(), id);
-  logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
+  await q('update users set role=$1, updated_at=now() where id=$2', [role, id]);
+  await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
   res.json({ ok: true });
 });
 
-app.delete('/api/users/:id', auth(), requireAdmin, (req, res) => {
+app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   const targetId = Number(req.params.id);
-  if (req.user && req.user.uid === targetId) {
-    return res.status(400).json({ message: '無法刪除自己' });
-  }
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(targetId);
+  if (req.user && req.user.uid === targetId) return res.status(400).json({ message: '無法刪除自己' });
+
+  const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
+
   if (u.role === 'admin') {
-    const adminCount = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role='admin'").get().c;
-    if (adminCount <= 1) return res.status(400).json({ message: '系統至少需要一位管理員，無法刪除' });
+    const a = await one(`select count(*)::int as c from users where role='admin'`);
+    if (a.c <= 1) return res.status(400).json({ message: '系統至少需要一位管理員，無法刪除' });
   }
-  db.prepare('DELETE FROM users WHERE id=?').run(targetId);
-  logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
+
+  await q('delete from users where id=$1', [targetId]);
+  await logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
   res.json({ ok: true });
 });
 
-app.delete('/api/users/bulk-delete', auth(), requireAdmin, (req, res) => {
+app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
   if (!ids.length) return res.status(400).json({ message: 'ids required' });
   if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
 
-  const admins = db.prepare(`SELECT id FROM users WHERE role='admin'`).all().map(x => x.id);
-  const remainingAdmins = admins.filter(id => !ids.includes(id));
+  const admins = await q(`select id from users where role='admin'`);
+  const adminIds = new Set(admins.map(x => x.id));
+  const remainingAdmins = [...adminIds].filter(id => !ids.includes(id));
   if (remainingAdmins.length === 0) return res.status(400).json({ message: '不能刪除所有管理員' });
 
-  const tx = db.transaction(() => {
-    const del = db.prepare('DELETE FROM users WHERE id=?');
-    ids.forEach(id => del.run(id));
+  await tx(async (c) => {
+    for (const id of ids) {
+      await c.query('delete from users where id=$1', [id]);
+    }
   });
-  tx();
-  logAction(req.user, 'user.bulkDelete', { ids }, req);
+  await logAction(req.user, 'user.bulkDelete', { ids }, req);
   res.json({ ok: true, deleted: ids.length });
 });
 
 // ===== Logs =====
-app.get('/api/logs', auth(), requireAdmin, (req, res) => {
-  const rows = db.prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 500').all();
+app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
+  const rows = await q('select * from audit_logs order by id desc limit 500');
   res.json({ logs: rows });
 });
 
 app.get('/', (req, res) => {
-  res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
+  res.type('text').send('Lunch Orders API (Supabase/PostgreSQL) is running.\nTry GET /api/menus');
 });
 
-app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
+(async function start() {
+  try {
+    // Test connection & seed
+    await one('select now()');
+    await seed();
+    app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
+  } catch (e) {
+    console.error('Startup error:', e);
+    process.exit(1);
+  }
+})();
