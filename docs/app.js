@@ -38,7 +38,7 @@ const pageLogs    = document.getElementById('pageLogs');
 const pageUsers   = document.getElementById('pageUsers');
 
 const seatSelect = document.getElementById('seatSelect');
-// 這個按鈕在新版 UI 已移除，但程式仍容許存在就加上事件
+// 這個按鈕在新版 UI 已移除，但程式仍容許存在就加上事件（若不存在不會報錯）
 const toggleSubmitted = document.getElementById('toggleSubmitted');
 
 const clearSeat = document.getElementById('clearSeat');
@@ -85,6 +85,19 @@ const usersTableBody = document.getElementById('usersTableBody');
 // ====== 開放時段狀態（新增）======
 let isOpenWindow = true;
 const closedBanner = document.getElementById('closedBanner');
+
+// ====== 後台：點餐時段設定（DOM）======
+const owDayInputs = Array.from(document.querySelectorAll('input[name="owDay"]'));
+const owStart = document.getElementById('owStart');
+const owEnd = document.getElementById('owEnd');
+const owSave = document.getElementById('owSave');
+const owReload = document.getElementById('owReload');
+const owMsg = document.getElementById('owMsg');
+
+// ====== 後台：座號明細（DOM）======
+const bySeatTBody = document.getElementById('bySeatTBody');
+const loadBySeatBtn = document.getElementById('loadBySeat');
+const loadBySeatMsg = document.getElementById('loadBySeatMsg');
 
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
 let token = localStorage.getItem('jwt') || null;
@@ -138,7 +151,7 @@ loginBtn.onclick = async () => {
     localStorage.setItem('jwt', token);
     onLoginUser(data.user);
     applyMobileUI();
-    await fetchOpenStatus();     // 取得開放狀態
+    await fetchOpenStatus();     // 取得開放狀態（公開）
     await initApp();
     switchTab('orders');
     showApp();
@@ -182,6 +195,8 @@ const state = {
   menus: [],
   activeMenuId: null,
   ordersCache: new Map(),
+  owLoaded: false,        // 後台時段設定是否載入過
+  bySeatData: null,       // 後台座號明細暫存
 };
 function onLoginUser(user){
   state.me = user;
@@ -207,7 +222,7 @@ function onLoginUser(user){
   }
 }
 
-// ====== 開放時段：查詢與渲染（新增）======
+// ====== 開放時段（公開給前端顯示）======
 async function fetchOpenStatus(){
   try{
     const data = await api('/open-status', { method:'GET' }); // server 提供的公開狀態
@@ -239,6 +254,83 @@ function guardOpenWindow(){
   return true;
 }
 
+// ====== 後台：點餐時段設定（admin）======
+async function loadOpenWindowSettings(){
+  if (!owStart || !owEnd || !owDayInputs.length) return;
+  try{
+    const s = await api('/settings/open-window', { method:'GET' });
+    // days 可能是字串或數字；全部轉為字串比對
+    const days = (s.openDays || []).map(String);
+    owDayInputs.forEach(cb => cb.checked = days.includes(String(cb.value)));
+    owStart.value = s.openStart || '07:00';
+    owEnd.value   = s.openEnd   || '12:00';
+    owMsg.textContent = '已載入';
+    state.owLoaded = true;
+  }catch(e){
+    owMsg.textContent = '讀取失敗：' + e.message;
+  }
+}
+async function saveOpenWindowSettings(){
+  if (!owStart || !owEnd || !owDayInputs.length) return;
+  const days = owDayInputs.filter(cb=>cb.checked).map(cb=>Number(cb.value));
+  if (!days.length) { alert('請至少勾選一個開放日'); return; }
+  if (!owStart.value || !owEnd.value) { alert('請設定開始/結束時間'); return; }
+  try{
+    await api('/settings/open-window', {
+      method:'PUT',
+      body: JSON.stringify({ openDays: days, openStart: owStart.value, openEnd: owEnd.value })
+    });
+    owMsg.textContent = '已儲存';
+    // 更新公開狀態橫幅
+    await fetchOpenStatus();
+  }catch(e){
+    owMsg.textContent = '儲存失敗：' + e.message;
+  }
+}
+owReload?.addEventListener('click', loadOpenWindowSettings);
+owSave?.addEventListener('click', saveOpenWindowSettings);
+
+// ====== 後台：座號訂單合計與明細（admin）======
+function calcSubtotal(items){
+  return (items||[]).reduce((s,it)=> s + Number(it.unitPrice||0) * Number(it.qty||0), 0);
+}
+function seatStatusText(order){
+  // 後端已改為：有品項 => 自動 submitted
+  return (order.items && order.items.length>0) ? '完成' : '未完成';
+}
+async function loadBySeatReport(){
+  if (!bySeatTBody) return;
+  loadBySeatMsg.textContent = '載入中…';
+  bySeatTBody.innerHTML = `<tr><td colspan="4">載入中…</td></tr>`;
+  try{
+    const seats = Array.from({length:MAX_SEAT}, (_,i)=>i+1);
+    const orders = await Promise.all(seats.map(seat => api(`/orders/${seat}`)));
+    state.bySeatData = orders.map(o => ({
+      seat: o.seat,
+      submitted: !!o.submitted,
+      subtotal: calcSubtotal(o.items||[]),
+      items: o.items||[]
+    }));
+    // 渲染
+    bySeatTBody.innerHTML = state.bySeatData.map(r=>{
+      const detail = r.items.length
+        ? r.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
+        : '<span class="muted small">—</span>';
+      return `<tr>
+        <td>${r.seat}</td>
+        <td>${seatStatusText(r)}</td>
+        <td>${r.subtotal.toLocaleString('zh-Hant-TW')}</td>
+        <td>${detail}</td>
+      </tr>`;
+    }).join('');
+    loadBySeatMsg.textContent = `完成（共 ${state.bySeatData.filter(x=>x.subtotal>0).length} 人有填單）`;
+  }catch(e){
+    bySeatTBody.innerHTML = `<tr><td colspan="4">讀取失敗：${e.message}</td></tr>`;
+    loadBySeatMsg.textContent = '讀取失敗';
+  }
+}
+loadBySeatBtn?.addEventListener('click', loadBySeatReport);
+
 // ====== UI 切頁 ======
 function switchTab(which){
   const map = {
@@ -253,7 +345,12 @@ function switchTab(which){
     btn.classList.toggle('active', k===which);
     page.classList.toggle('hidden', k!==which);
   }
-  if (which==='reports') { renderAgg(); renderMissing(); }
+  if (which==='reports') {
+    renderAgg();
+    renderMissing();
+    // 首次進入後台頁，載入時段設定（admin）
+    if (state.me?.role === 'admin' && !state.owLoaded) loadOpenWindowSettings();
+  }
   if (which==='logs') { renderLogs(); }
   if (which==='users') { loadUsers(); }
 }

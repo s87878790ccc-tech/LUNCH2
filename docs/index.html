@@ -138,7 +138,7 @@
       </div>
     </section>
 
-    <!-- 後台頁（彙整＋缺單） -->
+    <!-- 後台頁（彙整＋缺單＋時段設定＋座號明細） -->
     <section id="pageReports" class="hidden">
       <div class="grid">
         <div class="card">
@@ -153,6 +153,56 @@
         <div class="card">
           <h3>尚未完成訂單名單</h3>
           <div id="missingList" class="muted"></div>
+        </div>
+
+        <!-- Admin：點餐時段設定 -->
+        <div class="card only-admin">
+          <h3>點餐時段設定（admin）</h3>
+          <div class="row" style="flex-wrap:wrap;gap:12px">
+            <div>
+              <div class="small muted">開放星期</div>
+              <div id="owDaysWrap" style="display:flex;gap:8px;flex-wrap:wrap">
+                <!-- 0..6: 日一二三四五六 -->
+                <label class="pill"><input type="checkbox" name="owDay" value="1"> 一</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="2"> 二</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="3"> 三</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="4"> 四</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="5"> 五</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="6"> 六</label>
+                <label class="pill"><input type="checkbox" name="owDay" value="0"> 日</label>
+              </div>
+            </div>
+            <div>
+              <div class="small muted">開始時間</div>
+              <input id="owStart" type="time" value="07:00" class="w140" />
+            </div>
+            <div>
+              <div class="small muted">結束時間</div>
+              <input id="owEnd" type="time" value="12:00" class="w140" />
+            </div>
+            <div style="display:flex;gap:8px;align-items:end">
+              <button id="owReload" class="ghost">讀取目前設定</button>
+              <button id="owSave" class="primary">儲存設定</button>
+              <span id="owMsg" class="small muted"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Admin：座號訂單合計與明細 -->
+        <div class="card only-admin">
+          <div class="section-title">
+            <h3>座號訂單明細（admin）</h3>
+            <div class="row" style="gap:8px">
+              <button id="loadBySeat" class="ghost">載入/更新</button>
+              <span id="loadBySeatMsg" class="small muted"></span>
+            </div>
+          </div>
+          <table id="bySeatTable">
+            <thead>
+              <tr><th>座號</th><th>狀態</th><th>合計金額</th><th>明細</th></tr>
+            </thead>
+            <tbody id="bySeatTBody"></tbody>
+          </table>
         </div>
       </div>
     </section>
