@@ -259,6 +259,28 @@ app.get('/api/auth/me', auth(), async (req, res) => {
   res.json({ user: req.user });
 });
 
+// === Public: 是否在開放點餐時段 ===
+app.get('/api/open-status', async (req, res) => {
+  const s = await one('select open_days, open_start, open_end from settings where id=1');
+  // 內部判斷
+  const openDays = (s?.open_days || [1,2,3,4,5]).map(Number);
+  const now = new Date();
+  const day = now.getDay(); // 0..6 (週日=0)
+  const hhmm = (d) => String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  const cur = hhmm(now);
+  const start = s?.open_start || '07:00';
+  const end   = s?.open_end   || '12:00';
+  const open = openDays.includes(day) && (start <= cur && cur <= end);
+
+  res.json({
+    open,
+    openDays,
+    openStart: start,
+    openEnd: end,
+    now: now.toISOString(),
+  });
+});
+
 // Settings (admin)
 app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
