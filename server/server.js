@@ -15,35 +15,61 @@ const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 const DATABASE_URL = process.env.DATABASE_URL;
 
-// ====== Logging ======
+/* =========================
+   Logging
+   ========================= */
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
-// ====== Middleware ======
+/* =========================
+   Security / Middleware
+   ========================= */
 app.use(helmet());
-app.use(cors({ origin: true, credentials: true }));
+
+// CORS 改成白名單：允許 GitHub Pages 前端呼叫
+const ALLOW_ORIGINS = [
+  'https://s87878790ccc-tech.github.io', // 你的 GitHub Pages 網域
+];
+app.use(cors({
+  origin(origin, cb) {
+    // 同源 / 無 Origin（server-side / curl）放行
+    if (!origin) return cb(null, true);
+    if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'), false);
+  },
+  credentials: true,
+}));
+
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
-// ====== DB (pg) ======
+/* =========================
+   DB (pg) 連線
+   ========================= */
 if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
 
-// 讓連線字串一定包含 sslmode=require
-const withSSL =
-  DATABASE_URL.includes('sslmode=') 
-    ? DATABASE_URL
-    : DATABASE_URL + (DATABASE_URL.includes('?') ? '&' : '?') + 'sslmode=require';
+// 解析 URL，移除任何 sslmode，由程式碼強制設定 SSL 行為
+let pgUrl;
+try {
+  pgUrl = new URL(DATABASE_URL);
+  if (pgUrl.searchParams.has('sslmode')) {
+    pgUrl.searchParams.delete('sslmode');
+  }
+} catch (e) {
+  console.error('Bad DATABASE_URL:', e);
+  process.exit(1);
+}
 
 const pool = new Pool({
-  connectionString: withSSL,
+  connectionString: pgUrl.toString(),
   ssl: {
-    require: true,             // 明確要求 TLS
-    rejectUnauthorized: false, // 不驗憑證鏈（Supabase 常用）
+    require: true,
+    rejectUnauthorized: false, // 關鍵：避免 SELF_SIGNED_CERT_IN_CHAIN
   },
   keepAlive: true,
   max: 10,
@@ -88,7 +114,6 @@ async function t_q(client, sql, params = []) {
    方案 A：安全升級 settings 欄位
    ========================= */
 async function ensureSettingsSchema() {
-  // 確保 settings 表存在（若你原本就已建立，這段不會覆蓋資料）
   await pool.query(`
     create table if not exists settings(
       id integer primary key,
@@ -98,22 +123,16 @@ async function ensureSettingsSchema() {
       open_end   text default '12:00'
     )
   `);
-
-  // 對既有 settings 表做欄位補強（idempotent）
   await pool.query(`
     alter table if exists settings
       add column if not exists open_days integer[] default '{1,2,3,4,5}',
       add column if not exists open_start text default '07:00',
       add column if not exists open_end   text default '12:00'
   `);
-
-  // 確保有 id=1 的設定列
   await pool.query(`
     insert into settings(id) values(1)
     on conflict (id) do nothing
   `);
-
-  // 補上預設值（如果是 null）
   await pool.query(`
     update settings
     set open_days = coalesce(open_days, '{1,2,3,4,5}'),
@@ -123,13 +142,14 @@ async function ensureSettingsSchema() {
   `);
 }
 
-// ====== bootstrap（seed）======
+/* =========================
+   bootstrap（seed）
+   ========================= */
 async function seed() {
   const adminName = process.env.ADMIN_DEFAULT_USER || 'admin';
   const adminPass = process.env.ADMIN_DEFAULT_PASS || 'admin123';
   const seatPass = process.env.SEAT_DEFAULT_PASS || '123456';
 
-  // admin
   const u = await one('select * from users where username=$1', [adminName]);
   if (!u) {
     const hash = await bcrypt.hash(adminPass, 10);
@@ -141,7 +161,6 @@ async function seed() {
     console.log('[seed] admin created:', adminName);
   }
 
-  // 1~36 users
   const hashSeat = await bcrypt.hash(seatPass, 10);
   for (let s = 1; s <= 36; s++) {
     await q(
@@ -206,7 +225,7 @@ async function isOpenNow() {
   if (!s) return true;
   const openDays = (s.open_days || []).map(Number);
   const now = new Date();
-  const day = now.getDay(); // 0..6
+  const day = now.getDay(); // 0..6 (Sun=0)
   if (!openDays.includes(day)) return false;
   const hhmm = (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   const cur = hhmm(now);
@@ -215,7 +234,10 @@ async function isOpenNow() {
   return start <= cur && cur <= end;
 }
 
-// ===== Auth =====
+/* =========================
+   Routes
+   ========================= */
+// Auth
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
@@ -233,29 +255,28 @@ app.post('/api/auth/login', async (req, res) => {
   await logAction({ uid: u.id }, 'login', { username }, req);
   res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
 });
-
 app.get('/api/auth/me', auth(), async (req, res) => {
   res.json({ user: req.user });
 });
 
-// ===== Settings (admin) =====
+// Settings (admin)
 app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
-    openDays: s?.open_days || ["1","2","3","4","5"],
+    openDays: s?.open_days || ['1', '2', '3', '4', '5'],
     openStart: s?.open_start || '07:00',
     openEnd: s?.open_end || '12:00',
   });
 });
 app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const { openDays, openStart, openEnd } = req.body || {};
-  const days = Array.isArray(openDays) ? openDays : ["1","2","3","4","5"];
+  const days = Array.isArray(openDays) ? openDays : ['1', '2', '3', '4', '5'];
   await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
   res.json({ ok: true });
 });
 
-// ===== Menus =====
+// Menus
 app.get('/api/menus', auth(false), async (req, res) => {
   const menus = await q('select * from menus order by id asc');
   const items = await q('select * from menu_items order by menu_id asc, code asc');
@@ -332,7 +353,7 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ===== Orders =====
+// Orders
 app.get('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
@@ -346,7 +367,6 @@ app.get('/api/orders/:seat', auth(), async (req, res) => {
     items: items.map(i => ({ id: i.id, name: i.name, unitPrice: i.unit_price, qty: i.qty })),
   });
 });
-
 app.put('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
@@ -388,7 +408,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
   res.json({ ok: true });
 });
 
-// 報表（僅 admin）
+// Reports（僅 admin）
 app.get('/api/reports/aggregate', auth(), requireAdmin, async (req, res) => {
   const rows = await q(
     `select name, sum(qty)::int as "totalQty", sum(unit_price*qty)::int as "totalMoney"
@@ -408,7 +428,7 @@ app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
   res.json({ missing });
 });
 
-// ===== Users =====
+// Users
 app.post('/api/users', auth(), requireAdmin, async (req, res) => {
   const { username, password, role } = req.body || {};
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
@@ -425,7 +445,6 @@ app.post('/api/users', auth(), requireAdmin, async (req, res) => {
   await logAction(req.user, 'user.create', { id: row.id, username, role: r }, req);
   res.json(row);
 });
-
 app.get('/api/users', auth(), requireAdmin, async (req, res) => {
   const qkw = (req.query.q || '').trim();
   const role = (req.query.role || '').trim();
@@ -452,7 +471,6 @@ app.get('/api/users', auth(), requireAdmin, async (req, res) => {
   );
   res.json({ users: rows, total: totalRow.c, page, pageSize });
 });
-
 app.put('/api/users/:id/password', auth(), async (req, res) => {
   const targetId = Number(req.params.id);
   const { oldPassword, newPassword } = req.body || {};
@@ -476,7 +494,6 @@ app.put('/api/users/:id/password', auth(), async (req, res) => {
   await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
   res.json({ ok: true });
 });
-
 app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { status } = req.body || {};
@@ -490,7 +507,6 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
 });
-
 app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { role } = req.body || {};
@@ -509,7 +525,6 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
   res.json({ ok: true });
 });
-
 app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   const targetId = Number(req.params.id);
   if (req.user && req.user.uid === targetId) return res.status(400).json({ message: '無法刪除自己' });
@@ -526,7 +541,6 @@ app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   await logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
   res.json({ ok: true });
 });
-
 app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
   if (!ids.length) return res.status(400).json({ message: 'ids required' });
@@ -546,7 +560,7 @@ app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
   res.json({ ok: true, deleted: ids.length });
 });
 
-// ===== Logs =====
+// Logs
 app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
   const rows = await q('select * from audit_logs order by id desc limit 500');
   res.json({ logs: rows });
@@ -556,17 +570,14 @@ app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API (Supabase/PostgreSQL) is running.\nTry GET /api/menus');
 });
 
+/* =========================
+   Start
+   ========================= */
 (async function start() {
   try {
-    // Test connection
-    await one('select now()');
-
-    // 方案 A：在 seed 之前先把 settings 欄位補齊
-    await ensureSettingsSchema();
-
-    // 然後再 seed
-    await seed();
-
+    await one('select now()');          // test DB
+    await ensureSettingsSchema();       // 先補 settings 欄位
+    await seed();                       // 再 seed
     app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
     console.error('Startup error:', e);
