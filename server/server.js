@@ -13,7 +13,7 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
-const DATABASE_URL = process.env.DATABASE_URL;
+const RAW_DATABASE_URL = process.env.DATABASE_URL;
 
 // ====== Logging ======
 const LOG_DIR = path.join(__dirname, 'logs');
@@ -28,13 +28,17 @@ app.use(morgan('dev'));
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
 // ====== DB (pg) ======
-if (!DATABASE_URL) {
+if (!RAW_DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
+
+// 移除連線字串中的 sslmode=...，避免與下方 ssl 設定衝突（解決 Render 上 self-signed 問題）
+const DATABASE_URL = RAW_DATABASE_URL.replace(/(\?|&)sslmode=[^&]*/g, '').replace(/\?$/, '');
+
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Supabase 需要 SSL
+  ssl: { rejectUnauthorized: false }, // 在 Supabase/Render 上最穩（跳過 CA 驗證，避免 self-signed 錯誤）
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
@@ -71,6 +75,73 @@ async function t_one(client, sql, params = []) {
 async function t_q(client, sql, params = []) {
   const { rows } = await client.query(sql, params);
   return rows;
+}
+
+// ====== Schema bootstrap（PostgreSQL 版，自動建表 & 預設設定）======
+async function initSchema() {
+  await pool.query(`
+    create table if not exists users(
+      id serial primary key,
+      username text unique not null,
+      password_hash text not null,
+      role text not null default 'admin',         -- 'admin' | 'user'
+      status text not null default 'active',      -- 'active' | 'disabled'
+      created_at timestamptz default now(),
+      updated_at timestamptz default now(),
+      last_login_at timestamptz
+    );
+
+    create table if not exists menus(
+      id serial primary key,
+      name text not null
+    );
+
+    create table if not exists menu_items(
+      id serial primary key,
+      menu_id integer not null references menus(id) on delete cascade,
+      code integer not null,
+      name text not null,
+      price integer not null
+    );
+
+    create table if not exists settings(
+      id integer primary key,
+      active_menu_id integer references menus(id) on delete set null,
+      open_days integer[] default '{1,2,3,4,5}',  -- 0=Sun..6=Sat
+      open_start text default '07:00',
+      open_end   text default '12:00'
+    );
+
+    insert into settings(id) values(1)
+    on conflict (id) do nothing;
+
+    create table if not exists orders(
+      id serial primary key,
+      seat integer not null unique,
+      submitted boolean not null default false,
+      internal_only boolean not null default false,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+
+    create table if not exists order_items(
+      id serial primary key,
+      order_id integer not null references orders(id) on delete cascade,
+      name text not null,
+      unit_price integer not null,
+      qty integer not null
+    );
+
+    create table if not exists audit_logs(
+      id serial primary key,
+      user_id integer references users(id) on delete set null,
+      action text not null,
+      details text,
+      ip text,
+      ua text,
+      ts timestamptz not null default now()
+    );
+  `);
 }
 
 // ====== bootstrap（seed）======
@@ -199,7 +270,7 @@ app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
 });
 app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const { openDays, openStart, openEnd } = req.body || {};
-  const days = Array.isArray(openDays) ? openDays : ["1","2","3","4","5"];
+  const days = Array.isArray(openDays) ? openDays.map(Number) : [1,2,3,4,5];
   await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
   res.json({ ok: true });
@@ -502,14 +573,17 @@ app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
   res.json({ logs: rows });
 });
 
+// ===== Root =====
 app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API (Supabase/PostgreSQL) is running.\nTry GET /api/menus');
 });
 
+// ===== Start =====
 (async function start() {
   try {
-    // Test connection & seed
+    // 建表 & 健康檢查 & 種子
     await one('select now()');
+    await initSchema();
     await seed();
     app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
