@@ -38,7 +38,7 @@
 
     <!-- 訂單頁 -->
     <section id="pageOrders">
-      <!-- 新增：非點餐時段的提示橫幅（一般使用者才會看到） -->
+      <!-- 非點餐時段提示（一般使用者可見） -->
       <div id="closedBanner" class="card hidden" style="border:1px solid #f59e0b;background:#24190b;color:#ffd38a">
         <strong>目前不在點餐時段</strong>
         <div class="small">可點餐時間由管理員設定（週期與時段）。一般使用者在關閉時段不可修改訂單。</div>
@@ -51,7 +51,13 @@
             <label>座號
               <select id="seatSelect"></select>
             </label>
-            <button id="toggleSubmitted" class="ghost">標記完成</button>
+
+            <!-- 內訂：勾選後僅保留一個「內訂」品項 -->
+            <label class="pill" style="display:flex;align-items:center;gap:6px;">
+              <input id="internalOnly" type="checkbox" />
+              內訂
+            </label>
+
             <button id="clearSeat" class="danger">清空本座</button>
           </div>
 
@@ -192,21 +198,3 @@
   <script src="app.js"></script>
 </body>
 </html>
-
-<table class="table" id="usersTable">
-  <thead>
-    <tr>
-      <th><input type="checkbox" id="pickAll"></th>
-      <th>ID</th>
-      <th>帳號</th>
-      <th>角色</th>
-      <th>狀態</th>
-      <th>最後登入</th>
-      <th>建立時間</th>
-      <th>重設密碼</th>
-      <th>操作</th>
-    </tr>
-  </thead>
-  <tbody id="usersTableBody"></tbody>
-</table>
-<div id="usersPager" class="muted"></div>

@@ -38,7 +38,9 @@ const pageLogs    = document.getElementById('pageLogs');
 const pageUsers   = document.getElementById('pageUsers');
 
 const seatSelect = document.getElementById('seatSelect');
+// 這個按鈕在新版 UI 已移除，但程式仍容許存在就加上事件
 const toggleSubmitted = document.getElementById('toggleSubmitted');
+
 const clearSeat = document.getElementById('clearSeat');
 const codeInput = document.getElementById('codeInput');
 const qtyInput  = document.getElementById('qtyInput');
@@ -49,6 +51,8 @@ const manualQty = document.getElementById('manualQty');
 const addManual = document.getElementById('addManual');
 const orderTableBody = document.querySelector('#orderTable tbody');
 const seatSubtotal = document.getElementById('seatSubtotal');
+
+const internalOnlyEl = document.getElementById('internalOnly');
 
 const activeMenuName = document.getElementById('activeMenuName');
 const activeMenuList = document.getElementById('activeMenuList');
@@ -86,6 +90,21 @@ const closedBanner = document.getElementById('closedBanner');
 let token = localStorage.getItem('jwt') || null;
 apiBaseHint.textContent = `API: ${API_BASE}`;
 
+// === 手機偵測 & 帳密正規化 ===
+const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+function applyMobileUI(){
+  if(!isMobile) return;
+  document.body.classList.add('mobile');
+}
+function normalizeUsername(u=''){
+  u = u.replace(/\u3000/g,' ')
+       .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0)-0xFF10+48));
+  return u.trim();
+}
+function normalizePassword(p=''){
+  return String(p).replace(/\u3000/g,' ').trim();
+}
+
 function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
@@ -109,14 +128,17 @@ initLoginLayerStyles();
 loginBtn.onclick = async () => {
   loginMsg.textContent = '';
   try {
+    const username = normalizeUsername(loginUser.value.trim());
+    const password = normalizePassword(loginPass.value);
     const data = await api('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username: loginUser.value.trim(), password: loginPass.value })
+      body: JSON.stringify({ username, password })
     });
     token = data.token;
     localStorage.setItem('jwt', token);
     onLoginUser(data.user);
-    await fetchOpenStatus();     // 新增：取得開放狀態
+    applyMobileUI();
+    await fetchOpenStatus();     // 取得開放狀態
     await initApp();
     switchTab('orders');
     showApp();
@@ -174,16 +196,25 @@ function onLoginUser(user){
     .forEach(el => el.classList.toggle('hidden', !isAdmin));
   document.querySelectorAll('.only-user')
     .forEach(el => el.classList.toggle('hidden', isAdmin));
+
+  // 一般使用者：座號 = 帳號；鎖定座號下拉
+  if (user.role === 'user') {
+    const n = Number(user.username);
+    if (Number.isInteger(n) && n>=1 && n<=36) {
+      seatSelect.value = String(n);
+      seatSelect.disabled = true;
+    }
+  }
 }
 
 // ====== 開放時段：查詢與渲染（新增）======
 async function fetchOpenStatus(){
   try{
-    const data = await api('/open-status', { method:'GET' }); // server 端提供的公開狀態
+    const data = await api('/open-status', { method:'GET' }); // server 提供的公開狀態
     isOpenWindow = !!data.open;
     renderOpenBanner(data);
   }catch{
-    isOpenWindow = true; // 失敗不擋操作（以免誤判），但後端仍會擋
+    isOpenWindow = true; // 失敗不擋操作（後端仍會擋）
     renderOpenBanner(null);
   }
 }
@@ -278,39 +309,19 @@ async function getOrder(seat){
   return o;
 }
 async function saveOrder(seat, order){
-  await api(`/orders/${seat}`, { method:'PUT', body: JSON.stringify(order) });
-  state.ordersCache.set(seat, order);
+  try{
+    await api(`/orders/${seat}`, { method:'PUT', body: JSON.stringify(order) });
+    state.ordersCache.set(seat, order);
+  }catch(e){
+    if (String(e.message).includes('not in open window')) {
+      if (closedBanner) closedBanner.classList.remove('hidden');
+      alert('目前非開放點餐時段');
+    }
+    throw e;
+  }
 }
 async function getAggregate(){ return api('/reports/aggregate'); }
 async function getMissing(){ return api('/reports/missing'); }
-
-// ====== Logs & Users（admin）=====
-async function getLogs(){ return api('/logs'); }
-async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}){
-  const p = new URLSearchParams({ q, role, status, page, pageSize });
-  return api('/users?'+p.toString());
-}
-async function createUser(username, password, role){
-  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
-}
-async function resetPasswordAdmin(userId, newPassword){
-  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
-}
-async function resetPasswordSelf(userId, oldPassword, newPassword){
-  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
-}
-async function setUserStatus(userId, status){
-  return api(`/users/${userId}/status`, { method:'PATCH', body: JSON.stringify({ status })});
-}
-async function setUserRole(userId, role){
-  return api(`/users/${userId}/role`, { method:'PATCH', body: JSON.stringify({ role })});
-}
-async function deleteUser(userId){
-  return api(`/users/${userId}`, { method:'DELETE' });
-}
-async function bulkDelete(ids){
-  return api('/users/bulk-delete', { method:'DELETE', body: JSON.stringify({ ids })});
-}
 
 // ====== Render（畫面）=====
 function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
@@ -350,6 +361,20 @@ function renderMenuPage(){
 async function renderSeatOrder(){
   const seat = Number(seatSelect.value||1);
   const o = await getOrder(seat);
+
+  // 內訂狀態反映到 UI
+  if (internalOnlyEl) internalOnlyEl.checked = !!o.internalOnly;
+  const lock = !!o.internalOnly;
+
+  // 鎖定新增/輸入區
+  codeInput.disabled = lock;
+  qtyInput.disabled = lock;
+  addByCode.disabled = lock;
+  manualName.disabled = lock;
+  manualPrice.disabled = lock;
+  manualQty.disabled = lock;
+  addManual.disabled = lock;
+
   orderTableBody.innerHTML = '';
   let subtotal = 0;
   o.items.forEach((it,idx)=>{
@@ -359,13 +384,18 @@ async function renderSeatOrder(){
       <td>${idx+1}</td>
       <td>${it.name}</td>
       <td>${fmt(it.unitPrice)}</td>
-      <td><input type="number" min="1" value="${it.qty}" class="qtyInput w120" data-idx="${idx}"/></td>
+      <td>
+        <input type="number" min="1" value="${it.qty}"
+               class="qtyInput w120" data-idx="${idx}" ${lock?'disabled':''}/>
+      </td>
       <td>${fmt(line)}</td>
-      <td><button class="danger delBtn" data-idx="${idx}">刪除</button></td>`;
+      <td>${lock ? '' : `<button class="danger delBtn" data-idx="${idx}">刪除</button>`}</td>`;
     orderTableBody.appendChild(tr);
   });
   seatSubtotal.textContent = fmt(subtotal);
-  toggleSubmitted.textContent = o.submitted ? '設為未完成' : '標記完成';
+  if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
+    toggleSubmitted.textContent = o.submitted ? '設為未完成' : '標記完成';
+  }
 }
 async function renderAgg(){
   const data = await getAggregate();
@@ -379,7 +409,7 @@ async function renderMissing(){
   missingList.textContent = arr.length ? `座號：${arr.join(', ')}` : '全部人都完成填單！';
 }
 
-// Logs（略：保持你既有版本）
+// Logs（簡化渲染）
 async function renderLogs(){
   logsTableBody.innerHTML = '<tr><td colspan="7">載入中…</td></tr>';
   try{
@@ -401,13 +431,56 @@ async function renderLogs(){
     logsTableBody.innerHTML = `<tr><td colspan="7">讀取失敗：${e.message}</td></tr>`;
   }
 }
+async function getLogs(){ return api('/logs'); }
 
-// ====== 使用者（保留你現有的 loadUsers 版本或強化版） ======
+// ====== 使用者頁 ======
+async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}) {
+  const p = new URLSearchParams({ q, role, status, page, pageSize });
+  return api('/users?'+p.toString());
+}
+async function createUser(username, password, role){
+  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
+}
+async function resetPasswordAdmin(userId, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
+}
+async function resetPasswordSelf(userId, oldPassword, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
+}
+
 async function loadUsers(){
-  // 這裡保留你原本的簡化版本
+  const isAdmin = state.me?.role === 'admin';
+  // 一般使用者：只顯示「變更我的密碼」
+  if (!isAdmin) {
+    usersTableBody.innerHTML = `
+      <tr>
+        <td colspan="4">
+          <div class="card only-user">
+            <h4>變更我的密碼</h4>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <input type="password" id="selfOldPwd" placeholder="舊密碼" />
+              <input type="password" id="selfNewPwd" placeholder="新密碼(>=6)" />
+              <button id="selfChangeBtn">送出</button>
+            </div>
+          </div>
+        </td>
+      </tr>
+    `;
+    const btn = document.getElementById('selfChangeBtn');
+    btn.onclick = async ()=>{
+      const oldP = document.getElementById('selfOldPwd').value;
+      const newP = document.getElementById('selfNewPwd').value;
+      if (!newP || newP.length<6) return alert('新密碼至少 6 碼');
+      try{ await resetPasswordSelf(state.me.id, oldP, newP); alert('已更新'); }
+      catch(e){ alert('失敗：'+e.message); }
+    };
+    return;
+  }
+
+  // Admin：列表 + 重設
   usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
   try{
-    const data = await api('/users');
+    const data = await listUsersAdv(); // 簡單載入第一頁
     usersTableBody.innerHTML = data.users.map(u=>`
       <tr>
         <td>${u.id}</td>
@@ -424,7 +497,7 @@ async function loadUsers(){
   }
 }
 
-// 使用者事件（簡化版）
+// 使用者事件
 createUserBtn?.addEventListener('click', async ()=>{
   const username = newUserName.value.trim();
   const password = newUserPass.value;
@@ -451,18 +524,20 @@ usersTableBody.addEventListener('click', async (e)=>{
   }
 });
 
-// ====== 事件：加入「非時段」守門（新增）======
+// ====== 事件 ======
 seatSelect.addEventListener('change', ()=>{ renderSeatOrder(); });
 
-toggleSubmitted.addEventListener('click', async ()=>{
-  if (!guardOpenWindow()) return;
-  const seat = Number(seatSelect.value||1);
-  const o = await getOrder(seat);
-  o.submitted = !o.submitted;
-  await saveOrder(seat, o);
-  await renderSeatOrder();
-  await renderMissing();
-});
+if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
+  toggleSubmitted.addEventListener('click', async ()=>{
+    if (!guardOpenWindow()) return;
+    const seat = Number(seatSelect.value||1);
+    const o = await getOrder(seat);
+    o.submitted = !o.submitted;
+    await saveOrder(seat, o);
+    await renderSeatOrder();
+    await renderMissing();
+  });
+}
 
 clearSeat.addEventListener('click', async ()=>{
   if (!guardOpenWindow()) return;
@@ -475,8 +550,32 @@ clearSeat.addEventListener('click', async ()=>{
   await renderMissing();
 });
 
+// 內訂勾選
+internalOnlyEl?.addEventListener('change', async ()=>{
+  const seat = Number(seatSelect.value||1);
+  const o = await getOrder(seat);
+  if (internalOnlyEl.checked) {
+    o.items = [{ name:'內訂', unitPrice:0, qty:1 }];
+    o.internalOnly = true;
+  } else {
+    o.items = [];
+    o.internalOnly = false;
+  }
+  try{
+    await saveOrder(seat, o);
+    await renderSeatOrder();
+    await renderAgg();
+    await renderMissing();
+  }catch(e){
+    alert('儲存失敗：'+e.message);
+  }
+});
+
 addByCode.addEventListener('click', async ()=>{
   if (!guardOpenWindow()) return;
+  const seat = Number(seatSelect.value||1);
+  const o = await getOrder(seat);
+  if (o.internalOnly) { alert('已為「內訂」，不可加入其他品項'); return; }
   const m = state.menus.find(x=>x.id===state.activeMenuId);
   if (!m) return alert('尚未選擇菜單');
   const code = Number(codeInput.value||0);
@@ -484,30 +583,27 @@ addByCode.addEventListener('click', async ()=>{
   const it = m.items.find(x=>x.code===code);
   if (!it) return alert('查無此代號');
   if (qty<=0) return alert('數量需 >= 1');
-  const seat = Number(seatSelect.value||1);
-  const o = await getOrder(seat);
   o.items.push({ name: it.name, unitPrice: it.price, qty });
   await saveOrder(seat, o);
   codeInput.value=''; qtyInput.value='1';
   await renderSeatOrder(); await renderAgg();
 });
-
 addManual.addEventListener('click', async ()=>{
   if (!guardOpenWindow()) return;
+  const seat = Number(seatSelect.value||1);
+  const o = await getOrder(seat);
+  if (o.internalOnly) { alert('已為「內訂」，不可加入其他品項'); return; }
   const name = (manualName.value||'').trim();
   const price= Number(manualPrice.value||0);
   const qty  = Number(manualQty.value||1);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
   if (qty<=0) return alert('數量需 >= 1');
-  const seat = Number(seatSelect.value||1);
-  const o = await getOrder(seat);
   o.items.push({ name, unitPrice:price, qty });
   await saveOrder(seat, o);
   manualName.value=''; manualPrice.value=''; manualQty.value='1';
   await renderSeatOrder(); await renderAgg();
 });
-
 orderTableBody.addEventListener('input', async (e)=>{
   if (!guardOpenWindow()) return;
   const t = e.target;
@@ -515,6 +611,7 @@ orderTableBody.addEventListener('input', async (e)=>{
     const seat = Number(seatSelect.value||1);
     const idx = Number(t.dataset.idx);
     const o = await getOrder(seat);
+    if (o.internalOnly) { alert('內訂狀態不可編輯數量'); return; }
     o.items[idx].qty = Math.max(1, Number(t.value||1));
     await saveOrder(seat, o);
     await renderSeatOrder(); await renderAgg();
@@ -527,12 +624,12 @@ orderTableBody.addEventListener('click', async (e)=>{
     const seat = Number(seatSelect.value||1);
     const idx = Number(t.dataset.idx);
     const o = await getOrder(seat);
+    if (o.internalOnly) { alert('內訂狀態不可刪除品項'); return; }
     o.items.splice(idx,1);
     await saveOrder(seat, o);
     await renderSeatOrder(); await renderAgg();
   }
 });
-
 useMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   await setActiveMenu(id);
@@ -606,7 +703,8 @@ async function initApp(){
   try{
     const me = await api('/auth/me');
     onLoginUser(me.user);
-    await fetchOpenStatus();      // 新增：開啟時段查詢
+    applyMobileUI();
+    await fetchOpenStatus();      // 開啟時段查詢
     await initApp();
     switchTab('orders');
     showApp();
