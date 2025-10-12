@@ -8,7 +8,7 @@
 </head>
 <body>
   <!-- 登入層 -->
-  <div id="loginLayer" class="layer">
+  <div id="loginLayer" class="layer hidden">
     <div class="card w400">
       <h2>後台登入</h2>
       <input id="loginUser" placeholder="帳號" />
@@ -19,7 +19,7 @@
   </div>
 
   <!-- 主畫面 -->
-  <div id="app" class="hidden">
+  <div id="app" class="hidden wrap">
     <div class="topbar">
       <div class="left">
         <strong>🍱 班級午餐訂單系統</strong>
@@ -27,10 +27,10 @@
       </div>
       <div class="right">
         <button id="tabOrders" class="tab active">訂單</button>
-        <button id="tabMenus" class="tab">菜單</button>
-        <button id="tabReports" class="tab">後台</button>
-        <button id="tabLogs" class="tab hidden">Logs</button>
-        <button id="tabUsers" class="tab hidden">使用者</button>
+        <button id="tabMenus" class="tab only-admin">菜單</button>
+        <button id="tabReports" class="tab only-admin">後台</button>
+        <button id="tabLogs" class="tab only-admin hidden">Logs</button>
+        <button id="tabUsers" class="tab">使用者</button>
         <span id="whoami" class="pill"></span>
         <button id="logoutBtn">登出</button>
       </div>
@@ -95,8 +95,8 @@
       </div>
     </section>
 
-    <!-- 菜單頁 -->
-    <section id="pageMenus" class="hidden">
+    <!-- 菜單頁（僅 admin 顯示） -->
+    <section id="pageMenus" class="hidden only-admin">
       <div class="card">
         <h3>菜單管理</h3>
         <div class="row">
@@ -127,7 +127,7 @@
     </section>
 
     <!-- 後台頁（彙整＋缺單） -->
-    <section id="pageReports" class="hidden">
+    <section id="pageReports" class="hidden only-admin">
       <div class="grid">
         <div class="card">
           <h3>品項彙整</h3>
@@ -146,21 +146,46 @@
     </section>
 
     <!-- Logs（僅 admin） -->
-    <section id="pageLogs" class="hidden">
+    <section id="pageLogs" class="hidden only-admin">
       <div class="card">
         <h3>審計紀錄（最近 500 筆）</h3>
         <table id="logsTable">
           <thead>
-            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP</th><th>UA</th></tr>
+            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP/UA</th></tr>
           </thead>
-        <tbody></tbody>
+          <tbody></tbody>
         </table>
       </div>
     </section>
 
-    <!-- 使用者管理（僅 admin） -->
+    <!-- 使用者管理 -->
     <section id="pageUsers" class="hidden">
-      <div class="card">
+      <!-- 一般使用者在這裡只會看到自助改密碼區塊；admin 會看到完整表格＋工具列 -->
+      <div class="card only-admin" id="usersToolbar" style="display:none"></div>
+
+      <div class="card mt8 only-admin" id="usersTableCard" style="display:none">
+        <h3>使用者列表</h3>
+        <table class="table" id="usersTable">
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="pickAll" /></th>
+              <th>ID</th>
+              <th>帳號</th>
+              <th>角色</th>
+              <th>狀態</th>
+              <th>最後登入</th>
+              <th>建立時間</th>
+              <th>重設密碼</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody"></tbody>
+        </table>
+        <div id="usersPager" class="muted"></div>
+      </div>
+
+      <!-- 新增使用者（僅 admin） -->
+      <div class="card only-admin" id="createUserCard" style="display:none">
         <h3>新增使用者</h3>
         <div class="row">
           <input id="newUserName" placeholder="帳號" />
@@ -173,12 +198,14 @@
         </div>
       </div>
 
-      <div class="card mt8">
-        <h3>使用者列表</h3>
-        <table>
-          <thead><tr><th>ID</th><th>帳號</th><th>角色</th><th>重設密碼</th></tr></thead>
-          <tbody id="usersTableBody"></tbody>
-        </table>
+      <!-- 一般使用者自助改密碼區塊（only-user）-->
+      <div class="card only-user hidden" id="selfPwdCard">
+        <h3>變更我的密碼</h3>
+        <div class="row">
+          <input type="password" id="selfOldPwd" placeholder="舊密碼" />
+          <input type="password" id="selfNewPwd" placeholder="新密碼(>=6)" />
+          <button id="selfChangeBtn">送出</button>
+        </div>
       </div>
     </section>
   </div>
@@ -186,21 +213,3 @@
   <script src="app.js"></script>
 </body>
 </html>
-
-<table class="table" id="usersTable">
-  <thead>
-    <tr>
-      <th><input type="checkbox" id="pickAll"></th>
-      <th>ID</th>
-      <th>帳號</th>
-      <th>角色</th>
-      <th>狀態</th>
-      <th>最後登入</th>
-      <th>建立時間</th>
-      <th>重設密碼</th>
-      <th>操作</th>
-    </tr>
-  </thead>
-  <tbody id="usersTableBody"></tbody>
-</table>
-<div id="usersPager" class="muted"></div>
