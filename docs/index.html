@@ -8,7 +8,7 @@
 </head>
 <body>
   <!-- 登入層 -->
-  <div id="loginLayer" class="layer hidden">
+  <div id="loginLayer" class="layer">
     <div class="card w400">
       <h2>後台登入</h2>
       <input id="loginUser" placeholder="帳號" />
@@ -27,10 +27,10 @@
       </div>
       <div class="right">
         <button id="tabOrders" class="tab active">訂單</button>
-        <button id="tabMenus" class="tab only-admin">菜單</button>
-        <button id="tabReports" class="tab only-admin">後台</button>
-        <button id="tabLogs" class="tab only-admin hidden">Logs</button>
-        <button id="tabUsers" class="tab">使用者</button>
+        <button id="tabMenus" class="tab hidden">菜單</button>
+        <button id="tabReports" class="tab hidden">後台</button>
+        <button id="tabLogs" class="tab hidden">Logs</button>
+        <button id="tabUsers" class="tab hidden">使用者</button>
         <span id="whoami" class="pill"></span>
         <button id="logoutBtn">登出</button>
       </div>
@@ -45,28 +45,40 @@
             <label>座號
               <select id="seatSelect"></select>
             </label>
-            <button id="toggleSubmitted" class="ghost">標記完成</button>
-            <button id="clearSeat" class="danger">清空本座</button>
+            <!-- toggleSubmitted 已移除，不再顯示 -->
+            <button id="clearSeat" class="danger only-admin">清空本座</button>
           </div>
 
           <div class="hr"></div>
 
-          <details open>
+          <div class="row">
+            <label class="pill">
+              <input id="internalOnly" type="checkbox" />
+              僅「內訂」
+            </label>
+            <span class="small muted">（勾選後本座只會記錄一筆「內訂」，不可再加入其他品項）</span>
+          </div>
+
+          <details id="byCodeBox" open>
             <summary><strong>由菜單代號新增</strong> <span class="muted small">（輸入代號與數量，如 <span class="kbd">1</span>、<span class="kbd">2</span>）</span></summary>
             <div class="row mt8">
-              <input id="codeInput" type="number" min="1" placeholder="代號" class="w120" />
-              <input id="qtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
+              <input id="codeInput" inputmode="numeric" pattern="[0-9]*" type="number" min="1" placeholder="代號" class="w120" />
+              <input id="qtyInput" inputmode="numeric" pattern="[0-9]*" type="number" min="1" value="1" placeholder="數量" class="w120" />
               <button id="addByCode" class="primary">加入</button>
+              <div class="mobile-only row">
+                <button id="qtyMinus" class="ghost">－</button>
+                <button id="qtyPlus" class="ghost">＋</button>
+              </div>
             </div>
             <div id="menuView" class="small muted mt8"></div>
           </details>
 
-          <details>
+          <details id="manualBox">
             <summary><strong>手動新增餐點</strong></summary>
             <div class="row mt8">
               <input id="manualName" placeholder="品名" />
-              <input id="manualPrice" type="number" placeholder="單價" class="w140" />
-              <input id="manualQty" type="number" placeholder="數量" value="1" class="w120" />
+              <input id="manualPrice" inputmode="numeric" pattern="[0-9]*" type="number" placeholder="單價" class="w140" />
+              <input id="manualQty" inputmode="numeric" pattern="[0-9]*" type="number" placeholder="數量" value="1" class="w120" />
               <button id="addManual" class="ghost">新增</button>
             </div>
           </details>
@@ -95,8 +107,8 @@
       </div>
     </section>
 
-    <!-- 菜單頁（僅 admin 顯示） -->
-    <section id="pageMenus" class="hidden only-admin">
+    <!-- 菜單頁（admin） -->
+    <section id="pageMenus" class="hidden">
       <div class="card">
         <h3>菜單管理</h3>
         <div class="row">
@@ -126,8 +138,8 @@
       </div>
     </section>
 
-    <!-- 後台頁（彙整＋缺單） -->
-    <section id="pageReports" class="hidden only-admin">
+    <!-- 後台頁（admin：彙整＋缺單＋開放時段設定） -->
+    <section id="pageReports" class="hidden">
       <div class="grid">
         <div class="card">
           <h3>品項彙整</h3>
@@ -142,50 +154,44 @@
           <h3>尚未完成訂單名單</h3>
           <div id="missingList" class="muted"></div>
         </div>
+
+        <div class="card">
+          <h3>開放時段設定</h3>
+          <div class="row">
+            <label class="pill">週日 <input type="checkbox" class="openDay" value="0"></label>
+            <label class="pill">週一 <input type="checkbox" class="openDay" value="1"></label>
+            <label class="pill">週二 <input type="checkbox" class="openDay" value="2"></label>
+            <label class="pill">週三 <input type="checkbox" class="openDay" value="3"></label>
+            <label class="pill">週四 <input type="checkbox" class="openDay" value="4"></label>
+            <label class="pill">週五 <input type="checkbox" class="openDay" value="5"></label>
+            <label class="pill">週六 <input type="checkbox" class="openDay" value="6"></label>
+          </div>
+          <div class="row mt8">
+            <label>開始 <input id="openStart" type="time" value="07:00"></label>
+            <label>結束 <input id="openEnd" type="time" value="12:00"></label>
+            <button id="saveOpenWindow" class="primary">儲存</button>
+          </div>
+          <div class="small muted">一般使用者僅能在上述時段內提交/修改訂單；管理員不受限制。</div>
+        </div>
       </div>
     </section>
 
     <!-- Logs（僅 admin） -->
-    <section id="pageLogs" class="hidden only-admin">
+    <section id="pageLogs" class="hidden">
       <div class="card">
         <h3>審計紀錄（最近 500 筆）</h3>
         <table id="logsTable">
           <thead>
-            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP/UA</th></tr>
+            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP / UA</th></tr>
           </thead>
-          <tbody></tbody>
+        <tbody></tbody>
         </table>
       </div>
     </section>
 
     <!-- 使用者管理 -->
     <section id="pageUsers" class="hidden">
-      <!-- 一般使用者在這裡只會看到自助改密碼區塊；admin 會看到完整表格＋工具列 -->
-      <div class="card only-admin" id="usersToolbar" style="display:none"></div>
-
-      <div class="card mt8 only-admin" id="usersTableCard" style="display:none">
-        <h3>使用者列表</h3>
-        <table class="table" id="usersTable">
-          <thead>
-            <tr>
-              <th><input type="checkbox" id="pickAll" /></th>
-              <th>ID</th>
-              <th>帳號</th>
-              <th>角色</th>
-              <th>狀態</th>
-              <th>最後登入</th>
-              <th>建立時間</th>
-              <th>重設密碼</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="usersTableBody"></tbody>
-        </table>
-        <div id="usersPager" class="muted"></div>
-      </div>
-
-      <!-- 新增使用者（僅 admin） -->
-      <div class="card only-admin" id="createUserCard" style="display:none">
+      <div class="card only-admin">
         <h3>新增使用者</h3>
         <div class="row">
           <input id="newUserName" placeholder="帳號" />
@@ -198,14 +204,25 @@
         </div>
       </div>
 
-      <!-- 一般使用者自助改密碼區塊（only-user）-->
-      <div class="card only-user hidden" id="selfPwdCard">
-        <h3>變更我的密碼</h3>
-        <div class="row">
-          <input type="password" id="selfOldPwd" placeholder="舊密碼" />
-          <input type="password" id="selfNewPwd" placeholder="新密碼(>=6)" />
-          <button id="selfChangeBtn">送出</button>
-        </div>
+      <div class="card mt8">
+        <h3>使用者列表 / 自助</h3>
+        <table class="table" id="usersTable">
+          <thead>
+            <tr>
+              <th class="only-admin"><input type="checkbox" id="pickAll"></th>
+              <th>ID</th>
+              <th>帳號</th>
+              <th class="only-admin">角色</th>
+              <th class="only-admin">狀態</th>
+              <th class="only-admin">最後登入</th>
+              <th class="only-admin">建立時間</th>
+              <th>重設/變更密碼</th>
+              <th class="only-admin">操作</th>
+            </tr>
+          </thead>
+          <tbody id="usersTableBody"></tbody>
+        </table>
+        <div id="usersPager" class="muted"></div>
       </div>
     </section>
   </div>

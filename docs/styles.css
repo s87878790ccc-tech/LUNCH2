@@ -36,17 +36,14 @@ th{color:var(--muted);font-weight:600}
 
 #menuView .pill{margin-right:6px;margin-bottom:6px}
 /* 確保加上 hidden 就一定消失 */
-#loginLayer.hidden {
-  display: none !important;
-  opacity: 0 !important;
-  pointer-events: none !important;
-}
-/* 手機：按鈕與輸入加大 */
-@media (max-width: 768px){
-  input, select, button { padding: 12px 14px; font-size:18px; border-radius:14px; }
-  .w120 { width: 140px; } .w140{ width: 160px; }
-  .tab { padding:10px 12px; }
-}
-/* 觸控代號鍵盤區塊 */
-.touch-pad{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px }
-.touch-pad button{ min-width:64px }
+#loginLayer.hidden { display:none!important; opacity:0!important; pointer-events:none!important; }
+
+/* 行動版優化 */
+.mobile .tab{padding:10px 14px;font-size:18px}
+.mobile input,.mobile select,.mobile button{font-size:18px;padding:12px 14px;border-radius:12px}
+.mobile .mobile-only{display:flex}
+.mobile #orderTable td input.qtyInput{width:100px}
+.mobile .card{border-radius:20px}
+
+/* 桌機隱藏 mobile-only 區塊 */
+.mobile-only{display:none}
