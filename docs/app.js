@@ -30,7 +30,6 @@ const tabMenus   = document.getElementById('tabMenus');
 const tabReports = document.getElementById('tabReports');
 const tabLogs    = document.getElementById('tabLogs');
 const tabUsers   = document.getElementById('tabUsers');
-const tabAllSeats = document.getElementById('tabAllSeats'); // ✅ 新增
 
 const pageOrders  = document.getElementById('pageOrders');
 const pageMenus   = document.getElementById('pageMenus');
@@ -83,6 +82,11 @@ const newUserRole = document.getElementById('newUserRole');
 const createUserBtn = document.getElementById('createUserBtn');
 const usersTableBody = document.getElementById('usersTableBody');
 
+// ====== Admin：全部座號一覽（DOM）======
+const adminAllSeats = document.getElementById('adminAllSeats');
+const allSeatsGrid = document.getElementById('allSeatsGrid');
+const refreshAllSeats = document.getElementById('refreshAllSeats');
+
 // ====== 開放時段狀態（新增）======
 let isOpenWindow = true;
 const closedBanner = document.getElementById('closedBanner');
@@ -99,11 +103,6 @@ const owMsg = document.getElementById('owMsg');
 const bySeatTBody = document.getElementById('bySeatTBody');
 const loadBySeatBtn = document.getElementById('loadBySeat');
 const loadBySeatMsg = document.getElementById('loadBySeatMsg');
-
-// ====== Admin：全部座號一覽（DOM）======
-const adminAllSeats = document.getElementById('adminAllSeats');
-const allSeatsGrid = document.getElementById('allSeatsGrid');
-const refreshAllSeats = document.getElementById('refreshAllSeats');
 
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
 let token = localStorage.getItem('jwt') || null;
@@ -221,7 +220,6 @@ function onLoginUser(user){
   tabUsers.classList.toggle('hidden', false);
   tabMenus.classList.toggle('hidden', !admin);
   tabReports.classList.toggle('hidden', !admin);
-  tabAllSeats?.classList.toggle('hidden', !admin); // ✅ 新增：只有 admin 看得到
 
   document.querySelectorAll('.only-admin')
     .forEach(el => el.classList.toggle('hidden', !admin));
@@ -457,14 +455,6 @@ tabReports.onclick= ()=>switchTab('reports');
 tabLogs.onclick   = ()=>switchTab('logs');
 tabUsers.onclick  = ()=>switchTab('users');
 
-// ✅ 新增：一鍵捲到全部座號
-tabAllSeats?.addEventListener('click', () => {
-  switchTab('orders');
-  setTimeout(() => {
-    document.getElementById('adminAllSeats')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, 50);
-});
-
 // ====== 菜單 & 訂單 API ======
 async function loadMenus(){
   const data = await api('/menus');
@@ -642,17 +632,8 @@ async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}) {
   const p = new URLSearchParams({ q, role, status, page, pageSize });
   return api('/users?'+p.toString());
 }
-async function createUser(username, password, role){
-  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
-}
-async function resetPasswordAdmin(userId, newPassword){
-  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
-}
-async function resetPasswordSelf(userId, oldPassword, newPassword){
-  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
-}
 
-// 取所有使用者（自動翻頁直到抓完）
+// ⬇️ 把所有頁一次抓回來（自動翻頁，直到抓完）
 async function fetchAllUsers() {
   const pageSize = 100; // 後端上限 100
   let page = 1;
@@ -661,12 +642,21 @@ async function fetchAllUsers() {
     const data = await listUsersAdv({ page, pageSize });
     const chunk = data.users || [];
     all = all.concat(chunk);
-    // 抓到總數 or 本頁不足 pageSize -> 結束
     if (typeof data.total === 'number' && all.length >= data.total) break;
     if (chunk.length < pageSize) break;
     page += 1;
   }
   return all;
+}
+
+async function createUser(username, password, role){
+  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
+}
+async function resetPasswordAdmin(userId, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
+}
+async function resetPasswordSelf(userId, oldPassword, newPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
 }
 
 async function loadUsers(){
@@ -699,7 +689,7 @@ async function loadUsers(){
 
   usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
   try{
-    // ⬇️ 把所有頁一次抓回來
+    // ⬇️ 取全部頁
     const users = await fetchAllUsers();
 
     // 顯示總筆數（可選）
@@ -778,7 +768,7 @@ clearSeat.addEventListener('click', async ()=>{
   if (isAdmin()) await renderSeatCardInto(seat);
 });
 
-// 內訂勾選
+// 內訂勾選（單座）
 internalOnlyEl?.addEventListener('change', async ()=>{
   const seat = Number(seatSelect.value||1);
   const o = await getOrder(seat);
@@ -828,6 +818,7 @@ addManual.addEventListener('click', async ()=>{
   const qty  = Number(manualQty.value||1);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
+  if (qty<=0) return alert('數量需 >= 1');
   o.items.push({ name, unitPrice:price, qty });
   await saveOrder(seat, o);
   manualName.value=''; manualPrice.value=''; manualQty.value='1';
@@ -927,8 +918,8 @@ async function initApp(){
   renderActiveMenu();
   renderMenuPage();
   await renderSeatOrder();
-  await safeRenderAdminReports(); // 只在 admin 才打報表 API
-  if (isAdmin()) await renderAllSeatsAdmin(); // admin 一進來就載入全部座號
+  await safeRenderAdminReports(); // ✅ 只在 admin 才打報表 API
+  if (isAdmin()) await renderAllSeatsAdmin(); // ✅ admin 一進來就載入全部座號
 }
 
 // 自動登入驗證
