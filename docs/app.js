@@ -652,6 +652,23 @@ async function resetPasswordSelf(userId, oldPassword, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
 }
 
+// 取所有使用者（自動翻頁直到抓完）
+async function fetchAllUsers() {
+  const pageSize = 100; // 後端上限 100
+  let page = 1;
+  let all = [];
+  while (true) {
+    const data = await listUsersAdv({ page, pageSize });
+    const chunk = data.users || [];
+    all = all.concat(chunk);
+    // 抓到總數 or 本頁不足 pageSize -> 結束
+    if (typeof data.total === 'number' && all.length >= data.total) break;
+    if (chunk.length < pageSize) break;
+    page += 1;
+  }
+  return all;
+}
+
 async function loadUsers(){
   const admin = isAdmin();
   if (!admin) {
@@ -682,8 +699,16 @@ async function loadUsers(){
 
   usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
   try{
-    const data = await listUsersAdv();
-    usersTableBody.innerHTML = data.users.map(u=>`
+    // ⬇️ 把所有頁一次抓回來
+    const users = await fetchAllUsers();
+
+    // 顯示總筆數（可選）
+    const title = document.querySelector('#pageUsers h3');
+    if (title) {
+      title.innerHTML = `使用者列表 <span class="small muted">（共 ${users.length} 筆）</span>`;
+    }
+
+    usersTableBody.innerHTML = users.map(u=>`
       <tr>
         <td>${u.id}</td>
         <td>${u.username}</td>
