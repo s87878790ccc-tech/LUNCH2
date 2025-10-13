@@ -1,7 +1,9 @@
 // ====== 調整這個成你的後端 API 網址 ======
 const API_BASE = 'https://lunch2.onrender.com/api';
 
-// ====== DOM ======
+/* =========================
+   DOM 既有元素
+   ========================= */
 const app = document.getElementById('app');
 const loginLayer = document.getElementById('loginLayer');
 function initLoginLayerStyles() {
@@ -26,21 +28,21 @@ const logoutBtn = document.getElementById('logoutBtn');
 const apiBaseHint = document.getElementById('apiBaseHint');
 
 const tabOrders  = document.getElementById('tabOrders');
-const tabPreorder= document.getElementById('tabPreorder');
 const tabMenus   = document.getElementById('tabMenus');
 const tabReports = document.getElementById('tabReports');
 const tabLogs    = document.getElementById('tabLogs');
 const tabUsers   = document.getElementById('tabUsers');
-const tabAllSeats= document.getElementById('tabAllSeats');
+// 可能有/沒有（新版 index.html 才有）
+const tabAllSeats = document.getElementById('tabAllSeats');
 
 const pageOrders  = document.getElementById('pageOrders');
-const pagePreorder= document.getElementById('pagePreorder');
 const pageMenus   = document.getElementById('pageMenus');
 const pageReports = document.getElementById('pageReports');
 const pageLogs    = document.getElementById('pageLogs');
 const pageUsers   = document.getElementById('pageUsers');
 
 const seatSelect = document.getElementById('seatSelect');
+// 舊版 UI 若有這個按鈕不會報錯
 const toggleSubmitted = document.getElementById('toggleSubmitted');
 
 const clearSeat = document.getElementById('clearSeat');
@@ -55,7 +57,6 @@ const orderTableBody = document.querySelector('#orderTable tbody');
 const seatSubtotal = document.getElementById('seatSubtotal');
 
 const internalOnlyEl = document.getElementById('internalOnly');
-const paidEl = document.getElementById('paid');
 
 const activeMenuName = document.getElementById('activeMenuName');
 const activeMenuList = document.getElementById('activeMenuList');
@@ -76,7 +77,6 @@ const menuTableBody = document.querySelector('#menuTable tbody');
 const aggTableBody = document.querySelector('#aggTable tbody');
 const classTotalEl = document.getElementById('classTotal');
 const missingList = document.getElementById('missingList');
-const unpaidList = document.getElementById('unpaidList');
 
 const logsTableBody = document.querySelector('#logsTable tbody');
 
@@ -107,35 +107,6 @@ const owMsg = document.getElementById('owMsg');
 const bySeatTBody = document.getElementById('bySeatTBody');
 const loadBySeatBtn = document.getElementById('loadBySeat');
 const loadBySeatMsg = document.getElementById('loadBySeatMsg');
-
-// ⭐ 預訂便當（DOM）
-const preDateSelect = document.getElementById('preDateSelect');
-const preSeatSelect = document.getElementById('preSeatSelect');
-const preInternalOnlyEl = document.getElementById('preInternalOnly');
-const prePaidEl = document.getElementById('prePaid');
-const preCodeInput = document.getElementById('preCodeInput');
-const preQtyInput  = document.getElementById('preQtyInput');
-const preAddByCode = document.getElementById('preAddByCode');
-const preManualName = document.getElementById('preManualName');
-const preManualPrice = document.getElementById('preManualPrice');
-const preManualQty = document.getElementById('preManualQty');
-const preAddManual = document.getElementById('preAddManual');
-const preOrderTbody = document.getElementById('preOrderTbody');
-const preSeatSubtotal = document.getElementById('preSeatSubtotal');
-
-// ⭐ 預訂設定（DOM）
-const preEnabledEl = document.getElementById('preEnabled');
-const preAddDateEl = document.getElementById('preAddDate');
-const preAddDateBtn = document.getElementById('preAddDateBtn');
-const preSaveDatesBtn = document.getElementById('preSaveDates');
-const preReloadBtn = document.getElementById('preReload');
-const preDatesList = document.getElementById('preDatesList');
-const preSettingsMsg = document.getElementById('preSettingsMsg');
-
-// ⭐ 預訂未付款（DOM）
-const unpaidPreDateSelect = document.getElementById('unpaidPreDateSelect');
-const unpaidPreList = document.getElementById('unpaidPreList');
-const reloadUnpaidPre = document.getElementById('reloadUnpaidPre');
 
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
 let token = localStorage.getItem('jwt') || null;
@@ -175,7 +146,9 @@ function showApp() {
 }
 initLoginLayerStyles();
 
-// 登入/登出
+/* =========================
+   登入/登出
+   ========================= */
 loginBtn.onclick = async () => {
   loginMsg.textContent = '';
   try {
@@ -189,7 +162,10 @@ loginBtn.onclick = async () => {
     localStorage.setItem('jwt', token);
     onLoginUser(data.user);
     applyMobileUI();
-    await fetchOpenStatus();
+    await fetchOpenStatus();     // 公開開放狀態
+    await fetchPreSettings();    // 預訂開關與日期
+    ensurePreorderUI();          // 注入預訂頁與預訂設定卡片
+    ensureUnpaidUI();            // 注入未付款卡片
     await initApp();
     switchTab('orders');
     showApp();
@@ -203,7 +179,9 @@ logoutBtn.onclick = () => {
   showLogin();
 };
 
-// ====== Auth / API ======
+/* =========================
+   API helper
+   ========================= */
 async function api(path, options = {}) {
   const res = await fetch(API_BASE + path, {
     ...options,
@@ -226,22 +204,27 @@ async function api(path, options = {}) {
   return data ?? raw;
 }
 
-// ====== 狀態 ======
+/* =========================
+   狀態
+   ========================= */
 const MIN_SEAT=1, MAX_SEAT=36;
 const state = {
   me: null,
   menus: [],
   activeMenuId: null,
   ordersCache: new Map(),
-  owLoaded: false,
-  bySeatData: null,
+  owLoaded: false,        // 後台時段設定是否載入過
+  bySeatData: null,       // 後台座號明細暫存
 
-  // ⭐ 預訂設定
-  preorderEnabled: false,
-  preorderDates: [],
+  // ⭐ 預訂
+  pre: {
+    settings: { enabled:false, dates:[] },
+    cache: new Map(), // key: `${date}::${seat}` => {submitted, internalOnly, paid, items}
+  },
 
-  // 預訂暫存
-  preOrdersCache: new Map(), // key: `${date}-${seat}`
+  // 未付款快取
+  unpaidOrders: [],
+  unpaidPreorders: [],
 };
 
 function isAdmin(){ return state.me?.role === 'admin'; }
@@ -249,9 +232,7 @@ async function safeRenderAdminReports(){
   if (isAdmin()) {
     await renderAgg();
     await renderMissing();
-    await renderUnpaid(); // 今日未付款
-    await initUnpaidPreDateSelect();
-    await renderUnpaidPre(); // 預設第一個日期
+    await renderUnpaidOrders(); // 今日訂單未付款
   }
 }
 
@@ -259,48 +240,41 @@ function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
   const admin = isAdmin();
-  tabLogs.classList.toggle('hidden', !admin);
-  tabUsers.classList.toggle('hidden', false);
-  tabMenus.classList.toggle('hidden', !admin);
-  tabReports.classList.toggle('hidden', !admin);
+  tabLogs?.classList.toggle('hidden', !admin);
+  tabUsers?.classList.toggle('hidden', false);
+  tabMenus?.classList.toggle('hidden', !admin);
+  tabReports?.classList.toggle('hidden', !admin);
   tabAllSeats?.classList.toggle('hidden', !admin);
-
-  // 只有 admin 永遠看到「預訂」；一般使用者需預訂開啟才顯示（initApp 會更新一次）
-  tabPreorder?.classList.toggle('hidden', !admin);
 
   document.querySelectorAll('.only-admin')
     .forEach(el => el.classList.toggle('hidden', !admin));
   document.querySelectorAll('.only-user')
     .forEach(el => el.classList.toggle('hidden', admin));
 
-  // ✅ 非 admin 禁用已付款勾勾（訂單 + 預訂）
-  if (paidEl) paidEl.disabled = !admin;
-  if (prePaidEl) prePaidEl.disabled = !admin;
-
+  // Admin 顯示「全部座號一覽」
   adminAllSeats?.classList.toggle('hidden', !admin);
   if (admin) renderAllSeatsAdmin();
 
-  // 一般使用者：座號 = 帳號；鎖定座號下拉（訂單與預訂兩邊）
+  // 一般使用者：座號 = 帳號；鎖定座號下拉
   if (!admin) {
     const n = Number(user.username);
     if (Number.isInteger(n) && n>=1 && n<=36) {
       seatSelect.value = String(n);
       seatSelect.disabled = true;
-
-      preSeatSelect.value = String(n);
-      preSeatSelect.disabled = true;
     }
   }
 }
 
-// ====== 開放時段（公開給前端顯示）======
+/* =========================
+   開放時段（公開用）
+   ========================= */
 async function fetchOpenStatus(){
   try{
     const data = await api('/open-status', { method:'GET' });
     isOpenWindow = !!data.open;
     renderOpenBanner(data);
   }catch{
-    isOpenWindow = true;
+    isOpenWindow = true; // 失敗不擋操作（後端仍會擋）
     renderOpenBanner(null);
   }
 }
@@ -326,7 +300,9 @@ function guardOpenWindow(){
   return true;
 }
 
-// ====== 後台：點餐時段設定（admin）======
+/* =========================
+   後台：點餐時段設定（admin）
+   ========================= */
 async function loadOpenWindowSettings(){
   if (!owStart || !owEnd || !owDayInputs.length) return;
   try{
@@ -360,7 +336,9 @@ async function saveOpenWindowSettings(){
 owReload?.addEventListener('click', loadOpenWindowSettings);
 owSave?.addEventListener('click', saveOpenWindowSettings);
 
-// ====== 後台：座號訂單合計與明細（admin）======
+/* =========================
+   後台：座號訂單合計與明細（admin）
+   ========================= */
 function calcSubtotal(items){
   return (items||[]).reduce((s,it)=> s + Number(it.unitPrice||0) * Number(it.qty||0), 0);
 }
@@ -399,7 +377,9 @@ async function loadBySeatReport(){
 }
 loadBySeatBtn?.addEventListener('click', loadBySeatReport);
 
-// ====== Admin：全部座號一覽（卡片）======
+/* =========================
+   Admin：全部座號一覽（卡片）
+   ========================= */
 function seatCardHTML(o){
   const subtotal = calcSubtotal(o.items||[]);
   const done = (o.items && o.items.length>0);
@@ -410,19 +390,19 @@ function seatCardHTML(o){
   <div class="seat-card" id="seat-card-${o.seat}">
     <div class="hdr">
       <strong>座號 ${o.seat}</strong>
-      <span>
-        ${o.paid ? '<span class="badge paid">已付款</span>' : ''}
-        <span class="badge ${done?'ok':'pending'}">${done?'完成':'未完成'}</span>
-      </span>
+      <span class="badge ${done?'ok':'pending'}">${done?'完成':'未完成'}</span>
     </div>
     <div class="items">${detail}</div>
     <div class="row small" style="justify-content:space-between;margin-top:6px">
       <span>小計：$${subtotal.toLocaleString('zh-Hant-TW')}</span>
       ${o.internalOnly ? '<span class="badge pending" title="此座為內訂">內訂</span>' : ''}
+      ${o.paid ? '<span class="badge ok" title="已付款">已付款</span>' : '<span class="badge pending" title="未付款">未付款</span>'}
     </div>
     <div class="seat-actions">
-      <label class="small"><input type="checkbox" class="seat-internal" data-seat="${o.seat}" ${o.internalOnly?'checked':''}/> 內訂</label>
-      <label class="small"><input type="checkbox" class="seat-paid" data-seat="${o.seat}" ${o.paid?'checked':''}/> 已付</label>
+      <label class="small">
+        <input type="checkbox" class="seat-internal" data-seat="${o.seat}" ${o.internalOnly?'checked':''}/>
+        內訂
+      </label>
       <button class="seat-edit" data-seat="${o.seat}">編輯</button>
       <button class="danger seat-clear" data-seat="${o.seat}">清空</button>
     </div>
@@ -478,51 +458,51 @@ allSeatsGrid?.addEventListener('change', async (e)=>{
     await renderSeatCardInto(seat);
     await safeRenderAdminReports();
   }
-  if (t.classList.contains('seat-paid')) {
-    const seat = Number(t.dataset.seat);
-    try{
-      await setOrderPaid(seat, t.checked);
-      await renderSeatCardInto(seat);
-      if (Number(seatSelect.value) === seat) await renderSeatOrder();
-      await renderUnpaid();
-    }catch(err){ alert('設定失敗：'+err.message); }
-  }
 });
 
-// ====== UI 切頁 ======
+/* =========================
+   UI 切頁
+   ========================= */
 function switchTab(which){
   const map = {
     orders: [tabOrders, pageOrders],
-    preorder:[tabPreorder, pagePreorder],
     menus:  [tabMenus, pageMenus],
     reports:[tabReports, pageReports],
     logs:   [tabLogs, pageLogs],
     users:  [tabUsers, pageUsers],
+    // 可能由程式動態加入
+    preorders: [document.getElementById('tabPreorders'), document.getElementById('pagePreorders')],
   };
   for (const k of Object.keys(map)){
-    const [btn, page] = map[k];
-    btn?.classList.toggle('active', k===which);
-    page?.classList.toggle('hidden', k!==which);
+    const pair = map[k];
+    if (!pair) continue;
+    const [btn, page] = pair;
+    if (!btn || !page) continue;
+    btn.classList.toggle('active', k===which);
+    page.classList.toggle('hidden', k!==which);
   }
   if (which==='reports') {
     safeRenderAdminReports();
     if (isAdmin() && !state.owLoaded) loadOpenWindowSettings();
+    if (isAdmin()) { renderPreSettingsUI(); }
   }
   if (which==='logs') { renderLogs(); }
   if (which==='users') { loadUsers(); }
+  if (which==='preorders') { renderPreorder(); }
 }
-tabOrders.onclick   = ()=>switchTab('orders');
-tabPreorder.onclick = ()=>switchTab('preorder');
-tabMenus.onclick    = ()=>switchTab('menus');
-tabReports.onclick  = ()=>switchTab('reports');
-tabLogs.onclick     = ()=>switchTab('logs');
-tabUsers.onclick    = ()=>switchTab('users');
+tabOrders.onclick = ()=>switchTab('orders');
+tabMenus.onclick  = ()=>switchTab('menus');
+tabReports.onclick= ()=>switchTab('reports');
+tabLogs.onclick   = ()=>switchTab('logs');
+tabUsers.onclick  = ()=>switchTab('users');
 tabAllSeats?.addEventListener('click', ()=>{
   switchTab('orders');
-  setTimeout(()=> adminAllSeats?.scrollIntoView({ behavior:'smooth', block:'start' }), 0);
+  document.getElementById('adminAllSeats')?.scrollIntoView({behavior:'smooth', block:'start'});
 });
 
-// ====== 菜單 & 訂單 API ======
+/* =========================
+   菜單 & 訂單 API
+   ========================= */
 async function loadMenus(){
   const data = await api('/menus');
   state.menus = data.menus || [];
@@ -579,62 +559,39 @@ async function saveOrder(seat, order){
     throw e;
   }
 }
-// ⭐ 只改付款（admin；不受時段限制）
 async function setOrderPaid(seat, paid){
-  await api(`/orders/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid: !!paid }) });
+  await api(`/orders/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid }) });
 }
 async function getAggregate(){ return api('/reports/aggregate'); }
 async function getMissing(){ return api('/reports/missing'); }
-async function getUnpaid(){ return api('/reports/unpaid'); }
+async function getUnpaidOrders(){ return api('/reports/unpaid'); }
 
-// ⭐ 預訂 API
-async function loadPreSettings(){
-  const s = await api('/settings/preorder', { method:'GET' });
-  state.preorderEnabled = !!s.enabled;
-  state.preorderDates = (s.dates||[]).map(d=>String(d));
-}
-async function savePreSettings(){
-  const body = { enabled: preEnabledEl.checked, dates: state.preorderDates };
-  await api('/settings/preorder', { method:'PUT', body: JSON.stringify(body) });
-}
-async function getPreorder(date, seat){
-  const key = `${date}-${seat}`;
-  if (state.preOrdersCache.has(key)) return state.preOrdersCache.get(key);
-  const o = await api(`/preorders/${date}/${seat}`);
-  state.preOrdersCache.set(key, o);
-  return o;
-}
-async function savePreorder(date, seat, payload){
-  await api(`/preorders/${date}/${seat}`, { method:'PUT', body: JSON.stringify(payload) });
-  state.preOrdersCache.set(`${date}-${seat}`, payload);
-}
-async function setPreorderPaid(date, seat, paid){
-  await api(`/preorders/${date}/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid: !!paid }) });
-}
-async function getPreUnpaid(date){ return api(`/preorders/${date}/unpaid`); }
-
-// ====== Render（畫面）=====
+/* =========================
+   Render（一般訂單頁）
+   ========================= */
 function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
-function renderSeats(selectEl){
-  selectEl.innerHTML = '';
+function renderSeats(){
+  seatSelect.innerHTML = '';
   for(let s=MIN_SEAT; s<=MAX_SEAT; s++){
     const opt = document.createElement('option');
     opt.value=String(s); opt.textContent = `座號 ${s}`;
-    selectEl.appendChild(opt);
+    seatSelect.appendChild(opt);
   }
-  selectEl.value = selectEl.value || '1';
+  seatSelect.value = seatSelect.value || '1';
 }
 function renderActiveMenu() {
   const m = state.menus.find(x=>x.id===state.activeMenuId);
-  activeMenuName.textContent = m ? m.name : '(未選擇)';
+  if (activeMenuName) activeMenuName.textContent = m ? m.name : '(未選擇)';
   const list = (m?.items||[]).map(it =>
     `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
-  activeMenuList.innerHTML = list || '(此菜單沒有項目)';
-  menuView.innerHTML = list;
+  if (activeMenuList) activeMenuList.innerHTML = list || '(此菜單沒有項目)';
+  if (menuView) menuView.innerHTML = list;
 }
 function renderMenuPage(){
+  if (!menuSelect) return;
   menuSelect.innerHTML = state.menus.map((m,i)=>`<option value="${m.id}">${i+1}. ${m.name}</option>`).join('');
   if (state.activeMenuId) menuSelect.value = String(state.activeMenuId);
+  if (!menuTableBody) return;
   menuTableBody.innerHTML = '';
   const m = state.menus.find(x=>x.id===state.activeMenuId);
   if (!m) return;
@@ -652,13 +609,11 @@ async function renderSeatOrder(){
   const seat = Number(seatSelect.value||1);
   const o = await getOrder(seat);
 
-  internalOnlyEl.checked = !!o.internalOnly;
-  paidEl.checked = !!o.paid;
-  // 再次保險：非 admin 一律禁用
-  paidEl.disabled = !isAdmin();
-
+  // 內訂狀態反映到 UI
+  if (internalOnlyEl) internalOnlyEl.checked = !!o.internalOnly;
   const lock = !!o.internalOnly;
 
+  // 鎖定新增/輸入區
   codeInput.disabled = lock;
   qtyInput.disabled = lock;
   addByCode.disabled = lock;
@@ -688,6 +643,20 @@ async function renderSeatOrder(){
   if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
     toggleSubmitted.textContent = o.submitted ? '設為未完成' : '標記完成';
   }
+
+  // ⭐ 已付款（tfoot 最後一格動態顯示；admin 可改）
+  const paidCell = document.querySelector('#orderTable tfoot th:last-child');
+  if (paidCell) {
+    if (isAdmin()) {
+      paidCell.innerHTML = `
+        <label class="small">
+          <input type="checkbox" id="paidCheckbox" ${o.paid?'checked':''}/>
+          已付款（僅 admin）
+        </label>`;
+    } else {
+      paidCell.innerHTML = `<span class="small muted">付款狀態：${o.paid ? '已付款' : '未付款'}</span>`;
+    }
+  }
 }
 async function renderAgg(){
   const data = await getAggregate();
@@ -700,97 +669,10 @@ async function renderMissing(){
   const arr = data.missing||[];
   missingList.textContent = arr.length ? `座號：${arr.join(', ')}` : '全部人都完成填單！';
 }
-async function renderUnpaid(){
-  if (!unpaidList) return;
-  unpaidList.textContent = '載入中…';
-  try{
-    const data = await getUnpaid();
-    if (!data.list.length) { unpaidList.textContent = '全數已付款 🎉'; return; }
-    unpaidList.innerHTML = data.list.map(r=>{
-      const detail = r.items.length
-        ? r.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
-        : '—';
-      return `座號 ${r.seat}：$${fmt(r.subtotal)}　<span class="small">${detail}</span>`;
-    }).join('<br>');
-  }catch(e){
-    unpaidList.textContent = '讀取失敗：' + e.message;
-  }
-}
 
-// ⭐ 預訂渲染
-function renderPreDateSelect(){
-  preDateSelect.innerHTML = state.preorderDates.map(d=> `<option value="${d}">${d}</option>`).join('');
-  unpaidPreDateSelect.innerHTML = preDateSelect.innerHTML;
-}
-function renderPreDatesList(){
-  preDatesList.innerHTML = (state.preorderDates||[]).map(d=>`
-    <span class="pill" data-date="${d}" style="display:inline-flex;align-items:center;gap:6px;margin:4px 6px 0 0">
-      ${d} <button class="danger small removeDate" data-date="${d}" style="padding:2px 6px">移除</button>
-    </span>
-  `).join('') || '<span class="small muted">（尚無日期）</span>';
-}
-async function renderPreorder(){
-  const date = preDateSelect.value;
-  const seat = Number(preSeatSelect.value||1);
-  const o = await getPreorder(date, seat);
-
-  preInternalOnlyEl.checked = !!o.internalOnly;
-  prePaidEl.checked = !!o.paid;
-  prePaidEl.disabled = !isAdmin(); // 再次保險
-  const lock = !!o.internalOnly;
-
-  preCodeInput.disabled = lock;
-  preQtyInput.disabled = lock;
-  preAddByCode.disabled = lock;
-  preManualName.disabled = lock;
-  preManualPrice.disabled = lock;
-  preManualQty.disabled = lock;
-  preAddManual.disabled = lock;
-
-  preOrderTbody.innerHTML = '';
-  let subtotal = 0;
-  (o.items||[]).forEach((it,idx)=>{
-    const line = it.unitPrice * it.qty; subtotal += line;
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${idx+1}</td>
-      <td>${it.name}</td>
-      <td>${fmt(it.unitPrice)}</td>
-      <td>
-        <input type="number" min="1" value="${it.qty}"
-               class="preQtyInput w120" data-idx="${idx}" ${lock?'disabled':''}/>
-      </td>
-      <td>${fmt(line)}</td>
-      <td>${lock ? '' : `<button class="danger preDelBtn" data-idx="${idx}">刪除</button>`}</td>`;
-    preOrderTbody.appendChild(tr);
-  });
-  preSeatSubtotal.textContent = fmt(subtotal);
-}
-async function initUnpaidPreDateSelect(){
-  renderPreDateSelect();
-  if (!unpaidPreDateSelect.value && state.preorderDates.length) {
-    unpaidPreDateSelect.value = state.preorderDates[0];
-  }
-}
-async function renderUnpaidPre(){
-  if (!unpaidPreList) return;
-  const date = unpaidPreDateSelect.value;
-  unpaidPreList.textContent = '載入中…';
-  try{
-    const data = await getPreUnpaid(date);
-    if (!data.list.length) { unpaidPreList.textContent = '全數已付款 🎉'; return; }
-    unpaidPreList.innerHTML = data.list.map(r=>{
-      const detail = r.items.length
-        ? r.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
-        : '—';
-      return `座號 ${r.seat}：$${fmt(r.subtotal)}　<span class="small">${detail}</span>`;
-    }).join('<br>');
-  }catch(e){
-    unpaidPreList.textContent = '讀取失敗：' + e.message;
-  }
-}
-
-// Logs
+/* =========================
+   Logs
+   ========================= */
 async function renderLogs(){
   logsTableBody.innerHTML = '<tr><td colspan="7">載入中…</td></tr>';
   try{
@@ -816,11 +698,14 @@ async function renderLogs(){
 }
 async function getLogs(){ return api('/logs'); }
 
-// ====== 使用者頁 ======
+/* =========================
+   使用者頁（抓全部分頁）
+   ========================= */
 async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}) {
   const p = new URLSearchParams({ q, role, status, page, pageSize });
   return api('/users?'+p.toString());
 }
+// 自動翻頁抓完
 async function fetchAllUsers() {
   const pageSize = 100;
   let page = 1;
@@ -844,7 +729,6 @@ async function resetPasswordAdmin(userId, newPassword){
 async function resetPasswordSelf(userId, oldPassword, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
 }
-
 async function loadUsers(){
   const admin = isAdmin();
   if (!admin) {
@@ -876,10 +760,8 @@ async function loadUsers(){
   usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
   try{
     const users = await fetchAllUsers();
-    const title = document.querySelector('#pageUsers .card.mt8 h3');
-    if (title) {
-      title.innerHTML = `使用者列表 <span class="small muted">（共 ${users.length} 筆）</span>`;
-    }
+    const title = document.querySelector('#pageUsers h3');
+    if (title) title.innerHTML = `使用者列表 <span class="small muted">（共 ${users.length} 筆）</span>`;
     usersTableBody.innerHTML = users.map(u=>`
       <tr>
         <td>${u.id}</td>
@@ -921,44 +803,9 @@ usersTableBody.addEventListener('click', async (e)=>{
   }
 });
 
-// ====== 菜單表格：編輯/刪除 ======
-menuTableBody.addEventListener('change', async (e)=>{
-  const t = e.target;
-  if (t.classList.contains('nameEdit') || t.classList.contains('priceEdit')) {
-    const id = Number(t.dataset.id);
-    const tr = t.closest('tr');
-    if (!tr) return;
-    const name = tr.querySelector(`.nameEdit[data-id="${id}"]`)?.value?.trim() ?? '';
-    const priceVal = tr.querySelector(`.priceEdit[data-id="${id}"]`)?.value ?? '0';
-    const price = Number(priceVal);
-    if (!name) return alert('品名不可空白');
-    if (Number.isNaN(price) || price < 0) return alert('價格需為 >= 0 的數字');
-    try{
-      await updateMenuItemReq(id, name, price);
-      renderMenuPage();
-      renderActiveMenu();
-    }catch(err){
-      alert('更新失敗：'+err.message);
-    }
-  }
-});
-menuTableBody.addEventListener('click', async (e)=>{
-  const t = e.target;
-  if (t.classList.contains('delItem')) {
-    const id = Number(t.dataset.id);
-    if (!confirm('確定刪除此項目？')) return;
-    try{
-      await deleteMenuItemReq(id);
-      await loadMenus();
-      renderMenuPage();
-      renderActiveMenu();
-    }catch(err){
-      alert('刪除失敗：'+err.message);
-    }
-  }
-});
-
-// ====== 訂單事件 ======
+/* =========================
+   事件（一般訂單）
+   ========================= */
 seatSelect.addEventListener('change', ()=>{ renderSeatOrder(); });
 
 if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
@@ -1004,23 +851,6 @@ internalOnlyEl?.addEventListener('change', async ()=>{
   }catch(e){
     alert('儲存失敗：'+e.message);
   }
-});
-// ⭐ 已付款（單座）— 僅 admin；不受時段限制
-paidEl?.addEventListener('change', async ()=>{
-  if (!isAdmin()) {
-    alert('僅管理員可變更付款狀態');
-    paidEl.checked = !paidEl.checked; // 還原
-    return;
-  }
-  const seat = Number(seatSelect.value||1);
-  try{
-    await setOrderPaid(seat, paidEl.checked);
-    await renderSeatOrder();
-    if (isAdmin()) {
-      await renderSeatCardInto(seat);
-      await renderUnpaid();
-    }
-  }catch(e){ alert('設定失敗：'+e.message); }
 });
 
 addByCode.addEventListener('click', async ()=>{
@@ -1090,6 +920,28 @@ orderTableBody.addEventListener('click', async (e)=>{
     if (isAdmin()) await renderSeatCardInto(seat);
   }
 });
+
+// ⭐ 已付款（admin 專用）切換
+document.querySelector('#orderTable tfoot')?.addEventListener('change', async (e)=>{
+  const t = e.target;
+  if (t.id === 'paidCheckbox') {
+    if (!isAdmin()) { t.checked = !t.checked; return; }
+    const seat = Number(seatSelect.value||1);
+    try{
+      await setOrderPaid(seat, t.checked);
+      // 同步快取
+      const o = await getOrder(seat);
+      o.paid = t.checked;
+      state.ordersCache.set(seat, o);
+      await safeRenderAdminReports();
+      if (isAdmin()) await renderSeatCardInto(seat);
+    }catch(err){
+      alert('更新付款狀態失敗：' + err.message);
+      t.checked = !t.checked;
+    }
+  }
+});
+
 useMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   await setActiveMenu(id);
@@ -1141,16 +993,421 @@ addItem.addEventListener('click', async ()=>{
   renderActiveMenu(); renderMenuPage();
 });
 
-// ====== ⭐ 預訂事件 ======
-preDateSelect?.addEventListener('change', ()=>{ renderPreorder(); });
-preSeatSelect?.addEventListener('change', ()=>{ renderPreorder(); });
+/* =========================
+   ⭐ 預訂便當區（UI + API）
+   ========================= */
+// 注入「預訂」分頁 & 預訂頁內容
+function ensurePreorderUI(){
+  // 新增 Tab（如不存在）
+  if (!document.getElementById('tabPreorders')) {
+    const right = document.querySelector('.topbar .right');
+    const btn = document.createElement('button');
+    btn.id = 'tabPreorders';
+    btn.className = 'tab';
+    btn.textContent = '預訂';
+    btn.addEventListener('click', ()=>switchTab('preorders'));
+    right.insertBefore(btn, right.querySelector('#whoami'));
+  }
+  // 新增 Page（如不存在）
+  if (!document.getElementById('pagePreorders')) {
+    const sec = document.createElement('section');
+    sec.id = 'pagePreorders';
+    sec.className = 'hidden';
+    sec.innerHTML = `
+      <div class="card">
+        <h3>預訂便當</h3>
+        <div class="row">
+          <label>日期 <input id="preDate" type="date"></label>
+          <label>座號 <select id="preSeatSelect"></select></label>
+          <button id="preLoad" class="ghost">載入</button>
+        </div>
 
-// 內訂（預訂）
-preInternalOnlyEl?.addEventListener('change', async ()=>{
-  const date = preDateSelect.value;
-  const seat = Number(preSeatSelect.value||1);
+        <div class="hr"></div>
+
+        <details open>
+          <summary><strong>由菜單代號新增</strong> <span class="small muted">（輸入代號與數量）</span></summary>
+          <div class="row mt8">
+            <input id="preCodeInput" type="number" min="1" placeholder="代號" class="w120" />
+            <input id="preQtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
+            <button id="preAddByCode" class="primary">加入</button>
+          </div>
+          <div id="preMenuView" class="small muted mt8"></div>
+        </details>
+
+        <details>
+          <summary><strong>手動新增餐點</strong></summary>
+          <div class="row mt8">
+            <input id="preManualName" placeholder="品名" />
+            <input id="preManualPrice" type="number" placeholder="單價" class="w140" />
+            <input id="preManualQty" type="number" placeholder="數量" value="1" class="w120" />
+            <button id="preAddManual" class="ghost">新增</button>
+          </div>
+        </details>
+
+        <div class="row mt8">
+          <label><input type="checkbox" id="preInternalOnly" /> 內訂</label>
+        </div>
+
+        <div class="hr"></div>
+
+        <table id="preTable">
+          <thead>
+            <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+          <tfoot>
+            <tr>
+              <th colspan="4" style="text-align:right">小計</th>
+              <th id="preSubtotal">0</th>
+              <th id="prePaidCell"></th>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div class="card only-admin" id="preAdminNote">
+        <div class="small muted">
+          管理員可隨時調整預訂內容與「已付款」；一般使用者只能在開啟「預訂」且日期允許時操作，且無法更改「已付款」。
+        </div>
+      </div>
+    `;
+    pageOrders.insertAdjacentElement('afterend', sec);
+
+    // 綁定事件
+    document.getElementById('preLoad').addEventListener('click', renderPreorder);
+    document.getElementById('preAddByCode').addEventListener('click', preAddByCode);
+    document.getElementById('preAddManual').addEventListener('click', preAddManual);
+    document.getElementById('preTable').addEventListener('input', preOnQtyChange);
+    document.getElementById('preTable').addEventListener('click', preOnDelete);
+    document.getElementById('preInternalOnly').addEventListener('change', preOnInternalToggle);
+    document.getElementById('preTable').addEventListener('change', preOnPaidToggle);
+  }
+
+  // 預設把菜單清單也顯示在預訂頁
+  const m = state.menus.find(x=>x.id===state.activeMenuId);
+  const list = (m?.items||[]).map(it => `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
+  document.getElementById('preMenuView').innerHTML = list || '(此菜單沒有項目)';
+
+  // 填座號下拉
+  const sel = document.getElementById('preSeatSelect');
+  sel.innerHTML = '';
+  for(let s=MIN_SEAT; s<=MAX_SEAT; s++){
+    const opt = document.createElement('option');
+    opt.value=String(s); opt.textContent = `座號 ${s}`;
+    sel.appendChild(opt);
+  }
+  // 一般使用者鎖定自己的座號
+  if (!isAdmin()) {
+    const n = Number(state.me?.username);
+    if (Number.isInteger(n) && n>=1 && n<=36) {
+      sel.value = String(n);
+      sel.disabled = true;
+    }
+  }
+  // 預設日期：今天（字串 yyyy-mm-dd）
+  const dt = new Date();
+  const yyyy = dt.getFullYear();
+  const mm = String(dt.getMonth()+1).padStart(2,'0');
+  const dd = String(dt.getDate()).padStart(2,'0');
+  document.getElementById('preDate').value = `${yyyy}-${mm}-${dd}`;
+}
+
+// 後台：注入「預訂設定」與「未付款清單」
+function ensureUnpaidUI(){
+  if (!pageReports) return;
+  // 未付款清單（如果還沒加）
+  if (!document.getElementById('unpaidCard')) {
+    const card = document.createElement('div');
+    card.className = 'card mt8';
+    card.id = 'unpaidCard';
+    card.innerHTML = `
+      <h3>未付款清單</h3>
+      <div class="small muted">以下為「今日訂單」未付款名單。</div>
+      <div id="unpaidOrdersList" class="mt8"></div>
+
+      <div class="hr"></div>
+      <div class="row">
+        <label>預訂日期 <input type="date" id="unpaidPreDate"></label>
+        <button id="loadUnpaidPre" class="ghost">載入預訂未付款</button>
+      </div>
+      <div id="unpaidPreList" class="mt8"></div>
+    `;
+    pageReports.appendChild(card);
+
+    document.getElementById('loadUnpaidPre').addEventListener('click', renderUnpaidPreorders);
+  }
+}
+function renderUnpaidOrdersList(arr){
+  const wrap = document.getElementById('unpaidOrdersList');
+  if (!arr.length) { wrap.innerHTML = '<div class="muted">（無）</div>'; return; }
+  wrap.innerHTML = arr.map(r=>{
+    const items = r.items.map(i=>`${i.name}×${i.qty}( \$${i.unitPrice} )`).join('，');
+    return `<div>座號 ${r.seat}：$${fmt(r.subtotal)} — ${items}</div>`;
+  }).join('');
+}
+function renderUnpaidPreList(arr){
+  const wrap = document.getElementById('unpaidPreList');
+  if (!arr.length) { wrap.innerHTML = '<div class="muted">（無）</div>'; return; }
+  wrap.innerHTML = arr.map(r=>{
+    const items = r.items.map(i=>`${i.name}×${i.qty}( \$${i.unitPrice} )`).join('，');
+    return `<div>座號 ${r.seat}：$${fmt(r.subtotal)} — ${items}</div>`;
+  }).join('');
+}
+async function renderUnpaidOrders(){
+  if (!isAdmin()) return;
+  try{
+    const data = await getUnpaidOrders();
+    state.unpaidOrders = data.list || [];
+    renderUnpaidOrdersList(state.unpaidOrders);
+  }catch(e){
+    document.getElementById('unpaidOrdersList').innerHTML = `<div class="muted">讀取失敗：${e.message}</div>`;
+  }
+}
+async function renderUnpaidPreorders(){
+  if (!isAdmin()) return;
+  const d = document.getElementById('unpaidPreDate').value;
+  if (!d) return alert('請選擇日期');
+  try{
+    const data = await api(`/preorders/${encodeURIComponent(d)}/unpaid`);
+    state.unpaidPreorders = data.list || [];
+    renderUnpaidPreList(state.unpaidPreorders);
+  }catch(e){
+    document.getElementById('unpaidPreList').innerHTML = `<div class="muted">讀取失敗：${e.message}</div>`;
+  }
+}
+
+// API：預訂設定
+async function fetchPreSettings(){
+  try{
+    const s = await api('/settings/preorder');
+    state.pre.settings = { enabled: !!s.enabled, dates: Array.isArray(s.dates)? s.dates : [] };
+  }catch{
+    state.pre.settings = { enabled:false, dates:[] };
+  }
+}
+async function savePreSettings(enabled, dates){
+  await api('/settings/preorder', {
+    method:'PUT',
+    body: JSON.stringify({ enabled, dates })
+  });
+  await fetchPreSettings();
+}
+// 報表頁注入/渲染 預訂設定（admin 專用）
+function renderPreSettingsUI(){
+  if (!isAdmin() || !pageReports) return;
+  let card = document.getElementById('preSettingsCard');
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'card mt8 only-admin';
+    card.id = 'preSettingsCard';
+    card.innerHTML = `
+      <h3>預訂設定</h3>
+      <div class="row">
+        <label><input type="checkbox" id="preEnabled"> 啟用預訂（顯示預訂分頁給一般使用者）</label>
+        <button id="preSave" class="primary">儲存</button>
+        <button id="preReload" class="ghost">重新載入</button>
+        <span id="preMsg" class="small muted"></span>
+      </div>
+      <div class="row mt8">
+        <label>新增允許日期 <input type="date" id="preAddDate"></label>
+        <button id="preAddDateBtn">加入</button>
+      </div>
+      <div class="small muted">允許日期清單：</div>
+      <div id="preDatesWrap" class="mt8"></div>
+    `;
+    pageReports.appendChild(card);
+
+    document.getElementById('preSave').addEventListener('click', async ()=>{
+      const enabled = document.getElementById('preEnabled').checked;
+      const dates = [...document.querySelectorAll('.pre-date-chip')].map(ch=>ch.dataset.date);
+      try{
+        await savePreSettings(enabled, dates);
+        document.getElementById('preMsg').textContent = '已儲存';
+      }catch(e){
+        document.getElementById('preMsg').textContent = '失敗：' + e.message;
+      }
+    });
+    document.getElementById('preReload').addEventListener('click', async ()=>{
+      await fetchPreSettings(); drawPreDatesChips();
+      document.getElementById('preEnabled').checked = !!state.pre.settings.enabled;
+      document.getElementById('preMsg').textContent = '已載入';
+    });
+    document.getElementById('preAddDateBtn').addEventListener('click', ()=>{
+      const d = document.getElementById('preAddDate').value;
+      if (!d) return;
+      if (!state.pre.settings.dates.includes(d)) state.pre.settings.dates.push(d);
+      drawPreDatesChips();
+    });
+  }
+  // 同步狀態
+  document.getElementById('preEnabled').checked = !!state.pre.settings.enabled;
+  drawPreDatesChips();
+
+  // 一般使用者：當預訂未啟用時隱藏預訂 Tab
+  const tab = document.getElementById('tabPreorders');
+  if (tab) tab.classList.toggle('hidden', !isAdmin() && !state.pre.settings.enabled);
+}
+function drawPreDatesChips(){
+  const wrap = document.getElementById('preDatesWrap');
+  const arr = state.pre.settings.dates || [];
+  if (!arr.length) { wrap.innerHTML = '<div class="muted small">（尚未加入）</div>'; return; }
+  wrap.innerHTML = arr.map(d=>`
+    <span class="pill pre-date-chip" data-date="${d}" title="點擊移除">${d} ✕</span>
+  `).join(' ');
+  wrap.querySelectorAll('.pre-date-chip').forEach(ch=>{
+    ch.addEventListener('click', ()=>{
+      const d = ch.dataset.date;
+      state.pre.settings.dates = state.pre.settings.dates.filter(x=>x!==d);
+      drawPreDatesChips();
+    });
+  });
+}
+
+// 讀寫預訂
+function preKey(date, seat){ return `${date}::${seat}`; }
+async function getPreorder(date, seat){
+  const key = preKey(date, seat);
+  if (state.pre.cache.has(key)) return state.pre.cache.get(key);
+  const o = await api(`/preorders/${encodeURIComponent(date)}/${seat}`);
+  state.pre.cache.set(key, o);
+  return o;
+}
+async function savePreorder(date, seat, order){
+  await api(`/preorders/${encodeURIComponent(date)}/${seat}`, { method:'PUT', body: JSON.stringify(order) });
+  state.pre.cache.set(preKey(date, seat), { date, seat, ...order });
+}
+async function setPreorderPaid(date, seat, paid){
+  await api(`/preorders/${encodeURIComponent(date)}/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid }) });
+}
+
+// 渲染預訂頁
+async function renderPreorder(){
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  if (!date) return;
+
+  // 一般使用者若預訂關閉/日期不在清單，阻擋
+  if (!isAdmin()){
+    if (!state.pre.settings.enabled) {
+      alert('預訂功能尚未啟用');
+      return;
+    }
+    if (!state.pre.settings.dates.includes(date)) {
+      alert('此日期不在可預訂清單');
+      return;
+    }
+  }
+
   const o = await getPreorder(date, seat);
-  if (preInternalOnlyEl.checked) {
+
+  const preInternalOnly = document.getElementById('preInternalOnly');
+  preInternalOnly.checked = !!o.internalOnly;
+
+  const TBody = document.querySelector('#preTable tbody');
+  const Subtotal = document.getElementById('preSubtotal');
+  const PaidCell = document.getElementById('prePaidCell');
+
+  // 內訂鎖住輸入
+  const lock = !!o.internalOnly;
+  document.getElementById('preCodeInput').disabled = lock;
+  document.getElementById('preQtyInput').disabled = lock;
+  document.getElementById('preAddByCode').disabled = lock;
+  document.getElementById('preManualName').disabled = lock;
+  document.getElementById('preManualPrice').disabled = lock;
+  document.getElementById('preManualQty').disabled = lock;
+  document.getElementById('preAddManual').disabled = lock;
+
+  TBody.innerHTML = '';
+  let subtotal = 0;
+  (o.items||[]).forEach((it, idx)=>{
+    const line = Number(it.unitPrice) * Number(it.qty);
+    subtotal += line;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${idx+1}</td>
+      <td>${it.name}</td>
+      <td>${fmt(it.unitPrice)}</td>
+      <td><input type="number" min="1" value="${it.qty}" class="preQty w120" data-idx="${idx}" ${lock?'disabled':''}/></td>
+      <td>${fmt(line)}</td>
+      <td>${lock?'':`<button class="danger preDel" data-idx="${idx}">刪除</button>`}</td>
+    `;
+    TBody.appendChild(tr);
+  });
+  Subtotal.textContent = fmt(subtotal);
+
+  // 已付款（admin 可改）
+  if (isAdmin()){
+    PaidCell.innerHTML = `<label class="small"><input id="prePaidCheckbox" type="checkbox" ${o.paid?'checked':''}/> 已付款（僅 admin）</label>`;
+  }else{
+    PaidCell.innerHTML = `<span class="small muted">付款狀態：${o.paid?'已付款':'未付款'}</span>`;
+  }
+}
+async function preAddByCode(){
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  const o = await getPreorder(date, seat);
+  if (o.internalOnly) return alert('已為「內訂」，不可加入其他品項');
+  const m = state.menus.find(x=>x.id===state.activeMenuId);
+  if (!m) return alert('尚未選擇菜單');
+  const code = Number(document.getElementById('preCodeInput').value||0);
+  const qty  = Number(document.getElementById('preQtyInput').value||1);
+  const it = m.items.find(x=>x.code===code);
+  if (!it) return alert('查無此代號');
+  if (qty<=0) return alert('數量需 >= 1');
+  o.items.push({ name: it.name, unitPrice: it.price, qty });
+  await savePreorder(date, seat, o);
+  document.getElementById('preCodeInput').value='';
+  document.getElementById('preQtyInput').value='1';
+  await renderPreorder();
+  if (isAdmin()) await renderSeatCardInto(seat); // 不一定同日，但不影響
+}
+async function preAddManual(){
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  const o = await getPreorder(date, seat);
+  if (o.internalOnly) return alert('已為「內訂」，不可加入其他品項');
+  const name = (document.getElementById('preManualName').value||'').trim();
+  const price= Number(document.getElementById('preManualPrice').value||0);
+  const qty  = Number(document.getElementById('preManualQty').value||1);
+  if (!name) return alert('請輸入品名');
+  if (price<0) return alert('價格需 >= 0');
+  if (qty<=0) return alert('數量需 >= 1');
+  o.items.push({ name, unitPrice:price, qty });
+  await savePreorder(date, seat, o);
+  document.getElementById('preManualName').value='';
+  document.getElementById('preManualPrice').value='';
+  document.getElementById('preManualQty').value='1';
+  await renderPreorder();
+}
+async function preOnQtyChange(e){
+  const t = e.target;
+  if (!t.classList.contains('preQty')) return;
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  const o = await getPreorder(date, seat);
+  if (o.internalOnly) return alert('內訂狀態不可編輯數量');
+  const idx = Number(t.dataset.idx);
+  o.items[idx].qty = Math.max(1, Number(t.value||1));
+  await savePreorder(date, seat, o);
+  await renderPreorder();
+}
+async function preOnDelete(e){
+  const t = e.target;
+  if (!t.classList.contains('preDel')) return;
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  const o = await getPreorder(date, seat);
+  if (o.internalOnly) return alert('內訂狀態不可刪除品項');
+  const idx = Number(t.dataset.idx);
+  o.items.splice(idx,1);
+  await savePreorder(date, seat, o);
+  await renderPreorder();
+}
+async function preOnInternalToggle(){
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
+  const o = await getPreorder(date, seat);
+  if (document.getElementById('preInternalOnly').checked) {
     o.items = [{ name:'內訂', unitPrice:0, qty:1 }];
     o.internalOnly = true;
   } else {
@@ -1160,157 +1417,46 @@ preInternalOnlyEl?.addEventListener('change', async ()=>{
   try{
     await savePreorder(date, seat, o);
     await renderPreorder();
-    if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-  }catch(e){ alert('儲存失敗：'+e.message); }
-});
-// 已付款（預訂）— 僅 admin；不受時段限制
-prePaidEl?.addEventListener('change', async ()=>{
-  if (!isAdmin()) {
-    alert('僅管理員可變更付款狀態');
-    prePaidEl.checked = !prePaidEl.checked;
-    return;
+  }catch(e){
+    alert('儲存失敗：'+e.message);
   }
-  const date = preDateSelect.value;
-  const seat = Number(preSeatSelect.value||1);
-  try{
-    await setPreorderPaid(date, seat, prePaidEl.checked);
-    await renderPreorder();
-    if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-  }catch(e){ alert('設定失敗：'+e.message); }
-});
-
-preAddByCode?.addEventListener('click', async ()=>{
-  const date = preDateSelect.value;
-  const seat = Number(preSeatSelect.value||1);
-  const o = await getPreorder(date, seat);
-  if (o.internalOnly) { alert('已為「內訂」，不可加入其他品項'); return; }
-  const m = state.menus.find(x=>x.id===state.activeMenuId);
-  if (!m) return alert('尚未選擇菜單');
-  const code = Number(preCodeInput.value||0);
-  const qty  = Number(preQtyInput.value||1);
-  const it = m.items.find(x=>x.code===code);
-  if (!it) return alert('查無此代號');
-  if (qty<=0) return alert('數量需 >= 1');
-  o.items.push({ name: it.name, unitPrice: it.price, qty });
-  await savePreorder(date, seat, o);
-  preCodeInput.value=''; preQtyInput.value='1';
-  await renderPreorder();
-  if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-});
-preAddManual?.addEventListener('click', async ()=>{
-  const date = preDateSelect.value;
-  const seat = Number(preSeatSelect.value||1);
-  const o = await getPreorder(date, seat);
-  if (o.internalOnly) { alert('已為「內訂」，不可加入其他品項'); return; }
-  const name = (preManualName.value||'').trim();
-  const price= Number(preManualPrice.value||0);
-  const qty  = Number(preManualQty.value||1);
-  if (!name) return alert('請輸入品名');
-  if (price<0) return alert('價格需 >= 0');
-  if (qty<=0) return alert('數量需 >= 1');
-  o.items.push({ name, unitPrice:price, qty });
-  await savePreorder(date, seat, o);
-  preManualName.value=''; preManualPrice.value=''; preManualQty.value='1';
-  await renderPreorder();
-  if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-});
-preOrderTbody.addEventListener('input', async (e)=>{
+}
+async function preOnPaidToggle(e){
   const t = e.target;
-  if (t.classList.contains('preQtyInput')) {
-    const date = preDateSelect.value;
-    const seat = Number(preSeatSelect.value||1);
-    const idx = Number(t.dataset.idx);
-    const o = await getPreorder(date, seat);
-    if (o.internalOnly) { alert('內訂狀態不可編輯數量'); return; }
-    o.items[idx].qty = Math.max(1, Number(t.value||1));
-    await savePreorder(date, seat, o);
-    await renderPreorder();
-    if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-  }
-});
-preOrderTbody.addEventListener('click', async (e)=>{
-  const t = e.target;
-  if (t.classList.contains('preDelBtn')) {
-    const date = preDateSelect.value;
-    const seat = Number(preSeatSelect.value||1);
-    const idx = Number(t.dataset.idx);
-    const o = await getPreorder(date, seat);
-    if (o.internalOnly) { alert('內訂狀態不可刪除品項'); return; }
-    o.items.splice(idx,1);
-    await savePreorder(date, seat, o);
-    await renderPreorder();
-    if (isAdmin() && unpaidPreDateSelect.value===date) await renderUnpaidPre();
-  }
-});
-
-// ⭐ 預訂設定事件
-preAddDateBtn?.addEventListener('click', ()=>{
-  const d = preAddDateEl.value;
-  if (!d) return;
-  if (!state.preorderDates.includes(d)) state.preorderDates.push(d);
-  state.preorderDates.sort();
-  renderPreDateSelect();
-  renderPreDatesList();
-});
-preDatesList?.addEventListener('click', (e)=>{
-  const t = e.target;
-  if (t.classList.contains('removeDate')) {
-    const d = t.dataset.date;
-    state.preorderDates = state.preorderDates.filter(x=>x!==d);
-    renderPreDateSelect();
-    renderPreDatesList();
-  }
-});
-preSaveDatesBtn?.addEventListener('click', async ()=>{
+  if (t.id !== 'prePaidCheckbox') return;
+  if (!isAdmin()) { t.checked = !t.checked; return; }
+  const date = document.getElementById('preDate').value;
+  const seat = Number(document.getElementById('preSeatSelect').value||1);
   try{
-    await savePreSettings();
-    preSettingsMsg.textContent = '已儲存';
-    renderPreDateSelect();
-    await initUnpaidPreDateSelect();
-  }catch(e){ preSettingsMsg.textContent = '儲存失敗：'+e.message; }
-});
-preReloadBtn?.addEventListener('click', async ()=>{
-  try{
-    await loadPreSettings();
-    preEnabledEl.checked = state.preorderEnabled;
-    renderPreDateSelect();
-    renderPreDatesList();
-    preSettingsMsg.textContent = '已載入';
-    await initUnpaidPreDateSelect();
-  }catch(e){ preSettingsMsg.textContent = '讀取失敗：'+e.message; }
-});
-reloadUnpaidPre?.addEventListener('click', renderUnpaidPre);
-unpaidPreDateSelect?.addEventListener('change', renderUnpaidPre);
+    await setPreorderPaid(date, seat, t.checked);
+  }catch(err){
+    alert('更新付款狀態失敗：' + err.message);
+    t.checked = !t.checked;
+  }
+}
 
-// ====== 初始化 ======
+/* =========================
+   初始化
+   ========================= */
 function renderSeatsThenDefault(){
-  renderSeats(seatSelect);
-  renderSeats(preSeatSelect);
+  renderSeats();
   if (!seatSelect.value) seatSelect.value = '1';
-  if (!preSeatSelect.value) preSeatSelect.value = '1';
 }
 function renderStatic(){ renderSeatsThenDefault(); }
 async function initApp(){
   await loadMenus();
   renderActiveMenu();
   renderMenuPage();
-
-  // 載入預訂設定
-  await loadPreSettings();
-  preEnabledEl && (preEnabledEl.checked = state.preorderEnabled);
-  renderPreDateSelect();
-  renderPreDatesList();
-
-  // 一般使用者看不見預訂（若關閉）
-  if (!isAdmin()) tabPreorder.classList.toggle('hidden', !state.preorderEnabled);
-
-  // 訂單 & 預訂初次渲染
+  ensurePreorderUI();          // 確保預訂頁存在
+  renderPreSettingsUI();       // 報表頁顯示預訂設定（admin）
+  ensureUnpaidUI();            // 報表頁顯示未付款卡片
   await renderSeatOrder();
-  if (state.preorderDates.length) preDateSelect.value = state.preorderDates[0];
-  await renderPreorder();
+  await safeRenderAdminReports(); // 只在 admin 才打報表 API
+  if (isAdmin()) await renderAllSeatsAdmin(); // admin 一進來就載入全部座號
 
-  await safeRenderAdminReports();
-  if (isAdmin()) await renderAllSeatsAdmin();
+  // 一般使用者若未啟用預訂，就隱藏預訂 Tab
+  const tab = document.getElementById('tabPreorders');
+  if (tab) tab.classList.toggle('hidden', !isAdmin() && !state.pre.settings.enabled);
 }
 
 // 自動登入驗證
@@ -1322,6 +1468,9 @@ async function initApp(){
     onLoginUser(me.user);
     applyMobileUI();
     await fetchOpenStatus();
+    await fetchPreSettings();
+    ensurePreorderUI();
+    ensureUnpaidUI();
     await initApp();
     switchTab('orders');
     showApp();
