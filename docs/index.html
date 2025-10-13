@@ -19,6 +19,7 @@
     .badge{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #555}
     .badge.ok{background:#103a1a;border-color:#1f7a35}
     .badge.pending{background:#3a2a10;border-color:#a36b1a}
+    .badge.paid{background:#0f2f49;border-color:#3aa0ff}
     .seat-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
     .items{font-size:12px;color:#d8d8d8}
   </style>
@@ -44,11 +45,12 @@
       </div>
       <div class="right">
         <button id="tabOrders" class="tab active">訂單</button>
+        <button id="tabPreorder" class="tab hidden">預訂</button>
         <button id="tabMenus" class="tab">菜單</button>
         <button id="tabReports" class="tab">後台</button>
         <button id="tabLogs" class="tab hidden">Logs</button>
         <button id="tabUsers" class="tab hidden">使用者</button>
-        <!-- ✅ 新增：僅 admin 顯示，一鍵捲到「全部座號」 -->
+        <!-- 僅 admin 顯示，一鍵捲到「全部座號」 -->
         <button id="tabAllSeats" class="tab hidden">全座號</button>
         <span id="whoami" class="pill"></span>
         <button id="logoutBtn">登出</button>
@@ -70,7 +72,6 @@
             <label>座號
               <select id="seatSelect"></select>
             </label>
-            <!-- 若你的舊版仍有此按鈕可保留；沒有也不影響 -->
             <button id="clearSeat" class="danger">清空本座</button>
           </div>
 
@@ -95,11 +96,11 @@
               <button id="addManual" class="ghost">新增</button>
             </div>
           </details>
-            <div class="row mt8">
-              <label>
-                <input type="checkbox" id="internalOnly" /> 內訂（此座位由班導/行政統一內部訂購）</label>
-            </div>
-          
+
+          <div class="row mt8" style="gap:16px">
+            <label><input type="checkbox" id="internalOnly" /> 內訂</label>
+            <label><input type="checkbox" id="paid" /> 已付款</label>
+          </div>
 
           <div class="hr"></div>
 
@@ -124,13 +125,87 @@
         </div>
       </div>
 
-      <!-- ✅ 新增：管理員一頁看完全部座號 -->
+      <!-- 管理員一頁看完全部座號 -->
       <div id="adminAllSeats" class="card hidden" style="margin-top:12px">
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
           <h3>全部座號（管理員快速檢視 / 操作）</h3>
           <button id="refreshAllSeats" class="ghost">重新整理</button>
         </div>
         <div id="allSeatsGrid"></div>
+      </div>
+    </section>
+
+    <!-- ⭐ 預訂便當頁 -->
+    <section id="pagePreorder" class="hidden">
+      <div class="grid">
+        <div class="card">
+          <h3>預訂便當</h3>
+          <div class="row" style="gap:16px">
+            <label>日期
+              <select id="preDateSelect"></select>
+            </label>
+            <label>座號
+              <select id="preSeatSelect"></select>
+            </label>
+          </div>
+
+          <div class="row mt8" style="gap:16px">
+            <label><input type="checkbox" id="preInternalOnly" /> 內訂</label>
+            <label><input type="checkbox" id="prePaid" /> 已付款</label>
+          </div>
+
+          <div class="hr"></div>
+
+          <details open>
+            <summary><strong>由菜單代號新增</strong></summary>
+            <div class="row mt8">
+              <input id="preCodeInput" type="number" min="1" placeholder="代號" class="w120" />
+              <input id="preQtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
+              <button id="preAddByCode" class="primary">加入</button>
+            </div>
+          </details>
+
+          <details>
+            <summary><strong>手動新增餐點</strong></summary>
+            <div class="row mt8">
+              <input id="preManualName" placeholder="品名" />
+              <input id="preManualPrice" type="number" placeholder="單價" class="w140" />
+              <input id="preManualQty" type="number" placeholder="數量" value="1" class="w120" />
+              <button id="preAddManual" class="ghost">新增</button>
+            </div>
+          </details>
+
+          <div class="hr"></div>
+
+          <h3>本座預訂明細</h3>
+          <table id="preOrderTable">
+            <thead>
+              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
+            </thead>
+            <tbody id="preOrderTbody"></tbody>
+            <tfoot>
+              <tr><th colspan="4" style="text-align:right">小計</th><th id="preSeatSubtotal">0</th><th></th></tr>
+            </tfoot>
+          </table>
+        </div>
+
+        <div class="card only-admin">
+          <div class="section-title">
+            <h3>預訂設定</h3>
+            <span id="preSettingsMsg" class="small muted"></span>
+          </div>
+          <div class="row" style="gap:16px">
+            <label><input type="checkbox" id="preEnabled" /> 開啟預訂功能（對一般使用者顯示）</label>
+          </div>
+          <div class="row mt8" style="gap:8px">
+            <input id="preAddDate" type="date" />
+            <button id="preAddDateBtn" class="ghost">加入日期</button>
+            <button id="preSaveDates" class="primary">儲存</button>
+            <button id="preReload" class="ghost">重新載入</button>
+          </div>
+          <div class="small muted mt8">允許的日期清單：</div>
+          <div id="preDatesList" class="mt8"></div>
+        </div>
       </div>
     </section>
 
@@ -165,7 +240,7 @@
       </div>
     </section>
 
-    <!-- 後台頁（彙整＋缺單） -->
+    <!-- 後台頁（彙整＋缺單＋未付款） -->
     <section id="pageReports" class="hidden">
       <div class="grid">
         <div class="card">
@@ -194,33 +269,47 @@
           <tbody id="bySeatTBody"></tbody>
         </table>
       </div>
-          <div class="card mt8 only-admin">
-      <h3>點餐時段設定</h3>
 
-      <!-- 勾選開放的星期（1=週一 … 6=週六, 0=週日） -->
-      <div class="row" style="flex-wrap:wrap;gap:8px">
-        <label><input type="checkbox" name="owDay" value="1"> 週一</label>
-        <label><input type="checkbox" name="owDay" value="2"> 週二</label>
-        <label><input type="checkbox" name="owDay" value="3"> 週三</label>
-        <label><input type="checkbox" name="owDay" value="4"> 週四</label>
-        <label><input type="checkbox" name="owDay" value="5"> 週五</label>
-        <label><input type="checkbox" name="owDay" value="6"> 週六</label>
-        <label><input type="checkbox" name="owDay" value="0"> 週日</label>
+      <div class="card mt8 only-admin">
+        <h3>未付款名單（今日）</h3>
+        <div id="unpaidList" class="muted"></div>
       </div>
 
-      <!-- 24 小時制時間輸入 -->
-      <div class="row mt8" style="gap:8px;align-items:center">
-        <label>開始 <input id="owStart" type="time" step="60"></label>
-        <label>結束 <input id="owEnd" type="time" step="60"></label>
-        <button id="owSave" class="primary">儲存</button>
-        <button id="owReload" class="ghost">重新載入</button>
-        <span id="owMsg" class="small muted"></span>
+      <div class="card mt8 only-admin">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <h3>預訂未付款名單</h3>
+          <div>
+            <label>日期
+              <select id="unpaidPreDateSelect"></select>
+            </label>
+            <button id="reloadUnpaidPre" class="ghost">重新整理</button>
+          </div>
+        </div>
+        <div id="unpaidPreList" class="muted"></div>
       </div>
 
-      <div class="small muted mt8">
-        顯示為 24 小時制；系統時區由後端設定（預設 Asia/Taipei）。儲存後立即生效。
+      <div class="card mt8 only-admin">
+        <h3>點餐時段設定</h3>
+        <div class="row" style="flex-wrap:wrap;gap:8px">
+          <label><input type="checkbox" name="owDay" value="1"> 週一</label>
+          <label><input type="checkbox" name="owDay" value="2"> 週二</label>
+          <label><input type="checkbox" name="owDay" value="3"> 週三</label>
+          <label><input type="checkbox" name="owDay" value="4"> 週四</label>
+          <label><input type="checkbox" name="owDay" value="5"> 週五</label>
+          <label><input type="checkbox" name="owDay" value="6"> 週六</label>
+          <label><input type="checkbox" name="owDay" value="0"> 週日</label>
+        </div>
+        <div class="row mt8" style="gap:8px;align-items:center">
+          <label>開始 <input id="owStart" type="time" step="60"></label>
+          <label>結束 <input id="owEnd" type="time" step="60"></label>
+          <button id="owSave" class="primary">儲存</button>
+          <button id="owReload" class="ghost">重新載入</button>
+          <span id="owMsg" class="small muted"></span>
+        </div>
+        <div class="small muted mt8">
+          顯示為 24 小時制；系統時區由後端設定（預設 Asia/Taipei）。儲存後立即生效。
+        </div>
       </div>
-    </div>
     </section>
 
     <!-- Logs（僅 admin） -->
