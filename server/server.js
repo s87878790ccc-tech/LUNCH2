@@ -222,16 +222,12 @@ function userCanAccessSeat(user, seat) {
 }
 async function isOpenNow() {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
-  if (!s) return true;
-  const openDays = (s.open_days || []).map(Number);
-  const now = new Date();
-  const day = now.getDay(); // 0..6 (Sun=0)
-  if (!openDays.includes(day)) return false;
-  const hhmm = (d) => String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-  const cur = hhmm(now);
+  if (!s) return true; // 沒設定就放行
+  const openDays = (s.open_days || []).map(Number); // 0(日)~6(六)
+  const { hhmm, day } = zonedNowInfo();
   const start = s.open_start || '00:00';
-  const end = s.open_end || '23:59';
-  return start <= cur && cur <= end;
+  const end   = s.open_end   || '23:59';
+  return openDays.includes(day) && start <= hhmm && hhmm <= end;
 }
 
 /* =========================
@@ -373,6 +369,49 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
   await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
   await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
+});
+
+// ---- 時區設定（預設 Asia/Taipei，可用 env 覆蓋：BUSINESS_TZ）----
+const BUSINESS_TZ = process.env.BUSINESS_TZ || 'Asia/Taipei';
+
+function zonedNowInfo(tz = BUSINESS_TZ) {
+  const now = new Date();
+  const [hh, mm] = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit'
+  }).format(now).split(':');
+
+  const wdStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, weekday: 'short'
+  }).format(now); // Sun/Mon/Tue...
+  const wdMap = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  const day = wdMap[wdStr] ?? 0;
+
+  const nowLocal = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: tz, hour12: false,
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit'
+  }).format(now);
+
+  return { hhmm: `${hh}:${mm}`, day, nowISO: now.toISOString(), nowLocal, tz };
+}
+
+app.get('/api/open-status', auth(false), async (req, res) => {
+  const s = await one('select open_days, open_start, open_end from settings where id=1');
+  const info = zonedNowInfo();
+  const openDays = (s?.open_days || []).map(Number);
+  const start = s?.open_start || '07:00';
+  const end   = s?.open_end   || '12:00';
+  const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
+
+  res.json({
+    open,
+    openDays: openDays.map(String), // ['1','2','3','4','5'] 代表一~五
+    openStart: start,
+    openEnd: end,
+    nowISO: info.nowISO,
+    nowLocal: info.nowLocal, // 直接給本地 24h 字串
+    tz: info.tz
+  });
 });
 
 // Orders

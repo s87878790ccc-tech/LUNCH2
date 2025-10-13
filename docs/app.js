@@ -242,18 +242,21 @@ async function fetchOpenStatus(){
     renderOpenBanner(null);
   }
 }
+
 function renderOpenBanner(data){
-  const admin = isAdmin();
+  const admin = state.me?.role === 'admin';
   const show = !admin && !isOpenWindow;
   if (!closedBanner) return;
   closedBanner.classList.toggle('hidden', !show);
   if (show && data){
+    const nowStr = data.nowLocal || new Date(data.nowISO || Date.now()).toLocaleString('zh-TW',{hour12:false});
     closedBanner.innerHTML = `
       <strong>目前不在點餐時段</strong>
-      <div class="small">開放時段：週${(data.openDays||[]).join('、')}，${data.openStart}~${data.openEnd}（現在：${new Date(data.now).toLocaleString('zh-TW',{hour12:false})}）</div>
+      <div class="small">開放時段：週${(data.openDays||[]).join('、')}，${data.openStart}~${data.openEnd}（現在：${nowStr}）</div>
     `;
   }
 }
+
 function guardOpenWindow(){
   const admin = isAdmin();
   if (!admin && !isOpenWindow) {
@@ -517,9 +520,11 @@ async function renderLogs(){
     logsTableBody.innerHTML = data.logs.map(l=>{
       let details = l.details;
       try{ if(details) details = JSON.stringify(JSON.parse(details), null, 2) }catch{}
+      const ts = l.ts ? new Date(l.ts) : null;
+      const tsStr = ts ? ts.toLocaleString('zh-TW',{hour12:false}) : '';
       return `<tr>
         <td>${l.id}</td>
-        <td>${l.ts}</td>
+        <td>${tsStr}</td>
         <td>${l.user_id ?? ''}</td>
         <td>${l.action}</td>
         <td><pre style="white-space:pre-wrap;margin:0">${details||''}</pre></td>
