@@ -99,6 +99,11 @@ const bySeatTBody = document.getElementById('bySeatTBody');
 const loadBySeatBtn = document.getElementById('loadBySeat');
 const loadBySeatMsg = document.getElementById('loadBySeatMsg');
 
+// ====== Admin：全部座號一覽（DOM）======
+const adminAllSeats = document.getElementById('adminAllSeats');
+const allSeatsGrid = document.getElementById('allSeatsGrid');
+const refreshAllSeats = document.getElementById('refreshAllSeats');
+
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
 let token = localStorage.getItem('jwt') || null;
 apiBaseHint.textContent = `API: ${API_BASE}`;
@@ -221,6 +226,10 @@ function onLoginUser(user){
   document.querySelectorAll('.only-user')
     .forEach(el => el.classList.toggle('hidden', admin));
 
+  // Admin 顯示「全部座號一覽」
+  adminAllSeats?.classList.toggle('hidden', !admin);
+  if (admin) renderAllSeatsAdmin();
+
   // 一般使用者：座號 = 帳號；鎖定座號下拉
   if (!admin) {
     const n = Number(user.username);
@@ -338,6 +347,86 @@ async function loadBySeatReport(){
   }
 }
 loadBySeatBtn?.addEventListener('click', loadBySeatReport);
+
+// ====== Admin：全部座號一覽（卡片）======
+function seatCardHTML(o){
+  const subtotal = calcSubtotal(o.items||[]);
+  const done = (o.items && o.items.length>0);
+  const detail = o.items.length
+    ? o.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
+    : '<span class="muted small">—</span>';
+  return `
+  <div class="seat-card" id="seat-card-${o.seat}">
+    <div class="hdr">
+      <strong>座號 ${o.seat}</strong>
+      <span class="badge ${done?'ok':'pending'}">${done?'完成':'未完成'}</span>
+    </div>
+    <div class="items">${detail}</div>
+    <div class="row small" style="justify-content:space-between;margin-top:6px">
+      <span>小計：$${subtotal.toLocaleString('zh-Hant-TW')}</span>
+      ${o.internalOnly ? '<span class="badge pending" title="此座為內訂">內訂</span>' : ''}
+    </div>
+    <div class="seat-actions">
+      <label class="small">
+        <input type="checkbox" class="seat-internal" data-seat="${o.seat}" ${o.internalOnly?'checked':''}/>
+        內訂
+      </label>
+      <button class="seat-edit" data-seat="${o.seat}">編輯</button>
+      <button class="danger seat-clear" data-seat="${o.seat}">清空</button>
+    </div>
+  </div>`;
+}
+async function renderSeatCardInto(seat){
+  if (!allSeatsGrid) return;
+  const o = await api(`/orders/${seat}`);
+  state.ordersCache.set(seat, o);
+  const el = document.getElementById(`seat-card-${seat}`);
+  if (el) el.outerHTML = seatCardHTML(o);
+}
+async function renderAllSeatsAdmin(){
+  if (!isAdmin() || !adminAllSeats || !allSeatsGrid) return;
+  const seats = Array.from({length:MAX_SEAT}, (_,i)=>i+1);
+  allSeatsGrid.innerHTML = '<div class="muted">載入中…</div>';
+  const orders = await Promise.all(seats.map(seat => api(`/orders/${seat}`)));
+  orders.forEach(o => state.ordersCache.set(o.seat, o));
+  allSeatsGrid.innerHTML = orders.map(o => seatCardHTML(o)).join('');
+}
+refreshAllSeats?.addEventListener('click', renderAllSeatsAdmin);
+
+allSeatsGrid?.addEventListener('click', async (e)=>{
+  const t = e.target;
+  if (t.classList.contains('seat-edit')) {
+    const seat = Number(t.dataset.seat);
+    seatSelect.value = String(seat);
+    window.scrollTo({top:0, behavior:'smooth'});
+    await renderSeatOrder();
+  }
+  if (t.classList.contains('seat-clear')) {
+    const seat = Number(t.dataset.seat);
+    if (!confirm(`清空座號 ${seat} 的訂單？`)) return;
+    await saveOrder(seat, { submitted:false, items:[], internalOnly:false });
+    state.ordersCache.delete(seat);
+    await renderSeatCardInto(seat);
+    await safeRenderAdminReports();
+  }
+});
+allSeatsGrid?.addEventListener('change', async (e)=>{
+  const t = e.target;
+  if (t.classList.contains('seat-internal')) {
+    const seat = Number(t.dataset.seat);
+    const o = await getOrder(seat);
+    if (t.checked) {
+      o.items = [{ name:'內訂', unitPrice:0, qty:1 }];
+      o.internalOnly = true;
+    } else {
+      o.items = [];
+      o.internalOnly = false;
+    }
+    await saveOrder(seat, o);
+    await renderSeatCardInto(seat);
+    await safeRenderAdminReports();
+  }
+});
 
 // ====== UI 切頁 ======
 function switchTab(which){
@@ -639,6 +728,7 @@ if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
     await saveOrder(seat, o);
     await renderSeatOrder();
     await safeRenderAdminReports();
+    if (isAdmin()) await renderSeatCardInto(seat);
   });
 }
 
@@ -650,6 +740,7 @@ clearSeat.addEventListener('click', async ()=>{
   state.ordersCache.delete(seat);
   await renderSeatOrder();
   await safeRenderAdminReports();
+  if (isAdmin()) await renderSeatCardInto(seat);
 });
 
 // 內訂勾選
@@ -667,6 +758,7 @@ internalOnlyEl?.addEventListener('change', async ()=>{
     await saveOrder(seat, o);
     await renderSeatOrder();
     await safeRenderAdminReports();
+    if (isAdmin()) await renderSeatCardInto(seat);
   }catch(e){
     alert('儲存失敗：'+e.message);
   }
@@ -689,6 +781,7 @@ addByCode.addEventListener('click', async ()=>{
   codeInput.value=''; qtyInput.value='1';
   await renderSeatOrder();
   await safeRenderAdminReports();
+  if (isAdmin()) await renderSeatCardInto(seat);
 });
 addManual.addEventListener('click', async ()=>{
   if (!guardOpenWindow()) return;
@@ -706,6 +799,7 @@ addManual.addEventListener('click', async ()=>{
   manualName.value=''; manualPrice.value=''; manualQty.value='1';
   await renderSeatOrder();
   await safeRenderAdminReports();
+  if (isAdmin()) await renderSeatCardInto(seat);
 });
 orderTableBody.addEventListener('input', async (e)=>{
   if (!guardOpenWindow()) return;
@@ -719,6 +813,7 @@ orderTableBody.addEventListener('input', async (e)=>{
     await saveOrder(seat, o);
     await renderSeatOrder();
     await safeRenderAdminReports();
+    if (isAdmin()) await renderSeatCardInto(seat);
   }
 });
 orderTableBody.addEventListener('click', async (e)=>{
@@ -733,6 +828,7 @@ orderTableBody.addEventListener('click', async (e)=>{
     await saveOrder(seat, o);
     await renderSeatOrder();
     await safeRenderAdminReports();
+    if (isAdmin()) await renderSeatCardInto(seat);
   }
 });
 useMenu.addEventListener('click', async ()=>{
@@ -798,6 +894,7 @@ async function initApp(){
   renderMenuPage();
   await renderSeatOrder();
   await safeRenderAdminReports(); // ✅ 只在 admin 才打報表 API
+  if (isAdmin()) await renderAllSeatsAdmin(); // ✅ admin 一進來就載入全部座號
 }
 
 // 自動登入驗證
