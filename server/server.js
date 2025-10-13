@@ -51,8 +51,6 @@ if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
-
-// 解析 URL，移除 url 上的 sslmode，改由程式統一設定
 let pgUrl;
 try {
   pgUrl = new URL(DATABASE_URL);
@@ -68,7 +66,7 @@ const pool = new Pool({
   connectionString: pgUrl.toString(),
   ssl: {
     require: true,
-    rejectUnauthorized: false, // 解決 SELF_SIGNED_CERT_IN_CHAIN
+    rejectUnauthorized: false,
   },
   keepAlive: true,
   max: 10,
@@ -108,137 +106,77 @@ async function t_q(client, sql, params = []) {
 }
 
 /* =========================
-   Schema 升級（安全補欄位 / 建表）
+   Schema 升級（不破壞既有資料）
    ========================= */
-async function ensureCoreSchema() {
-  // users
-  await q(`
-    create table if not exists users(
-      id serial primary key,
-      username text unique not null,
-      password_hash text not null,
-      role text not null default 'user',
-      status text not null default 'active',
-      created_at timestamptz default now(),
-      updated_at timestamptz default now(),
-      last_login_at timestamptz
-    )
-  `);
-
-  // menus
-  await q(`
-    create table if not exists menus(
-      id serial primary key,
-      name text not null
-    )
-  `);
-  await q(`
-    create table if not exists menu_items(
-      id serial primary key,
-      menu_id integer not null references menus(id) on delete cascade,
-      code integer not null,
-      name text not null,
-      price integer not null default 0
-    )
-  `);
-
-  // orders
-  await q(`
-    create table if not exists orders(
-      id serial primary key,
-      seat integer not null unique,
-      submitted boolean not null default false,
-      internal_only boolean not null default false,
-      paid boolean not null default false,
-      created_at timestamptz default now(),
-      updated_at timestamptz default now()
-    )
-  `);
-  await q(`
-    alter table if exists orders
-      add column if not exists paid boolean not null default false
-  `);
-  await q(`
-    create table if not exists order_items(
-      id serial primary key,
-      order_id integer not null references orders(id) on delete cascade,
-      name text not null,
-      unit_price integer not null default 0,
-      qty integer not null default 1
-    )
-  `);
-
-  // settings（含開放時段 + 預訂開關與日期）
-  await q(`
+async function ensureSettingsSchema() {
+  await pool.query(`
     create table if not exists settings(
       id integer primary key,
       active_menu_id integer,
       open_days integer[] default '{1,2,3,4,5}',
       open_start text default '07:00',
-      open_end   text default '12:00',
-      pre_enabled boolean default false,
-      pre_dates text[] default '{}'
+      open_end   text default '12:00'
     )
   `);
-  await q(`
+  await pool.query(`
     alter table if exists settings
       add column if not exists open_days integer[] default '{1,2,3,4,5}',
       add column if not exists open_start text default '07:00',
-      add column if not exists open_end   text default '12:00',
-      add column if not exists pre_enabled boolean default false,
-      add column if not exists pre_dates  text[] default '{}'
+      add column if not exists open_end   text default '12:00'
   `);
-  await q(`insert into settings(id) values(1) on conflict (id) do nothing`);
-  await q(`
+  await pool.query(`
+    insert into settings(id) values(1)
+    on conflict (id) do nothing
+  `);
+  await pool.query(`
     update settings
-      set open_days = coalesce(open_days, '{1,2,3,4,5}'),
-          open_start = coalesce(open_start, '07:00'),
-          open_end   = coalesce(open_end,   '12:00'),
-          pre_enabled = coalesce(pre_enabled, false),
-          pre_dates = coalesce(pre_dates, '{}')
+    set open_days = coalesce(open_days, '{1,2,3,4,5}'),
+        open_start = coalesce(open_start, '07:00'),
+        open_end   = coalesce(open_end,   '12:00')
     where id = 1
-  `);
-
-  // audit logs
-  await q(`
-    create table if not exists audit_logs(
-      id serial primary key,
-      user_id integer,
-      action text not null,
-      details jsonb,
-      ip text,
-      ua text,
-      ts timestamptz default now()
-    )
-  `);
-
-  // ⭐ 預訂便當
-  await q(`
-    create table if not exists preorders(
-      id serial primary key,
-      seat integer not null,
-      date text not null,
-      submitted boolean not null default false,
-      internal_only boolean not null default false,
-      paid boolean not null default false,
-      created_at timestamptz default now(),
-      updated_at timestamptz default now(),
-      unique(seat, date)
-    )
-  `);
-  await q(`
-    create table if not exists preorder_items(
-      id serial primary key,
-      preorder_id integer not null references preorders(id) on delete cascade,
-      name text not null,
-      unit_price integer not null default 0,
-      qty integer not null default 1
-    )
   `);
 }
 
-// 舊函式保留（向下相容）
-async function ensureSettingsSchema(){ return ensureCoreSchema(); }
+// 訂單表加上 paid / internal_only 欄位（若不存在）
+async function ensureOrdersExtraColumns() {
+  await pool.query(`alter table if exists orders add column if not exists internal_only boolean default false`);
+  await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
+}
+
+// 預訂用的設定與資料表
+async function ensurePreorderSchema(){
+  await pool.query(`
+    create table if not exists preorder_settings(
+      id integer primary key,
+      enabled boolean default false,
+      dates text[] default '{}'
+    )
+  `);
+  await pool.query(`insert into preorder_settings(id) values(1) on conflict(id) do nothing`);
+
+  await pool.query(`
+    create table if not exists preorders(
+      id serial primary key,
+      d date not null,
+      seat integer not null,
+      submitted boolean default false,
+      internal_only boolean default false,
+      paid boolean default false,
+      created_at timestamptz default now(),
+      updated_at timestamptz default now(),
+      unique(d, seat)
+    )
+  `);
+  await pool.query(`
+    create table if not exists preorder_items(
+      id serial primary key,
+      order_id integer not null references preorders(id) on delete cascade,
+      name text not null,
+      unit_price integer not null,
+      qty integer not null
+    )
+  `);
+}
 
 /* =========================
    bootstrap（seed）
@@ -315,18 +253,6 @@ async function ensureOrder(seat) {
   }
   return o;
 }
-async function ensurePreorder(dateStr, seat) {
-  let p = await one('select * from preorders where date=$1 and seat=$2', [dateStr, seat]);
-  if (!p) {
-    p = await one(
-      `insert into preorders(seat, date, submitted, internal_only, paid, created_at, updated_at)
-       values ($1,$2,false,false,false,now(),now())
-       returning *`,
-      [seat, dateStr]
-    );
-  }
-  return p;
-}
 function userCanAccessSeat(user, seat) {
   if (!user) return false;
   if (user.role === 'admin') return true;
@@ -370,14 +296,6 @@ async function isOpenNow() {
   return openDays.includes(day) && start <= hhmm && hhmm <= end;
 }
 
-async function preSettings() {
-  const s = await one('select pre_enabled, pre_dates from settings where id=1');
-  return {
-    enabled: !!(s && s.pre_enabled),
-    dates: (s && Array.isArray(s.pre_dates) ? s.pre_dates : [])
-  };
-}
-
 /* =========================
    Routes
    ========================= */
@@ -403,7 +321,7 @@ app.get('/api/auth/me', auth(), async (req, res) => {
   res.json({ user: req.user });
 });
 
-// Settings（admin）— 開放時段
+// Settings（admin）
 app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
@@ -420,35 +338,21 @@ app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ⭐ Settings — 預訂（admin 可修改；一般使用者可讀）
-app.get('/api/settings/preorder', auth(), async (req, res) => {
-  const s = await preSettings();
-  res.json({ enabled: s.enabled, dates: s.dates });
-});
-app.put('/api/settings/preorder', auth(), requireAdmin, async (req, res) => {
-  const { enabled = false, dates = [] } = req.body || {};
-  const ds = Array.isArray(dates) ? dates.map(String) : [];
-  await q('update settings set pre_enabled=$1, pre_dates=$2 where id=1', [!!enabled, ds]);
-  await logAction(req.user, 'settings.preorder', { enabled: !!enabled, dates: ds }, req);
-  res.json({ ok: true });
-});
-
-// 公開：是否在開放點餐時段（時區版）
+// 公開：是否在開放點餐時段
 app.get('/api/open-status', async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
-  const info = zonedNowInfo();                 // 依 BUSINESS_TZ（預設 Asia/Taipei）
+  const info = zonedNowInfo();
   const openDays = (s?.open_days || []).map(Number);
   const start = s?.open_start || '07:00';
   const end   = s?.open_end   || '12:00';
   const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
-
   res.json({
     open,
-    openDays: openDays.map(String), // ['1','2','3','4','5'] 代表一~五
+    openDays: openDays.map(String),
     openStart: start,
     openEnd: end,
     nowISO: info.nowISO,
-    nowLocal: info.nowLocal,       // 24h 本地字串
+    nowLocal: info.nowLocal,
     tz: info.tz
   });
 });
@@ -553,9 +457,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
     return res.status(403).json({ message: 'not in open window' });
   }
 
-  const { items = [], internalOnly = false, paid } = req.body || {};
-  const allowSetPaid = req.user.role === 'admin';
-
+  const { items = [], internalOnly = false } = req.body || {};
   await tx(async (c) => {
     const o = await t_one(c, 'select * from orders where seat=$1', [seat]) || await t_one(
       c,
@@ -572,10 +474,8 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
     }
     const submitted = finalItems.length > 0;
 
-    const newPaid = allowSetPaid ? !!paid : !!o.paid; // 非 admin 忽略 paid
-
-    await c.query('update orders set submitted=$1, internal_only=$2, paid=$3, updated_at=now() where id=$4', [
-      submitted, flag, newPaid, o.id,
+    await c.query('update orders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
+      submitted, flag, o.id,
     ]);
     await c.query('delete from order_items where order_id=$1', [o.id]);
     for (const it of finalItems) {
@@ -586,15 +486,16 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
     }
   });
 
-  await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items || []).length, paid: allowSetPaid ? !!paid : 'ignored' }, req);
+  await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items || []).length }, req);
   res.json({ ok: true });
 });
 
-// ⭐ 單獨更新付款狀態（僅 admin；不受時段限制）
+// ⭐ 訂單已付款（admin 專用）
 app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   const seat = Number(req.params.seat);
   const { paid } = req.body || {};
-  await q('update orders set paid=$1, updated_at=now() where seat=$2', [!!paid, seat]);
+  const o = await ensureOrder(seat);
+  await q('update orders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
   await logAction(req.user, 'order.paid', { seat, paid: !!paid }, req);
   res.json({ ok: true });
 });
@@ -618,121 +519,149 @@ app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
   for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
   res.json({ missing });
 });
-// ⭐ 未付款清單（今天/當期訂單，不分時段）
+// ⭐ 今日訂單未付款（其實就是目前未付款，因為 orders 沒有日期切分）
 app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
-  const orders = await q('select * from orders where submitted=true and paid=false order by seat asc');
+  const os = await q('select * from orders where paid=false and submitted=true order by seat asc');
   const list = [];
-  for (const o of orders) {
+  for (const o of os) {
     const items = await q('select name, unit_price, qty from order_items where order_id=$1 order by id asc', [o.id]);
-    const subtotal = items.reduce((s, it) => s + Number(it.unit_price) * Number(it.qty), 0);
+    const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
     list.push({
       seat: o.seat,
-      internalOnly: !!o.internal_only,
-      paid: !!o.paid,
       subtotal,
-      items: items.map(i => ({ name: i.name, unitPrice: i.unit_price, qty: i.qty }))
+      items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })),
     });
   }
   res.json({ list });
 });
 
 /* =========================
-   ⭐ 預訂便當（Preorders）
+   ⭐ 預訂設定 / 預訂資料  API
    ========================= */
-// 讀取某日某座
-app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  const d = String(req.params.date);
-  const seat = Number(req.params.seat);
-  if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
 
-  const s = await preSettings();
-  if (req.user.role !== 'admin') {
-    if (!s.enabled) return res.status(403).json({ message: 'preorder disabled' });
-    if (!s.dates.includes(d)) return res.status(400).json({ message: 'date not allowed' });
+// 讀取預訂設定（登入即可）
+app.get('/api/settings/preorder', auth(), async (req, res) => {
+  const s = await one('select enabled, dates from preorder_settings where id=1');
+  res.json({ enabled: !!s?.enabled, dates: s?.dates || [] });
+});
+// 儲存預訂設定（admin）
+app.put('/api/settings/preorder', auth(), requireAdmin, async (req, res) => {
+  const { enabled=false, dates=[] } = req.body || {};
+  await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [!!enabled, Array.isArray(dates)? dates : []]);
+  await logAction(req.user, 'settings.preorder', { enabled: !!enabled, dates }, req);
+  res.json({ ok: true });
+});
+
+function toDateOrNull(s){
+  if (!s) return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const d = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) ? null : `${m[1]}-${m[2]}-${m[3]}`;
+}
+async function ensurePreorder(date, seat){
+  const d = toDateOrNull(date);
+  if (!d) throw new Error('bad date');
+  let o = await one('select * from preorders where d=$1 and seat=$2', [d, seat]);
+  if (!o) {
+    o = await one(
+      `insert into preorders(d, seat, submitted, internal_only, paid, created_at, updated_at)
+       values ($1,$2,false,false,false,now(),now())
+       returning *`,
+      [d, seat]
+    );
   }
+  return o;
+}
+function canAccessPreSeat(user, seat){ return userCanAccessSeat(user, seat); }
 
-  const p = await ensurePreorder(d, seat);
-  const items = await q('select * from preorder_items where preorder_id=$1 order by id asc', [p.id]);
+async function checkPreUserAllowed(user, date) {
+  if (user.role === 'admin') return true;
+  const s = await one('select enabled, dates from preorder_settings where id=1');
+  if (!s || !s.enabled) return false;
+  const dOk = (s.dates || []).includes(date);
+  return !!dOk;
+}
+
+// 讀取預訂
+app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
+  const seat = Number(req.params.seat);
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
+
+  const o = await ensurePreorder(date, seat);
+  const items = await q('select * from preorder_items where order_id=$1 order by id asc', [o.id]);
   res.json({
-    date: d,
-    seat,
-    submitted: !!p.submitted,
-    internalOnly: !!p.internal_only,
-    paid: !!p.paid,
-    items: items.map(i => ({ id: i.id, name: i.name, unitPrice: i.unit_price, qty: i.qty })),
+    date, seat,
+    submitted: !!o.submitted,
+    internalOnly: !!o.internal_only,
+    paid: !!o.paid,
+    items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
   });
 });
 
-// 建立/更新（一般使用者允許，但不得改 paid）
+// 寫入預訂（非 admin 需在允許日期、且預訂啟用）
 app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  const d = String(req.params.date);
   const seat = Number(req.params.seat);
-  if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
-  const s = await preSettings();
   if (req.user.role !== 'admin') {
-    if (!s.enabled) return res.status(403).json({ message: 'preorder disabled' });
-    if (!s.dates.includes(d)) return res.status(400).json({ message: 'date not allowed' });
+    const allowed = await checkPreUserAllowed(req.user, date);
+    if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
   }
 
-  const { items = [], internalOnly = false, paid } = req.body || {};
-  const allowSetPaid = req.user.role === 'admin';
-
-  await tx(async (c) => {
-    const p = await t_one(c, 'select * from preorders where date=$1 and seat=$2', [d, seat]) || await t_one(
-      c,
-      `insert into preorders(seat, date, submitted, internal_only, paid, created_at, updated_at)
-       values ($1,$2,false,false,false,now(),now()) returning *`,
-      [seat, d]
-    );
+  const { items = [], internalOnly = false } = req.body || {};
+  await tx(async (c)=>{
+    const o = await ensurePreorder(date, seat);
     let finalItems = items;
     let flag = internalOnly ? true : false;
     if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
     const submitted = finalItems.length > 0;
 
-    const newPaid = allowSetPaid ? !!paid : !!p.paid;
-
-    await c.query('update preorders set submitted=$1, internal_only=$2, paid=$3, updated_at=now() where id=$4', [
-      submitted, flag, newPaid, p.id
+    await c.query('update preorders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
+      submitted, flag, o.id
     ]);
-    await c.query('delete from preorder_items where preorder_id=$1', [p.id]);
+    await c.query('delete from preorder_items where order_id=$1', [o.id]);
     for (const it of finalItems) {
       await c.query(
-        'insert into preorder_items(preorder_id, name, unit_price, qty) values ($1,$2,$3,$4)',
-        [p.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
+        'insert into preorder_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+        [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
       );
     }
   });
 
-  await logAction(req.user, 'preorder.update', { date:d, seat, internalOnly:!!internalOnly, itemsCount:(items||[]).length, paid: allowSetPaid ? !!paid : 'ignored' }, req);
+  await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: (items||[]).length }, req);
   res.json({ ok: true });
 });
 
-// 單獨更新付款（僅 admin）
-app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res) => {
-  const d = String(req.params.date);
+// 預訂「已付款」切換（admin）
+app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res)=>{
   const seat = Number(req.params.seat);
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  const o = await ensurePreorder(date, seat);
   const { paid } = req.body || {};
-  const p = await ensurePreorder(d, seat);
-  await q('update preorders set paid=$1, updated_at=now() where id=$2', [!!paid, p.id]);
-  await logAction(req.user, 'preorder.paid', { date:d, seat, paid: !!paid }, req);
-  res.json({ ok: true });
+  await q('update preorders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
+  await logAction(req.user, 'preorder.paid', { date, seat, paid: !!paid }, req);
+  res.json({ ok:true });
 });
 
-// 指定日期：未付款清單（僅 admin）
-app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res) => {
-  const d = String(req.params.date);
-  const rows = await q('select * from preorders where date=$1 and submitted=true and paid=false order by seat asc', [d]);
+// 指定日期的預訂「未付款」清單（admin）
+app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  const os = await q('select * from preorders where d=$1 and paid=false and submitted=true order by seat asc', [date]);
   const list = [];
-  for (const p of rows) {
-    const items = await q('select name, unit_price, qty from preorder_items where preorder_id=$1 order by id asc', [p.id]);
-    const subtotal = items.reduce((s, it) => s + Number(it.unit_price) * Number(it.qty), 0);
+  for (const o of os) {
+    const items = await q('select name, unit_price, qty from preorder_items where order_id=$1 order by id asc', [o.id]);
+    const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
     list.push({
-      seat: p.seat,
-      internalOnly: !!p.internal_only,
-      paid: !!p.paid,
+      seat: o.seat,
       subtotal,
-      items: items.map(i => ({ name: i.name, unitPrice: i.unit_price, qty: i.qty }))
+      items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })),
     });
   }
   res.json({ list });
@@ -878,9 +807,8 @@ app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
   res.json({ logs: rows });
 });
 
-// 健康檢查
 app.get('/', (req, res) => {
-  res.type('text').send('Lunch Orders API (Supabase/PostgreSQL) is running.\nTry GET /api/menus');
+  res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
 });
 
 /* =========================
@@ -889,9 +817,11 @@ app.get('/', (req, res) => {
 (async function start() {
   try {
     await one('select now()');          // test DB
-    await ensureCoreSchema();           // ✅ 安全補 schema（含 orders.paid / preorders* / settings.pre_* / audit_logs）
-    await seed();                       // seed 初始帳號與 1~36
-    console.log('[tz check]', zonedNowInfo()); // 啟動印出台灣時間
+    await ensureSettingsSchema();
+    await ensureOrdersExtraColumns();
+    await ensurePreorderSchema();
+    await seed();
+    console.log('[tz check]', zonedNowInfo());
     app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
     console.error('Startup error:', e);
