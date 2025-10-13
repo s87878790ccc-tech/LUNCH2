@@ -14,6 +14,47 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 const DATABASE_URL = process.env.DATABASE_URL;
+// ✅ 只需要一個宣告（保留你原本在檔案上方那個 ALLOW_ORIGINS）
+// const ALLOW_ORIGINS = ['https://s87878790ccc-tech.github.io'];  // ←這行若已存在就不要再宣告
+
+app.set('trust proxy', 1); // Render/代理下，避免 rate-limit 對 X-Forwarded-For 的警告
+
+// (1) 先對所有回應加上 CORS header（就算 401/403/500 也會帶）
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Vary', 'Origin');
+  }
+  next();
+});
+
+// (2) 把所有 OPTIONS 預檢先處理掉
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOW_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+  return res.sendStatus(204);
+});
+
+// (3) 再用 cors 套件處理一般請求（⚠️把你舊的 cors 區塊刪掉，避免重複）
+app.use(require('cors')({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);               // server-side / curl
+    if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+}));
 
 /* =========================
    Logging
