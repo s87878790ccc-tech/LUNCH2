@@ -240,16 +240,20 @@ function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
   const admin = isAdmin();
-  tabLogs?.classList.toggle('hidden', !admin);
-  tabUsers?.classList.toggle('hidden', false);
-  tabMenus?.classList.toggle('hidden', !admin);
-  tabReports?.classList.toggle('hidden', !admin);
-  tabAllSeats?.classList.toggle('hidden', !admin);
+
+  // 顯示/隱藏各頁籤
+  tabLogs.classList.toggle('hidden', !admin);
+  tabUsers.classList.toggle('hidden', false);
+  tabMenus.classList.toggle('hidden', !admin);
+  tabReports.classList.toggle('hidden', !admin);
 
   document.querySelectorAll('.only-admin')
     .forEach(el => el.classList.toggle('hidden', !admin));
   document.querySelectorAll('.only-user')
     .forEach(el => el.classList.toggle('hidden', admin));
+
+  // ✅ 先解鎖座號下拉，確保 admin 一定可以切換
+  if (seatSelect) seatSelect.disabled = false;
 
   // Admin 顯示「全部座號一覽」
   adminAllSeats?.classList.toggle('hidden', !admin);
@@ -258,12 +262,13 @@ function onLoginUser(user){
   // 一般使用者：座號 = 帳號；鎖定座號下拉
   if (!admin) {
     const n = Number(user.username);
-    if (Number.isInteger(n) && n>=1 && n<=36) {
+    if (Number.isInteger(n) && n >= MIN_SEAT && n <= MAX_SEAT) {
       seatSelect.value = String(n);
-      seatSelect.disabled = true;
+      seatSelect.disabled = true;   // 只有一般使用者才鎖
     }
   }
 }
+
 
 /* =========================
    開放時段（公開用）
