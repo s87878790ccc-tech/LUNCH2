@@ -38,7 +38,7 @@ const pageLogs    = document.getElementById('pageLogs');
 const pageUsers   = document.getElementById('pageUsers');
 
 const seatSelect = document.getElementById('seatSelect');
-// 這個按鈕在新版 UI 已移除，但程式仍容許存在就加上事件（若不存在不會報錯）
+// 保留相容：舊版 UI 若有這個按鈕不會報錯
 const toggleSubmitted = document.getElementById('toggleSubmitted');
 
 const clearSeat = document.getElementById('clearSeat');
@@ -198,22 +198,31 @@ const state = {
   owLoaded: false,        // 後台時段設定是否載入過
   bySeatData: null,       // 後台座號明細暫存
 };
+
+function isAdmin(){ return state.me?.role === 'admin'; }
+async function safeRenderAdminReports(){
+  if (isAdmin()) {
+    await renderAgg();
+    await renderMissing();
+  }
+}
+
 function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
-  const isAdmin = user.role === 'admin';
-  tabLogs.classList.toggle('hidden', !isAdmin);
+  const admin = isAdmin();
+  tabLogs.classList.toggle('hidden', !admin);
   tabUsers.classList.toggle('hidden', false);
-  tabMenus.classList.toggle('hidden', !isAdmin);
-  tabReports.classList.toggle('hidden', !isAdmin);
+  tabMenus.classList.toggle('hidden', !admin);
+  tabReports.classList.toggle('hidden', !admin);
 
   document.querySelectorAll('.only-admin')
-    .forEach(el => el.classList.toggle('hidden', !isAdmin));
+    .forEach(el => el.classList.toggle('hidden', !admin));
   document.querySelectorAll('.only-user')
-    .forEach(el => el.classList.toggle('hidden', isAdmin));
+    .forEach(el => el.classList.toggle('hidden', admin));
 
   // 一般使用者：座號 = 帳號；鎖定座號下拉
-  if (user.role === 'user') {
+  if (!admin) {
     const n = Number(user.username);
     if (Number.isInteger(n) && n>=1 && n<=36) {
       seatSelect.value = String(n);
@@ -225,7 +234,7 @@ function onLoginUser(user){
 // ====== 開放時段（公開給前端顯示）======
 async function fetchOpenStatus(){
   try{
-    const data = await api('/open-status', { method:'GET' }); // server 提供的公開狀態
+    const data = await api('/open-status', { method:'GET' });
     isOpenWindow = !!data.open;
     renderOpenBanner(data);
   }catch{
@@ -234,8 +243,8 @@ async function fetchOpenStatus(){
   }
 }
 function renderOpenBanner(data){
-  const isAdmin = state.me?.role === 'admin';
-  const show = !isAdmin && !isOpenWindow;
+  const admin = isAdmin();
+  const show = !admin && !isOpenWindow;
   if (!closedBanner) return;
   closedBanner.classList.toggle('hidden', !show);
   if (show && data){
@@ -246,8 +255,8 @@ function renderOpenBanner(data){
   }
 }
 function guardOpenWindow(){
-  const isAdmin = state.me?.role === 'admin';
-  if (!isAdmin && !isOpenWindow) {
+  const admin = isAdmin();
+  if (!admin && !isOpenWindow) {
     alert('目前不在點餐時段，暫不開放修改訂單。');
     return false;
   }
@@ -259,7 +268,6 @@ async function loadOpenWindowSettings(){
   if (!owStart || !owEnd || !owDayInputs.length) return;
   try{
     const s = await api('/settings/open-window', { method:'GET' });
-    // days 可能是字串或數字；全部轉為字串比對
     const days = (s.openDays || []).map(String);
     owDayInputs.forEach(cb => cb.checked = days.includes(String(cb.value)));
     owStart.value = s.openStart || '07:00';
@@ -281,7 +289,6 @@ async function saveOpenWindowSettings(){
       body: JSON.stringify({ openDays: days, openStart: owStart.value, openEnd: owEnd.value })
     });
     owMsg.textContent = '已儲存';
-    // 更新公開狀態橫幅
     await fetchOpenStatus();
   }catch(e){
     owMsg.textContent = '儲存失敗：' + e.message;
@@ -295,7 +302,6 @@ function calcSubtotal(items){
   return (items||[]).reduce((s,it)=> s + Number(it.unitPrice||0) * Number(it.qty||0), 0);
 }
 function seatStatusText(order){
-  // 後端已改為：有品項 => 自動 submitted
   return (order.items && order.items.length>0) ? '完成' : '未完成';
 }
 async function loadBySeatReport(){
@@ -311,7 +317,6 @@ async function loadBySeatReport(){
       subtotal: calcSubtotal(o.items||[]),
       items: o.items||[]
     }));
-    // 渲染
     bySeatTBody.innerHTML = state.bySeatData.map(r=>{
       const detail = r.items.length
         ? r.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
@@ -346,10 +351,8 @@ function switchTab(which){
     page.classList.toggle('hidden', k!==which);
   }
   if (which==='reports') {
-    renderAgg();
-    renderMissing();
-    // 首次進入後台頁，載入時段設定（admin）
-    if (state.me?.role === 'admin' && !state.owLoaded) loadOpenWindowSettings();
+    safeRenderAdminReports(); // 只在 admin 時觸發報表
+    if (isAdmin() && !state.owLoaded) loadOpenWindowSettings();
   }
   if (which==='logs') { renderLogs(); }
   if (which==='users') { loadUsers(); }
@@ -546,9 +549,8 @@ async function resetPasswordSelf(userId, oldPassword, newPassword){
 }
 
 async function loadUsers(){
-  const isAdmin = state.me?.role === 'admin';
-  // 一般使用者：只顯示「變更我的密碼」
-  if (!isAdmin) {
+  const admin = isAdmin();
+  if (!admin) {
     usersTableBody.innerHTML = `
       <tr>
         <td colspan="4">
@@ -574,10 +576,9 @@ async function loadUsers(){
     return;
   }
 
-  // Admin：列表 + 重設
   usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
   try{
-    const data = await listUsersAdv(); // 簡單載入第一頁
+    const data = await listUsersAdv();
     usersTableBody.innerHTML = data.users.map(u=>`
       <tr>
         <td>${u.id}</td>
@@ -632,7 +633,7 @@ if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
     o.submitted = !o.submitted;
     await saveOrder(seat, o);
     await renderSeatOrder();
-    await renderMissing();
+    await safeRenderAdminReports();
   });
 }
 
@@ -643,8 +644,7 @@ clearSeat.addEventListener('click', async ()=>{
   await saveOrder(seat, { submitted:false, items:[] });
   state.ordersCache.delete(seat);
   await renderSeatOrder();
-  await renderAgg();
-  await renderMissing();
+  await safeRenderAdminReports();
 });
 
 // 內訂勾選
@@ -661,8 +661,7 @@ internalOnlyEl?.addEventListener('change', async ()=>{
   try{
     await saveOrder(seat, o);
     await renderSeatOrder();
-    await renderAgg();
-    await renderMissing();
+    await safeRenderAdminReports();
   }catch(e){
     alert('儲存失敗：'+e.message);
   }
@@ -683,7 +682,8 @@ addByCode.addEventListener('click', async ()=>{
   o.items.push({ name: it.name, unitPrice: it.price, qty });
   await saveOrder(seat, o);
   codeInput.value=''; qtyInput.value='1';
-  await renderSeatOrder(); await renderAgg();
+  await renderSeatOrder();
+  await safeRenderAdminReports();
 });
 addManual.addEventListener('click', async ()=>{
   if (!guardOpenWindow()) return;
@@ -699,7 +699,8 @@ addManual.addEventListener('click', async ()=>{
   o.items.push({ name, unitPrice:price, qty });
   await saveOrder(seat, o);
   manualName.value=''; manualPrice.value=''; manualQty.value='1';
-  await renderSeatOrder(); await renderAgg();
+  await renderSeatOrder();
+  await safeRenderAdminReports();
 });
 orderTableBody.addEventListener('input', async (e)=>{
   if (!guardOpenWindow()) return;
@@ -711,7 +712,8 @@ orderTableBody.addEventListener('input', async (e)=>{
     if (o.internalOnly) { alert('內訂狀態不可編輯數量'); return; }
     o.items[idx].qty = Math.max(1, Number(t.value||1));
     await saveOrder(seat, o);
-    await renderSeatOrder(); await renderAgg();
+    await renderSeatOrder();
+    await safeRenderAdminReports();
   }
 });
 orderTableBody.addEventListener('click', async (e)=>{
@@ -724,7 +726,8 @@ orderTableBody.addEventListener('click', async (e)=>{
     if (o.internalOnly) { alert('內訂狀態不可刪除品項'); return; }
     o.items.splice(idx,1);
     await saveOrder(seat, o);
-    await renderSeatOrder(); await renderAgg();
+    await renderSeatOrder();
+    await safeRenderAdminReports();
   }
 });
 useMenu.addEventListener('click', async ()=>{
@@ -789,8 +792,7 @@ async function initApp(){
   renderActiveMenu();
   renderMenuPage();
   await renderSeatOrder();
-  await renderAgg();
-  await renderMissing();
+  await safeRenderAdminReports(); // ✅ 只在 admin 才打報表 API
 }
 
 // 自動登入驗證
@@ -801,7 +803,7 @@ async function initApp(){
     const me = await api('/auth/me');
     onLoginUser(me.user);
     applyMobileUI();
-    await fetchOpenStatus();      // 開啟時段查詢
+    await fetchOpenStatus();
     await initApp();
     switchTab('orders');
     showApp();
