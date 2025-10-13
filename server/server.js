@@ -26,7 +26,10 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
    ========================= */
 app.use(helmet());
 
-// 允許 GitHub Pages 前端呼叫
+// Render / 反向代理：避免 express-rate-limit 警告
+app.set('trust proxy', 1);
+
+// 允許你的前端網域
 const ALLOW_ORIGINS = [
   'https://s87878790ccc-tech.github.io',
 ];
@@ -64,24 +67,15 @@ try {
 
 const pool = new Pool({
   connectionString: pgUrl.toString(),
-  ssl: {
-    require: true,
-    rejectUnauthorized: false,
-  },
+  ssl: { require: true, rejectUnauthorized: false },
   keepAlive: true,
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
 });
 
-async function q(sql, params = []) {
-  const { rows } = await pool.query(sql, params);
-  return rows;
-}
-async function one(sql, params = []) {
-  const { rows } = await pool.query(sql, params);
-  return rows[0] || null;
-}
+async function q(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
+async function one(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
 async function tx(fn) {
   const client = await pool.connect();
   try {
@@ -90,20 +84,11 @@ async function tx(fn) {
     await client.query('COMMIT');
     return result;
   } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
 }
-async function t_one(client, sql, params = []) {
-  const { rows } = await client.query(sql, params);
-  return rows[0] || null;
-}
-async function t_q(client, sql, params = []) {
-  const { rows } = await client.query(sql, params);
-  return rows;
-}
+async function t_one(client, sql, params = []) { const { rows } = await client.query(sql, params); return rows[0] || null; }
+async function t_q(client, sql, params = []) { const { rows } = await client.query(sql, params); return rows; }
 
 /* =========================
    Schema 升級（不破壞既有資料）
@@ -116,57 +101,77 @@ async function ensureSettingsSchema() {
       open_days integer[] default '{1,2,3,4,5}',
       open_start text default '07:00',
       open_end   text default '12:00'
-    )
-  `);
+    )`);
   await pool.query(`
     alter table if exists settings
       add column if not exists open_days integer[] default '{1,2,3,4,5}',
       add column if not exists open_start text default '07:00',
-      add column if not exists open_end   text default '12:00'
-  `);
-  await pool.query(`
-    insert into settings(id) values(1)
-    on conflict (id) do nothing
-  `);
+      add column if not exists open_end   text default '12:00'`);
+  await pool.query(`insert into settings(id) values(1) on conflict (id) do nothing`);
   await pool.query(`
     update settings
     set open_days = coalesce(open_days, '{1,2,3,4,5}'),
         open_start = coalesce(open_start, '07:00'),
         open_end   = coalesce(open_end,   '12:00')
-    where id = 1
-  `);
+    where id = 1`);
 }
 
-// 訂單表加上 paid / internal_only 欄位（若不存在）
+// Orders 表補欄位（paid / internal_only）
 async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists internal_only boolean default false`);
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
 }
 
-// 預訂用的設定與資料表
+// 預訂設定與表（含舊欄位自動更名/補欄位）
 async function ensurePreorderSchema(){
   await pool.query(`
     create table if not exists preorder_settings(
       id integer primary key,
       enabled boolean default false,
       dates text[] default '{}'
-    )
-  `);
+    )`);
   await pool.query(`insert into preorder_settings(id) values(1) on conflict(id) do nothing`);
 
   await pool.query(`
     create table if not exists preorders(
       id serial primary key,
-      d date not null,
       seat integer not null,
       submitted boolean default false,
       internal_only boolean default false,
       paid boolean default false,
       created_at timestamptz default now(),
-      updated_at timestamptz default now(),
-      unique(d, seat)
-    )
-  `);
+      updated_at timestamptz default now()
+    )`);
+
+  // 兼容：把舊的 "date" 欄位改名為 d；若沒有就補 d
+  await pool.query(`
+    do $$
+    begin
+      if not exists (
+        select 1 from information_schema.columns
+        where table_name='preorders' and column_name='d'
+      ) then
+        if exists (
+          select 1 from information_schema.columns
+          where table_name='preorders' and column_name='date'
+        ) then
+          execute 'alter table preorders rename column "date" to d';
+        else
+          execute 'alter table preorders add column d date';
+        end if;
+      end if;
+    end
+    $$;`);
+
+  // 確保必要欄位存在
+  await pool.query(`alter table preorders alter column d set not null`);
+  await pool.query(`alter table preorders add column if not exists submitted boolean default false`);
+  await pool.query(`alter table preorders add column if not exists internal_only boolean default false`);
+  await pool.query(`alter table preorders add column if not exists paid boolean default false`);
+
+  // 唯一鍵（d, seat）
+  await pool.query(`create unique index if not exists preorders_d_seat_key on preorders(d, seat)`);
+
   await pool.query(`
     create table if not exists preorder_items(
       id serial primary key,
@@ -174,8 +179,7 @@ async function ensurePreorderSchema(){
       name text not null,
       unit_price integer not null,
       qty integer not null
-    )
-  `);
+    )`);
 }
 
 /* =========================
@@ -271,9 +275,7 @@ function zonedNowInfo(tz = BUSINESS_TZ) {
     timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit'
   }).format(now).split(':');
 
-  const wdStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz, weekday: 'short'
-  }).format(now); // Sun/Mon/Tue/Wed/Thu/Fri/Sat
+  const wdStr = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short' }).format(now);
   const wdMap = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
   const day = wdMap[wdStr] ?? 0;
 
@@ -325,14 +327,14 @@ app.get('/api/auth/me', auth(), async (req, res) => {
 app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
-    openDays: s?.open_days || ['1', '2', '3', '4', '5'],
+    openDays: s?.open_days || ['1','2','3','4','5'],
     openStart: s?.open_start || '07:00',
     openEnd: s?.open_end || '12:00',
   });
 });
 app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const { openDays, openStart, openEnd } = req.body || {};
-  const days = Array.isArray(openDays) ? openDays : ['1', '2', '3', '4', '5'];
+  const days = Array.isArray(openDays) ? openDays : ['1','2','3','4','5'];
   await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
   res.json({ ok: true });
@@ -346,15 +348,7 @@ app.get('/api/open-status', async (req, res) => {
   const start = s?.open_start || '07:00';
   const end   = s?.open_end   || '12:00';
   const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
-  res.json({
-    open,
-    openDays: openDays.map(String),
-    openStart: start,
-    openEnd: end,
-    nowISO: info.nowISO,
-    nowLocal: info.nowLocal,
-    tz: info.tz
-  });
+  res.json({ open, openDays: openDays.map(String), openStart: start, openEnd: end, nowISO: info.nowISO, nowLocal: info.nowLocal, tz: info.tz });
 });
 
 // Menus
@@ -468,10 +462,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
 
     let finalItems = items;
     let flag = internalOnly ? true : false;
-
-    if (internalOnly) {
-      finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
-    }
+    if (internalOnly) finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
     const submitted = finalItems.length > 0;
 
     await c.query('update orders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
@@ -490,7 +481,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
   res.json({ ok: true });
 });
 
-// ⭐ 訂單已付款（admin 專用）
+// 訂單「已付款」切換（admin）
 app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   const seat = Number(req.params.seat);
   const { paid } = req.body || {};
@@ -519,27 +510,22 @@ app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
   for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
   res.json({ missing });
 });
-// ⭐ 今日訂單未付款（其實就是目前未付款，因為 orders 沒有日期切分）
+// 未付款清單（目前 orders 不分日期）
 app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
   const os = await q('select * from orders where paid=false and submitted=true order by seat asc');
   const list = [];
   for (const o of os) {
     const items = await q('select name, unit_price, qty from order_items where order_id=$1 order by id asc', [o.id]);
     const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
-    list.push({
-      seat: o.seat,
-      subtotal,
-      items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })),
-    });
+    list.push({ seat: o.seat, subtotal, items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })) });
   }
   res.json({ list });
 });
 
 /* =========================
-   ⭐ 預訂設定 / 預訂資料  API
+   預訂設定 / 預訂資料  API
    ========================= */
-
-// 讀取預訂設定（登入即可）
+// 讀取預訂設定
 app.get('/api/settings/preorder', auth(), async (req, res) => {
   const s = await one('select enabled, dates from preorder_settings where id=1');
   res.json({ enabled: !!s?.enabled, dates: s?.dates || [] });
@@ -556,8 +542,8 @@ function toDateOrNull(s){
   if (!s) return null;
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
   if (!m) return null;
-  const d = new Date(`${m[1]}-${m[2]}-${m[3]}T00:00:00Z`);
-  return Number.isNaN(d.getTime()) ? null : `${m[1]}-${m[2]}-${m[3]}`;
+  // 存 DB 用原字串（避免時區偏移）
+  return `${m[1]}-${m[2]}-${m[3]}`;
 }
 async function ensurePreorder(date, seat){
   const d = toDateOrNull(date);
@@ -574,97 +560,107 @@ async function ensurePreorder(date, seat){
   return o;
 }
 function canAccessPreSeat(user, seat){ return userCanAccessSeat(user, seat); }
-
 async function checkPreUserAllowed(user, date) {
   if (user.role === 'admin') return true;
   const s = await one('select enabled, dates from preorder_settings where id=1');
   if (!s || !s.enabled) return false;
-  const dOk = (s.dates || []).includes(date);
-  return !!dOk;
+  return (s.dates || []).includes(date);
 }
 
 // 讀取預訂
 app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  const seat = Number(req.params.seat);
-  const date = toDateOrNull(req.params.date);
-  if (!date) return res.status(400).json({ message:'bad date' });
-  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
+  try{
+    const seat = Number(req.params.seat);
+    const date = toDateOrNull(req.params.date);
+    if (!date) return res.status(400).json({ message:'bad date' });
+    if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
-  const o = await ensurePreorder(date, seat);
-  const items = await q('select * from preorder_items where order_id=$1 order by id asc', [o.id]);
-  res.json({
-    date, seat,
-    submitted: !!o.submitted,
-    internalOnly: !!o.internal_only,
-    paid: !!o.paid,
-    items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
-  });
+    const o = await ensurePreorder(date, seat);
+    const items = await q('select * from preorder_items where order_id=$1 order by id asc', [o.id]);
+    res.json({
+      date, seat,
+      submitted: !!o.submitted,
+      internalOnly: !!o.internal_only,
+      paid: !!o.paid,
+      items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
+    });
+  }catch(e){
+    res.status(500).json({ message:String(e.message||e) });
+  }
 });
 
-// 寫入預訂（非 admin 需在允許日期、且預訂啟用）
+// 寫入預訂
 app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  const seat = Number(req.params.seat);
-  const date = toDateOrNull(req.params.date);
-  if (!date) return res.status(400).json({ message:'bad date' });
-  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
+  try{
+    const seat = Number(req.params.seat);
+    const date = toDateOrNull(req.params.date);
+    if (!date) return res.status(400).json({ message:'bad date' });
+    if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
-  if (req.user.role !== 'admin') {
-    const allowed = await checkPreUserAllowed(req.user, date);
-    if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
-  }
-
-  const { items = [], internalOnly = false } = req.body || {};
-  await tx(async (c)=>{
-    const o = await ensurePreorder(date, seat);
-    let finalItems = items;
-    let flag = internalOnly ? true : false;
-    if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
-    const submitted = finalItems.length > 0;
-
-    await c.query('update preorders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
-      submitted, flag, o.id
-    ]);
-    await c.query('delete from preorder_items where order_id=$1', [o.id]);
-    for (const it of finalItems) {
-      await c.query(
-        'insert into preorder_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
-        [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
-      );
+    if (req.user.role !== 'admin') {
+      const allowed = await checkPreUserAllowed(req.user, date);
+      if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
     }
-  });
 
-  await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: (items||[]).length }, req);
-  res.json({ ok: true });
+    const { items = [], internalOnly = false } = req.body || {};
+    await tx(async (c)=>{
+      const o = await ensurePreorder(date, seat);
+      let finalItems = items;
+      let flag = internalOnly ? true : false;
+      if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
+      const submitted = finalItems.length > 0;
+
+      await c.query('update preorders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
+        submitted, flag, o.id
+      ]);
+      await c.query('delete from preorder_items where order_id=$1', [o.id]);
+      for (const it of finalItems) {
+        await c.query(
+          'insert into preorder_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+          [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
+        );
+      }
+    });
+
+    await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: (items||[]).length }, req);
+    res.json({ ok: true });
+  }catch(e){
+    res.status(500).json({ message:String(e.message||e) });
+  }
 });
 
 // 預訂「已付款」切換（admin）
 app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res)=>{
-  const seat = Number(req.params.seat);
-  const date = toDateOrNull(req.params.date);
-  if (!date) return res.status(400).json({ message:'bad date' });
-  const o = await ensurePreorder(date, seat);
-  const { paid } = req.body || {};
-  await q('update preorders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
-  await logAction(req.user, 'preorder.paid', { date, seat, paid: !!paid }, req);
-  res.json({ ok:true });
+  try{
+    const seat = Number(req.params.seat);
+    const date = toDateOrNull(req.params.date);
+    if (!date) return res.status(400).json({ message:'bad date' });
+    const o = await ensurePreorder(date, seat);
+    const { paid } = req.body || {};
+    await q('update preorders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
+    await logAction(req.user, 'preorder.paid', { date, seat, paid: !!paid }, req);
+    res.json({ ok:true });
+  }catch(e){
+    res.status(500).json({ message:String(e.message||e) });
+  }
 });
 
 // 指定日期的預訂「未付款」清單（admin）
 app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
-  const date = toDateOrNull(req.params.date);
-  if (!date) return res.status(400).json({ message:'bad date' });
-  const os = await q('select * from preorders where d=$1 and paid=false and submitted=true order by seat asc', [date]);
-  const list = [];
-  for (const o of os) {
-    const items = await q('select name, unit_price, qty from preorder_items where order_id=$1 order by id asc', [o.id]);
-    const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
-    list.push({
-      seat: o.seat,
-      subtotal,
-      items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })),
-    });
+  try{
+    const date = toDateOrNull(req.params.date);
+    if (!date) return res.status(400).json({ message:'bad date' });
+    const os = await q('select * from preorders where d=$1 and paid=false and submitted=true order by seat asc', [date]);
+    const list = [];
+    for (const o of os) {
+      const items = await q('select name, unit_price, qty from preorder_items where order_id=$1 order by id asc', [o.id]);
+      const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
+      list.push({ seat: o.seat, subtotal, items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })) });
+    }
+    res.json({ list });
+  }catch(e){
+    res.status(500).json({ message:String(e.message||e) });
   }
-  res.json({ list });
 });
 
 /* =========================
