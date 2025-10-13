@@ -30,6 +30,7 @@ const tabMenus   = document.getElementById('tabMenus');
 const tabReports = document.getElementById('tabReports');
 const tabLogs    = document.getElementById('tabLogs');
 const tabUsers   = document.getElementById('tabUsers');
+const tabAllSeats = document.getElementById('tabAllSeats'); // ✅ 新增
 
 const pageOrders  = document.getElementById('pageOrders');
 const pageMenus   = document.getElementById('pageMenus');
@@ -220,6 +221,7 @@ function onLoginUser(user){
   tabUsers.classList.toggle('hidden', false);
   tabMenus.classList.toggle('hidden', !admin);
   tabReports.classList.toggle('hidden', !admin);
+  tabAllSeats?.classList.toggle('hidden', !admin); // ✅ 新增：只有 admin 看得到
 
   document.querySelectorAll('.only-admin')
     .forEach(el => el.classList.toggle('hidden', !admin));
@@ -454,6 +456,14 @@ tabMenus.onclick  = ()=>switchTab('menus');
 tabReports.onclick= ()=>switchTab('reports');
 tabLogs.onclick   = ()=>switchTab('logs');
 tabUsers.onclick  = ()=>switchTab('users');
+
+// ✅ 新增：一鍵捲到全部座號
+tabAllSeats?.addEventListener('click', () => {
+  switchTab('orders');
+  setTimeout(() => {
+    document.getElementById('adminAllSeats')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 50);
+});
 
 // ====== 菜單 & 訂單 API ======
 async function loadMenus(){
@@ -793,7 +803,6 @@ addManual.addEventListener('click', async ()=>{
   const qty  = Number(manualQty.value||1);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
-  if (qty<=0) return alert('數量需 >= 1');
   o.items.push({ name, unitPrice:price, qty });
   await saveOrder(seat, o);
   manualName.value=''; manualPrice.value=''; manualQty.value='1';
@@ -893,8 +902,8 @@ async function initApp(){
   renderActiveMenu();
   renderMenuPage();
   await renderSeatOrder();
-  await safeRenderAdminReports(); // ✅ 只在 admin 才打報表 API
-  if (isAdmin()) await renderAllSeatsAdmin(); // ✅ admin 一進來就載入全部座號
+  await safeRenderAdminReports(); // 只在 admin 才打報表 API
+  if (isAdmin()) await renderAllSeatsAdmin(); // admin 一進來就載入全部座號
 }
 
 // 自動登入驗證

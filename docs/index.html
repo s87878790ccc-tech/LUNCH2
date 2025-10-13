@@ -6,6 +6,12 @@
   <title>班級午餐訂單系統（前端）</title>
   <link rel="stylesheet" href="styles.css" />
   <style>
+    /* 讓整頁可以捲動到最底，避免 100vh / overflow 限制 */
+    html, body { height: auto; min-height: 100%; overflow-y: auto; }
+    #app { min-height: 100vh; height: auto; overflow: visible; }
+    section { height: auto !important; overflow: visible !important; }
+    .card { overflow: visible; }
+
     /* Admin 全部座號一覽 */
     #allSeatsGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px}
     .seat-card{border:1px solid #3a2d19;background:#1b140d;border-radius:10px;padding:10px}
@@ -42,6 +48,8 @@
         <button id="tabReports" class="tab">後台</button>
         <button id="tabLogs" class="tab hidden">Logs</button>
         <button id="tabUsers" class="tab hidden">使用者</button>
+        <!-- ✅ 新增：僅 admin 顯示，一鍵捲到「全部座號」 -->
+        <button id="tabAllSeats" class="tab hidden">全座號</button>
         <span id="whoami" class="pill"></span>
         <button id="logoutBtn">登出</button>
       </div>
@@ -177,7 +185,6 @@
         </div>
       </div>
 
-      <!-- （可選）你原本的「座號合計與明細」按鈕/表格放這裡 -->
       <div class="card mt8">
         <div class="row" style="justify-content:space-between;align-items:center">
           <h3>座號合計與明細</h3>
