@@ -26,14 +26,13 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
    ========================= */
 app.use(helmet());
 
-// CORS 改成白名單：允許 GitHub Pages 前端呼叫
+// 允許 GitHub Pages 前端呼叫
 const ALLOW_ORIGINS = [
-  'https://s87878790ccc-tech.github.io', // 你的 GitHub Pages 網域
+  'https://s87878790ccc-tech.github.io',
 ];
 app.use(cors({
   origin(origin, cb) {
-    // 同源 / 無 Origin（server-side / curl）放行
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true);                 // server-side / curl
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'), false);
   },
@@ -46,14 +45,14 @@ app.use(morgan('dev'));
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
 /* =========================
-   DB (pg) 連線
+   DB (pg)
    ========================= */
 if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
 
-// 解析 URL，移除任何 sslmode，由程式碼強制設定 SSL 行為
+// 解析 URL，移除 url 上的 sslmode，改由程式統一設定
 let pgUrl;
 try {
   pgUrl = new URL(DATABASE_URL);
@@ -69,15 +68,13 @@ const pool = new Pool({
   connectionString: pgUrl.toString(),
   ssl: {
     require: true,
-    rejectUnauthorized: false, // 關鍵：避免 SELF_SIGNED_CERT_IN_CHAIN
+    rejectUnauthorized: false, // 解決 SELF_SIGNED_CERT_IN_CHAIN
   },
   keepAlive: true,
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
 });
-
-const nowISO = () => new Date().toISOString();
 
 async function q(sql, params = []) {
   const { rows } = await pool.query(sql, params);
@@ -111,7 +108,7 @@ async function t_q(client, sql, params = []) {
 }
 
 /* =========================
-   方案 A：安全升級 settings 欄位
+   Settings schema 升級
    ========================= */
 async function ensureSettingsSchema() {
   await pool.query(`
@@ -173,6 +170,9 @@ async function seed() {
   console.log('[seed] seat users 1~36 ready (default pass = 123456)');
 }
 
+/* =========================
+   Auth helpers
+   ========================= */
 function sign(user) {
   return jwt.sign({ uid: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 }
@@ -220,6 +220,33 @@ function userCanAccessSeat(user, seat) {
   const n = Number(user.username);
   return Number.isInteger(n) && n === seat;
 }
+
+/* =========================
+   時區設定（24h）
+   ========================= */
+const BUSINESS_TZ = process.env.BUSINESS_TZ || 'Asia/Taipei';
+
+function zonedNowInfo(tz = BUSINESS_TZ) {
+  const now = new Date();
+  const [hh, mm] = new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit'
+  }).format(now).split(':');
+
+  const wdStr = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, weekday: 'short'
+  }).format(now); // Sun/Mon/Tue/Wed/Thu/Fri/Sat
+  const wdMap = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  const day = wdMap[wdStr] ?? 0;
+
+  const nowLocal = new Intl.DateTimeFormat('zh-TW', {
+    timeZone: tz, hour12: false,
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit'
+  }).format(now);
+
+  return { hhmm: `${hh}:${mm}`, day, nowISO: now.toISOString(), nowLocal, tz };
+}
+
 async function isOpenNow() {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   if (!s) return true; // 沒設定就放行
@@ -255,29 +282,7 @@ app.get('/api/auth/me', auth(), async (req, res) => {
   res.json({ user: req.user });
 });
 
-// === Public: 是否在開放點餐時段 ===
-app.get('/api/open-status', async (req, res) => {
-  const s = await one('select open_days, open_start, open_end from settings where id=1');
-  // 內部判斷
-  const openDays = (s?.open_days || [1,2,3,4,5]).map(Number);
-  const now = new Date();
-  const day = now.getDay(); // 0..6 (週日=0)
-  const hhmm = (d) => String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
-  const cur = hhmm(now);
-  const start = s?.open_start || '07:00';
-  const end   = s?.open_end   || '12:00';
-  const open = openDays.includes(day) && (start <= cur && cur <= end);
-
-  res.json({
-    open,
-    openDays,
-    openStart: start,
-    openEnd: end,
-    now: now.toISOString(),
-  });
-});
-
-// Settings (admin)
+// Settings（admin）
 app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
@@ -292,6 +297,26 @@ app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
   res.json({ ok: true });
+});
+
+// 公開：是否在開放點餐時段（僅保留「時區版」）
+app.get('/api/open-status', async (req, res) => {
+  const s = await one('select open_days, open_start, open_end from settings where id=1');
+  const info = zonedNowInfo();                 // 依 BUSINESS_TZ（預設 Asia/Taipei）
+  const openDays = (s?.open_days || []).map(Number);
+  const start = s?.open_start || '07:00';
+  const end   = s?.open_end   || '12:00';
+  const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
+
+  res.json({
+    open,
+    openDays: openDays.map(String), // ['1','2','3','4','5'] 代表一~五
+    openStart: start,
+    openEnd: end,
+    nowISO: info.nowISO,
+    nowLocal: info.nowLocal,       // 24h 本地字串
+    tz: info.tz
+  });
 });
 
 // Menus
@@ -369,49 +394,6 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
   await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
   await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
-});
-
-// ---- 時區設定（預設 Asia/Taipei，可用 env 覆蓋：BUSINESS_TZ）----
-const BUSINESS_TZ = process.env.BUSINESS_TZ || 'Asia/Taipei';
-
-function zonedNowInfo(tz = BUSINESS_TZ) {
-  const now = new Date();
-  const [hh, mm] = new Intl.DateTimeFormat('en-GB', {
-    timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit'
-  }).format(now).split(':');
-
-  const wdStr = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz, weekday: 'short'
-  }).format(now); // Sun/Mon/Tue...
-  const wdMap = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
-  const day = wdMap[wdStr] ?? 0;
-
-  const nowLocal = new Intl.DateTimeFormat('zh-TW', {
-    timeZone: tz, hour12: false,
-    year:'numeric', month:'2-digit', day:'2-digit',
-    hour:'2-digit', minute:'2-digit', second:'2-digit'
-  }).format(now);
-
-  return { hhmm: `${hh}:${mm}`, day, nowISO: now.toISOString(), nowLocal, tz };
-}
-
-app.get('/api/open-status', auth(false), async (req, res) => {
-  const s = await one('select open_days, open_start, open_end from settings where id=1');
-  const info = zonedNowInfo();
-  const openDays = (s?.open_days || []).map(Number);
-  const start = s?.open_start || '07:00';
-  const end   = s?.open_end   || '12:00';
-  const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
-
-  res.json({
-    open,
-    openDays: openDays.map(String), // ['1','2','3','4','5'] 代表一~五
-    openStart: start,
-    openEnd: end,
-    nowISO: info.nowISO,
-    nowLocal: info.nowLocal, // 直接給本地 24h 字串
-    tz: info.tz
-  });
 });
 
 // Orders
@@ -639,6 +621,7 @@ app.get('/', (req, res) => {
     await one('select now()');          // test DB
     await ensureSettingsSchema();       // 先補 settings 欄位
     await seed();                       // 再 seed
+    console.log('[tz check]', zonedNowInfo()); // 啟動印出台灣時間，方便檢查
     app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
     console.error('Startup error:', e);
