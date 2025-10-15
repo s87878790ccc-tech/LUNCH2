@@ -14,47 +14,14 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 const DATABASE_URL = process.env.DATABASE_URL;
-// ✅ 只需要一個宣告（保留你原本在檔案上方那個 ALLOW_ORIGINS）
-// const ALLOW_ORIGINS = ['https://s87878790ccc-tech.github.io'];  // ←這行若已存在就不要再宣告
 
-app.set('trust proxy', 1); // Render/代理下，避免 rate-limit 對 X-Forwarded-For 的警告
+// 允許的前端網域（GitHub Pages）
+const ALLOW_ORIGINS = [
+  'https://s87878790ccc-tech.github.io',
+];
 
-// (1) 先對所有回應加上 CORS header（就算 401/403/500 也會帶）
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOW_ORIGINS.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Vary', 'Origin');
-  }
-  next();
-});
-
-// (2) 把所有 OPTIONS 預檢先處理掉
-app.options('*', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && ALLOW_ORIGINS.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  }
-  return res.sendStatus(204);
-});
-
-// (3) 再用 cors 套件處理一般請求（⚠️把你舊的 cors 區塊刪掉，避免重複）
-app.use(require('cors')({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);               // server-side / curl
-    if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization'],
-  preflightContinue: false,
-  optionsSuccessStatus: 204,
-}));
+// 反向代理（Render/Cloudflare 等）下要設定，否則 rate-limit 對 XFF 會警告
+app.set('trust proxy', 1);
 
 /* =========================
    Logging
@@ -66,26 +33,28 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
    Security / Middleware
    ========================= */
 app.use(helmet());
+app.use(express.json({ limit: '1mb' }));
 
-// Render / 反向代理：避免 express-rate-limit 警告
-app.set('trust proxy', 1);
-
-// 允許你的前端網域
-const ALLOW_ORIGINS = [
-  'https://s87878790ccc-tech.github.io',
-];
-app.use(cors({
+// CORS（單一乾淨版本，含預檢）
+const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true);                 // server-side / curl
+    if (!origin) return cb(null, true); // server-side/curl
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'), false);
+    return cb(new Error('Not allowed by CORS'));
   },
   credentials: true,
-}));
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  optionsSuccessStatus: 204,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
-app.use(express.json({ limit: '1mb' }));
+// logging
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
+
+// rate limit
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
 /* =========================
@@ -98,14 +67,11 @@ if (!DATABASE_URL) {
 let pgUrl;
 try {
   pgUrl = new URL(DATABASE_URL);
-  if (pgUrl.searchParams.has('sslmode')) {
-    pgUrl.searchParams.delete('sslmode');
-  }
+  if (pgUrl.searchParams.has('sslmode')) pgUrl.searchParams.delete('sslmode');
 } catch (e) {
   console.error('Bad DATABASE_URL:', e);
   process.exit(1);
 }
-
 const pool = new Pool({
   connectionString: pgUrl.toString(),
   ssl: { require: true, rejectUnauthorized: false },
@@ -128,12 +94,26 @@ async function tx(fn) {
     await client.query('ROLLBACK'); throw e;
   } finally { client.release(); }
 }
-async function t_one(client, sql, params = []) { const { rows } = await client.query(sql, params); return rows[0] || null; }
-async function t_q(client, sql, params = []) { const { rows } = await client.query(sql, params); return rows; }
+async function t_one(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows[0] || null; }
+async function t_q(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows; }
 
 /* =========================
    Schema 升級（不破壞既有資料）
    ========================= */
+async function ensureAuditLogsSchema() {
+  await pool.query(`
+    create table if not exists audit_logs(
+      id serial primary key,
+      user_id integer,
+      action text,
+      details jsonb,
+      ip text,
+      ua text,
+      ts timestamptz default now()
+    )
+  `);
+}
+
 async function ensureSettingsSchema() {
   await pool.query(`
     create table if not exists settings(
@@ -142,59 +122,62 @@ async function ensureSettingsSchema() {
       open_days integer[] default '{1,2,3,4,5}',
       open_start text default '07:00',
       open_end   text default '12:00'
-    )`);
+    )
+  `);
   await pool.query(`
     alter table if exists settings
       add column if not exists open_days integer[] default '{1,2,3,4,5}',
       add column if not exists open_start text default '07:00',
-      add column if not exists open_end   text default '12:00'`);
+      add column if not exists open_end   text default '12:00'
+  `);
   await pool.query(`insert into settings(id) values(1) on conflict (id) do nothing`);
   await pool.query(`
     update settings
     set open_days = coalesce(open_days, '{1,2,3,4,5}'),
         open_start = coalesce(open_start, '07:00'),
         open_end   = coalesce(open_end,   '12:00')
-    where id = 1`);
+    where id = 1
+  `);
 }
 
-// Orders 表補欄位（paid / internal_only）
 async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists internal_only boolean default false`);
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
 }
 
-// 預訂設定與表（含舊欄位自動更名/補欄位）
-async function ensurePreorderSchema(){
+async function ensurePreorderSchema() {
+  // 設定
   await pool.query(`
     create table if not exists preorder_settings(
       id integer primary key,
       enabled boolean default false,
       dates text[] default '{}'
-    )`);
+    )
+  `);
   await pool.query(`insert into preorder_settings(id) values(1) on conflict(id) do nothing`);
 
+  // 主表
   await pool.query(`
     create table if not exists preorders(
       id serial primary key,
+      d date,
       seat integer not null,
       submitted boolean default false,
       internal_only boolean default false,
       paid boolean default false,
       created_at timestamptz default now(),
       updated_at timestamptz default now()
-    )`);
-
-  // 兼容：把舊的 "date" 欄位改名為 d；若沒有就補 d
+    )
+  `);
+  // date → d
   await pool.query(`
     do $$
     begin
       if not exists (
-        select 1 from information_schema.columns
-        where table_name='preorders' and column_name='d'
+        select 1 from information_schema.columns where table_name='preorders' and column_name='d'
       ) then
         if exists (
-          select 1 from information_schema.columns
-          where table_name='preorders' and column_name='date'
+          select 1 from information_schema.columns where table_name='preorders' and column_name='date'
         ) then
           execute 'alter table preorders rename column "date" to d';
         else
@@ -202,25 +185,44 @@ async function ensurePreorderSchema(){
         end if;
       end if;
     end
-    $$;`);
-
-  // 確保必要欄位存在
+    $$;
+  `);
   await pool.query(`alter table preorders alter column d set not null`);
   await pool.query(`alter table preorders add column if not exists submitted boolean default false`);
   await pool.query(`alter table preorders add column if not exists internal_only boolean default false`);
   await pool.query(`alter table preorders add column if not exists paid boolean default false`);
-
-  // 唯一鍵（d, seat）
   await pool.query(`create unique index if not exists preorders_d_seat_key on preorders(d, seat)`);
 
+  // 明細表（統一使用 preorder_id）
   await pool.query(`
     create table if not exists preorder_items(
       id serial primary key,
-      order_id integer not null references preorders(id) on delete cascade,
+      preorder_id integer references preorders(id) on delete cascade,
       name text not null,
       unit_price integer not null,
       qty integer not null
-    )`);
+    )
+  `);
+  // 兼容：若曾有 order_id，把它改名為 preorder_id；若兩者都不存在就補上 preorder_id
+  await pool.query(`
+    do $$
+    begin
+      if exists (
+        select 1 from information_schema.columns where table_name='preorder_items' and column_name='order_id'
+      ) and not exists (
+        select 1 from information_schema.columns where table_name='preorder_items' and column_name='preorder_id'
+      ) then
+        execute 'alter table preorder_items rename column order_id to preorder_id';
+      end if;
+
+      if not exists (
+        select 1 from information_schema.columns where table_name='preorder_items' and column_name='preorder_id'
+      ) then
+        execute 'alter table preorder_items add column preorder_id integer';
+      end if;
+    end
+    $$;
+  `);
 }
 
 /* =========================
@@ -263,10 +265,10 @@ function sign(user) {
 function auth(required = true) {
   return (req, res, next) => {
     const h = req.headers.authorization || '';
-    const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-    if (!token) return required ? res.status(401).json({ message: 'no token' }) : next();
+    const t = h.startsWith('Bearer ') ? h.slice(7) : null;
+    if (!t) return required ? res.status(401).json({ message: 'no token' }) : next();
     try {
-      req.user = jwt.verify(token, JWT_SECRET);
+      req.user = jwt.verify(t, JWT_SECRET);
       next();
     } catch {
       return res.status(401).json({ message: 'invalid token' });
@@ -473,7 +475,6 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
 app.get('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
-
   const o = await ensureOrder(seat);
   const items = await q('select * from order_items where order_id=$1 order by id asc', [o.id]);
   res.json({
@@ -491,7 +492,6 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
   if (req.user.role !== 'admin' && !(await isOpenNow())) {
     return res.status(403).json({ message: 'not in open window' });
   }
-
   const { items = [], internalOnly = false } = req.body || {};
   await tx(async (c) => {
     const o = await t_one(c, 'select * from orders where seat=$1', [seat]) || await t_one(
@@ -500,9 +500,8 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
        values ($1,false,false,false,now(),now()) returning *`,
       [seat]
     );
-
     let finalItems = items;
-    let flag = internalOnly ? true : false;
+    let flag = !!internalOnly;
     if (internalOnly) finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
     const submitted = finalItems.length > 0;
 
@@ -517,11 +516,9 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
       );
     }
   });
-
   await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items || []).length }, req);
   res.json({ ok: true });
 });
-
 // 訂單「已付款」切換（admin）
 app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   const seat = Number(req.params.seat);
@@ -564,14 +561,12 @@ app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
 });
 
 /* =========================
-   預訂設定 / 預訂資料  API
+   預訂設定 / 預訂資料 API
    ========================= */
-// 讀取預訂設定
 app.get('/api/settings/preorder', auth(), async (req, res) => {
   const s = await one('select enabled, dates from preorder_settings where id=1');
   res.json({ enabled: !!s?.enabled, dates: s?.dates || [] });
 });
-// 儲存預訂設定（admin）
 app.put('/api/settings/preorder', auth(), requireAdmin, async (req, res) => {
   const { enabled=false, dates=[] } = req.body || {};
   await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [!!enabled, Array.isArray(dates)? dates : []]);
@@ -583,8 +578,7 @@ function toDateOrNull(s){
   if (!s) return null;
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
   if (!m) return null;
-  // 存 DB 用原字串（避免時區偏移）
-  return `${m[1]}-${m[2]}-${m[3]}`;
+  return `${m[1]}-${m[2]}-${m[3]}`; // 存 DB 用原字串，避免時區偏移
 }
 async function ensurePreorder(date, seat){
   const d = toDateOrNull(date);
@@ -608,7 +602,6 @@ async function checkPreUserAllowed(user, date) {
   return (s.dates || []).includes(date);
 }
 
-// 讀取預訂
 app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
   try{
     const seat = Number(req.params.seat);
@@ -617,7 +610,7 @@ app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
     if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
     const o = await ensurePreorder(date, seat);
-    const items = await q('select * from preorder_items where order_id=$1 order by id asc', [o.id]);
+    const items = await q('select * from preorder_items where preorder_id=$1 order by id asc', [o.id]);
     res.json({
       date, seat,
       submitted: !!o.submitted,
@@ -629,8 +622,6 @@ app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
     res.status(500).json({ message:String(e.message||e) });
   }
 });
-
-// 寫入預訂
 app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
   try{
     const seat = Number(req.params.seat);
@@ -647,17 +638,17 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
     await tx(async (c)=>{
       const o = await ensurePreorder(date, seat);
       let finalItems = items;
-      let flag = internalOnly ? true : false;
+      let flag = !!internalOnly;
       if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
       const submitted = finalItems.length > 0;
 
       await c.query('update preorders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
         submitted, flag, o.id
       ]);
-      await c.query('delete from preorder_items where order_id=$1', [o.id]);
+      await c.query('delete from preorder_items where preorder_id=$1', [o.id]);
       for (const it of finalItems) {
         await c.query(
-          'insert into preorder_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+          'insert into preorder_items(preorder_id, name, unit_price, qty) values ($1,$2,$3,$4)',
           [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
         );
       }
@@ -669,8 +660,6 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
     res.status(500).json({ message:String(e.message||e) });
   }
 });
-
-// 預訂「已付款」切換（admin）
 app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res)=>{
   try{
     const seat = Number(req.params.seat);
@@ -685,8 +674,6 @@ app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res
     res.status(500).json({ message:String(e.message||e) });
   }
 });
-
-// 指定日期的預訂「未付款」清單（admin）
 app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
   try{
     const date = toDateOrNull(req.params.date);
@@ -694,7 +681,7 @@ app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
     const os = await q('select * from preorders where d=$1 and paid=false and submitted=true order by seat asc', [date]);
     const list = [];
     for (const o of os) {
-      const items = await q('select name, unit_price, qty from preorder_items where order_id=$1 order by id asc', [o.id]);
+      const items = await q('select name, unit_price, qty from preorder_items where preorder_id=$1 order by id asc', [o.id]);
       const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
       list.push({ seat: o.seat, subtotal, items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })) });
     }
@@ -844,6 +831,7 @@ app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
   res.json({ logs: rows });
 });
 
+// Root
 app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
 });
@@ -854,6 +842,7 @@ app.get('/', (req, res) => {
 (async function start() {
   try {
     await one('select now()');          // test DB
+    await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
     await ensurePreorderSchema();
