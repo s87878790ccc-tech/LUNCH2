@@ -736,10 +736,14 @@ async function resetPasswordSelf(userId, oldPassword, newPassword){
 }
 async function loadUsers(){
   const admin = isAdmin();
+
+  // 讀表頭實際欄位數，讓 colspan 跟著對
+  const headCols = document.querySelector('#pageUsers thead tr')?.children.length || 4;
+
   if (!admin) {
     usersTableBody.innerHTML = `
       <tr>
-        <td colspan="4">
+        <td colspan="${headCols}">
           <div class="card only-user">
             <h4>變更我的密碼</h4>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -756,32 +760,48 @@ async function loadUsers(){
       const oldP = document.getElementById('selfOldPwd').value;
       const newP = document.getElementById('selfNewPwd').value;
       if (!newP || newP.length<6) return alert('新密碼至少 6 碼');
-      try{ await resetPasswordSelf(state.me.id, oldP, newP); alert('已更新'); }
-      catch(e){ alert('失敗：'+e.message); }
+      try{
+        await resetPasswordSelf(state.me.id, oldP, newP);
+        alert('已更新');
+      }catch(e){
+        alert('失敗：'+e.message);
+      }
     };
     return;
   }
 
-  usersTableBody.innerHTML = '<tr><td colspan="4">載入中…</td></tr>';
+  usersTableBody.innerHTML = `<tr><td colspan="${headCols}">載入中…</td></tr>`;
   try{
+    // 一次抓完全部頁次
     const users = await fetchAllUsers();
+
+    // 顯示總筆數
     const title = document.querySelector('#pageUsers h3');
     if (title) title.innerHTML = `使用者列表 <span class="small muted">（共 ${users.length} 筆）</span>`;
-    usersTableBody.innerHTML = users.map(u=>`
-      <tr>
-        <td>${u.id}</td>
-        <td>${u.username}</td>
-        <td>${u.role}</td>
-        <td>
-          <input type="password" placeholder="新密碼(>=6)" id="reset_${u.id}" />
-          <button class="resetPwd" data-id="${u.id}">重設</button>
-        </td>
-      </tr>
-    `).join('');
+
+    // 仍維持 4 欄：ID / 帳號 / 角色 / 動作(重設+刪除)
+    usersTableBody.innerHTML = users.map(u=>{
+      const disableSelf = (u.id === state.me.id);
+      return `
+        <tr>
+          <td>${u.id}</td>
+          <td>${u.username}</td>
+          <td>${u.role}</td>
+          <td>
+            <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
+              <input type="password" placeholder="新密碼(>=6)" id="reset_${u.id}" />
+              <button class="resetPwd" data-id="${u.id}">重設</button>
+              <button class="danger delUser" data-id="${u.id}" ${disableSelf ? 'disabled title="不可刪除自己"' : ''}>刪除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
   }catch(e){
-    usersTableBody.innerHTML = `<tr><td colspan="4">失敗：${e.message}</td></tr>`;
+    usersTableBody.innerHTML = `<tr><td colspan="${headCols}">失敗：${e.message}</td></tr>`;
   }
 }
+
 createUserBtn?.addEventListener('click', async ()=>{
   const username = newUserName.value.trim();
   const password = newUserPass.value;
@@ -795,18 +815,38 @@ createUserBtn?.addEventListener('click', async ()=>{
   }catch(e){ alert('建立失敗：'+e.message); }
 });
 usersTableBody.addEventListener('click', async (e)=>{
-  const t=e.target;
+  const t = e.target;
+
+  // 重設密碼（admin）
   if (t.classList.contains('resetPwd')) {
     const id = Number(t.dataset.id);
     const input = document.getElementById(`reset_${id}`);
-    const pwd = input.value;
-    if (!pwd || pwd.length<6) return alert('新密碼至少 6 碼');
+    const pwd = input?.value || '';
+    if (!pwd || pwd.length < 6) return alert('新密碼至少 6 碼');
     try{
       await resetPasswordAdmin(id, pwd);
-      input.value=''; alert('已重設');
-    }catch(err){ alert('重設失敗：'+err.message); }
+      input.value = '';
+      alert('已重設');
+    }catch(err){
+      alert('重設失敗：' + err.message);
+    }
+  }
+
+  // 刪除使用者（admin）
+  if (t.classList.contains('delUser')) {
+    const id = Number(t.dataset.id);
+    if (!confirm(`確定要刪除使用者 ID=${id}？`)) return;
+    try{
+      await api(`/users/${id}`, { method: 'DELETE' });
+      await loadUsers(); // 重新載入列表
+      alert('已刪除');
+    }catch(err){
+      // 後端會保護：不可刪自己、至少保留一名管理員
+      alert('刪除失敗：' + err.message);
+    }
   }
 });
+
 
 /* =========================
    事件（一般訂單）
