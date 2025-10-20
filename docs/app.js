@@ -46,6 +46,7 @@ const seatSelect = document.getElementById('seatSelect');
 const toggleSubmitted = document.getElementById('toggleSubmitted');
 
 const clearSeat = document.getElementById('clearSeat');
+const purgeOrdersBtn = document.getElementById('purgeOrdersBtn');
 const codeInput = document.getElementById('codeInput');
 const qtyInput  = document.getElementById('qtyInput');
 const addByCode = document.getElementById('addByCode');
@@ -1126,6 +1127,28 @@ clearSeat.addEventListener('click', async ()=>{
   await renderSeatOrder();
   await safeRenderAdminReports();
   if (isAdmin()) await renderSeatCardInto(seat);
+});
+
+purgeOrdersBtn?.addEventListener('click', async ()=>{
+  if (!isAdmin()) return alert('僅限管理員可操作');
+  if (!confirm('確定要刪除今日全部訂單？此動作無法復原。')) return;
+  if (!confirm('再次確認：真的要刪除今日全部訂單嗎？')) return;
+  const originalLabel = purgeOrdersBtn.textContent;
+  purgeOrdersBtn.disabled = true;
+  purgeOrdersBtn.textContent = '刪除中…';
+  try {
+    await api('/orders/today', { method: 'DELETE' });
+    state.ordersCache.clear();
+    await renderSeatOrder();
+    await safeRenderAdminReports();
+    if (isAdmin()) await renderAllSeatsAdmin();
+    alert('已刪除今日全部訂單');
+  } catch (err) {
+    alert('刪除失敗：' + err.message);
+  } finally {
+    purgeOrdersBtn.disabled = false;
+    purgeOrdersBtn.textContent = originalLabel;
+  }
 });
 
 // 內訂勾選（單座）

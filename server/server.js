@@ -611,6 +611,18 @@ app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   await logAction(req.user, 'order.paid', { seat, paid: !!paid }, req);
   res.json({ ok: true });
 });
+app.delete('/api/orders/today', auth(), requireAdmin, async (req, res) => {
+  let deletedItems = 0;
+  let resetOrders = 0;
+  await tx(async (c) => {
+    const del = await c.query('delete from order_items');
+    deletedItems = del?.rowCount || 0;
+    const upd = await c.query('update orders set submitted=false, internal_only=false, paid=false, updated_at=now()');
+    resetOrders = upd?.rowCount || 0;
+  });
+  await logAction(req.user, 'orders.purgeToday', { deletedItems, resetOrders }, req);
+  res.json({ ok: true, deletedItems, resetOrders });
+});
 
 // Reports（僅 admin）
 app.get('/api/reports/aggregate', auth(), requireAdmin, async (req, res) => {
