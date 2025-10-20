@@ -1,6 +1,7 @@
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
@@ -9,6 +10,9 @@ const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
+
+const fsp = fs.promises;
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -29,11 +33,62 @@ app.set('trust proxy', 1);
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 
+const UPLOADS_PUBLIC_PATH = '/uploads';
+const UPLOAD_ROOT = path.join(__dirname, 'uploads');
+const MENU_IMAGE_DIR = path.join(UPLOAD_ROOT, 'menu-items');
+if (!fs.existsSync(MENU_IMAGE_DIR)) fs.mkdirSync(MENU_IMAGE_DIR, { recursive: true });
+
+const menuImageStorage = multer.diskStorage({
+  destination(_req, _file, cb) {
+    cb(null, MENU_IMAGE_DIR);
+  },
+  filename(_req, file, cb) {
+    const ext = (path.extname(file.originalname || '') || '').toLowerCase();
+    const safeExt = ext.length <= 10 ? ext : '';
+    const random = crypto.randomBytes(8).toString('hex');
+    cb(null, `${Date.now()}-${random}${safeExt}`);
+  },
+});
+
+const menuImageUpload = multer({
+  storage: menuImageStorage,
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+      return cb(new Error('只允許上傳圖片檔案'));
+    }
+    cb(null, true);
+  },
+});
+
+function resolveUploadPath(publicUrl) {
+  if (typeof publicUrl !== 'string') return null;
+  if (!publicUrl.startsWith(`${UPLOADS_PUBLIC_PATH}/`)) return null;
+  const rel = publicUrl.slice(UPLOADS_PUBLIC_PATH.length + 1);
+  const full = path.normalize(path.join(UPLOAD_ROOT, rel));
+  if (!full.startsWith(UPLOAD_ROOT)) return null;
+  return full;
+}
+
+async function removeMenuImage(publicUrl) {
+  const diskPath = resolveUploadPath(publicUrl);
+  if (!diskPath) return;
+  try {
+    await fsp.unlink(diskPath);
+  } catch (err) {
+    if (err?.code !== 'ENOENT') {
+      console.warn('Failed to remove image:', err.message || err);
+    }
+  }
+}
+
+
 /* =========================
    Security / Middleware
    ========================= */
 app.use(helmet());
 app.use(express.json({ limit: '1mb' }));
+app.use(UPLOADS_PUBLIC_PATH, express.static(UPLOAD_ROOT, { maxAge: '7d', index: false }));
 
 // CORS（單一乾淨版本，含預檢）
 const corsOptions = {
@@ -97,6 +152,15 @@ async function tx(fn) {
 async function t_one(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows[0] || null; }
 async function t_q(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows; }
 
+async function removeMenuImageIfUnused(publicUrl) {
+  if (!publicUrl) return;
+  const row = await one('select count(*)::int as cnt from menu_items where image_url=$1', [publicUrl]);
+  let count = Number(row?.cnt ?? row?.count ?? 0);
+  if (!Number.isFinite(count)) count = 0;
+  if (count > 0) return;
+  await removeMenuImage(publicUrl);
+}
+
 /* =========================
    Schema 升級（不破壞既有資料）
    ========================= */
@@ -143,6 +207,11 @@ async function ensureSettingsSchema() {
 async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists internal_only boolean default false`);
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
+}
+
+async function ensureMenuExtraColumns() {
+  await pool.query(`alter table if exists menus add column if not exists note text`);
+  await pool.query(`alter table if exists menu_items add column if not exists image_url text`);
 }
 
 async function ensurePreorderSchema() {
@@ -394,64 +463,131 @@ app.get('/api/open-status', async (req, res) => {
   res.json({ open, openDays: openDays.map(String), openStart: start, openEnd: end, nowISO: info.nowISO, nowLocal: info.nowLocal, tz: info.tz });
 });
 
+// Uploads
+const handleMenuImageUpload = menuImageUpload.single('image');
+app.post(
+  '/api/uploads/menu-item-image',
+  auth(),
+  requireAdmin,
+  (req, res, next) => {
+    handleMenuImageUpload(req, res, (err) => {
+      if (err) {
+        let message = err.message || '上傳失敗';
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+          message = '圖片檔案大小需在 2MB 以內';
+        }
+        return res.status(400).json({ message });
+      }
+      if (!req.file) {
+        return res.status(400).json({ message: '未收到圖片檔案' });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    const publicUrl = `${UPLOADS_PUBLIC_PATH}/menu-items/${req.file.filename}`;
+    await logAction(
+      req.user,
+      'upload.menuItemImage',
+      { filename: req.file.filename, size: req.file.size, mimetype: req.file.mimetype },
+      req,
+    );
+    res.json({ url: publicUrl });
+  },
+);
+
 // Menus
 app.get('/api/menus', auth(false), async (req, res) => {
   const menus = await q('select * from menus order by id asc');
   const items = await q('select * from menu_items order by menu_id asc, code asc');
   const setting = await one('select active_menu_id from settings where id=1');
   const grouped = menus.map(m => ({
-    id: m.id, name: m.name,
-    items: items.filter(x => x.menu_id === m.id).map(x => ({ id: x.id, code: x.code, name: x.name, price: x.price }))
+    id: m.id,
+    name: m.name,
+    note: m.note || '',
+    items: items
+      .filter(x => x.menu_id === m.id)
+      .map(x => ({
+        id: x.id,
+        code: x.code,
+        name: x.name,
+        price: x.price,
+        imageUrl: x.image_url || '',
+      }))
   }));
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
 app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
-  const { name } = req.body || {};
+  const { name, note } = req.body || {};
   if (!name) return res.status(400).json({ message: 'name required' });
-  const row = await one('insert into menus(name) values ($1) returning id', [name]);
-  await logAction(req.user, 'menu.create', { id: row.id, name }, req);
-  res.json({ id: row.id, name, items: [] });
+  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note ?? null]);
+  await logAction(req.user, 'menu.create', { id: row.id, name, note }, req);
+  res.json({ id: row.id, name: row.name, note: row.note || '', items: [] });
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const { name } = req.body || {};
-  await q('update menus set name=$1 where id=$2', [name, id]);
-  await logAction(req.user, 'menu.update', { id, name }, req);
+  const { name, note } = req.body || {};
+  await q('update menus set name=$1, note=$2 where id=$3', [name, note ?? null, id]);
+  await logAction(req.user, 'menu.update', { id, name, note }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  await tx(async (c) => {
+  const removedImages = await tx(async (c) => {
+    const imgs = await t_q(c, 'select image_url from menu_items where menu_id=$1', [id]);
     await c.query('delete from menu_items where menu_id=$1', [id]);
     await c.query('delete from menus where id=$1', [id]);
     const s = await t_one(c, 'select active_menu_id from settings where id=1');
     if (s?.active_menu_id === id) await c.query('update settings set active_menu_id=null where id=1');
-  });
+    return imgs.map(i => i.image_url).filter(Boolean);
+  }) || [];
+  const uniqueImages = [...new Set(removedImages)];
+  for (const img of uniqueImages) {
+    await removeMenuImageIfUnused(img);
+  }
   await logAction(req.user, 'menu.delete', { id }, req);
   res.json({ ok: true });
 });
 app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
-  const { name, price } = req.body || {};
+  const { name, price, imageUrl } = req.body || {};
   if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
+  const trimmedImage = typeof imageUrl === 'string' ? imageUrl.trim() : '';
   const row = await one(
-    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
-    [menuId, Number(max.c) + 1, name, Number(price)]
+    'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
+    [menuId, Number(max.c) + 1, name, Number(price), trimmedImage ? trimmedImage : null]
   );
-  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
-  res.json(row);
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
+  res.json({
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    price: row.price,
+    imageUrl: row.image_url || '',
+  });
 });
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const { name, price } = req.body || {};
-  await q('update menu_items set name=$1, price=$2 where id=$3', [name, Number(price), itemId]);
-  await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
+  const { name, price, imageUrl } = req.body || {};
+  if (!itemId) return res.status(400).json({ message: 'bad item id' });
+  if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
+  const existing = await one('select menu_id, image_url from menu_items where id=$1', [itemId]);
+  if (!existing) return res.status(404).json({ message: 'not found' });
+  const nextPrice = Number(price);
+  if (!Number.isFinite(nextPrice)) return res.status(400).json({ message: 'invalid price' });
+  const trimmedImage = typeof imageUrl === 'string' ? imageUrl.trim() : '';
+  const newImage = trimmedImage ? trimmedImage : null;
+  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, nextPrice, newImage, itemId]);
+  if (existing.image_url && existing.image_url !== newImage) {
+    await removeMenuImageIfUnused(existing.image_url);
+  }
+  await logAction(req.user, 'menu.item.update', { itemId, name, price: nextPrice, imageUrl: newImage }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const row = await one('select menu_id from menu_items where id=$1', [itemId]);
+  const row = await one('select menu_id, image_url from menu_items where id=$1', [itemId]);
   if (row) {
     await tx(async (c) => {
       await c.query('delete from menu_items where id=$1', [itemId]);
@@ -460,6 +596,9 @@ app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => 
         await c.query('update menu_items set code=$1 where id=$2', [i + 1, items[i].id]);
       }
     });
+    if (row.image_url) {
+      await removeMenuImageIfUnused(row.image_url);
+    }
   }
   await logAction(req.user, 'menu.item.delete', { itemId }, req);
   res.json({ ok: true });
@@ -845,6 +984,7 @@ app.get('/', (req, res) => {
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
+    await ensureMenuExtraColumns();
     await ensurePreorderSchema();
     await seed();
     console.log('[tz check]', zonedNowInfo());

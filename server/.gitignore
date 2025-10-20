@@ -7,3 +7,4 @@ package-lock.json
 # local env & db
 .env
 lunch.db
+uploads/
