@@ -74,6 +74,9 @@ const menuNote = document.getElementById('menuNote');
 const itemName = document.getElementById('itemName');
 const itemPrice = document.getElementById('itemPrice');
 const itemImage = document.getElementById('itemImage');
+const itemImageClear = document.getElementById('itemImageClear');
+const itemImagePreview = document.getElementById('itemImagePreview');
+const itemImageStatus = document.getElementById('itemImageStatus');
 const addItem = document.getElementById('addItem');
 const menuTableBody = document.querySelector('#menuTable tbody');
 
@@ -143,6 +146,98 @@ function escapeHtml(str=''){
 
 function noteToHtml(note=''){
   return escapeHtml(note).replace(/\r?\n/g,'<br>');
+}
+
+function buildImageThumb(url='', alt=''){
+  const safeUrl = escapeHtml(url || '');
+  const safeAlt = escapeHtml(alt || '');
+  if (!url) return '<div class="menu-thumb placeholder">無圖片</div>';
+  return `<button type="button" class="menu-thumb-btn" data-url="${safeUrl}" data-alt="${safeAlt}" title="點擊放大">` +
+    `<img src="${safeUrl}" alt="${safeAlt}" class="menu-thumb" loading="lazy"/></button>`;
+}
+
+function refreshNewItemImageUI(){
+  const nameHint = itemName?.value?.trim() || '';
+  if (itemImagePreview) itemImagePreview.innerHTML = buildImageThumb(newItemImageUrl, nameHint);
+  if (itemImageClear) {
+    const shouldHide = !newItemImageUrl;
+    itemImageClear.classList.toggle('hidden', shouldHide);
+    itemImageClear.disabled = shouldHide || itemImage?.disabled;
+  }
+}
+
+async function handleNewItemImageChange(){
+  if (!itemImage || itemImage.disabled) return;
+  const file = itemImage.files?.[0];
+  if (!file) {
+    newItemImageUrl = '';
+    refreshNewItemImageUI();
+    if (itemImageStatus) itemImageStatus.textContent = '';
+    return;
+  }
+  if (itemImageStatus) itemImageStatus.textContent = '上傳中...';
+  try {
+    const url = await uploadImageFile(file);
+    newItemImageUrl = url;
+    refreshNewItemImageUI();
+    if (itemImageStatus) {
+      itemImageStatus.textContent = '上傳完成';
+      setTimeout(() => {
+        if (itemImageStatus.textContent === '上傳完成') itemImageStatus.textContent = '';
+      }, 2000);
+    }
+  } catch (err) {
+    newItemImageUrl = '';
+    refreshNewItemImageUI();
+    if (itemImageStatus) itemImageStatus.textContent = '上傳失敗：' + err.message;
+  } finally {
+    itemImage.value = '';
+  }
+}
+
+function clearNewItemImage(){
+  newItemImageUrl = '';
+  if (itemImage) itemImage.value = '';
+  refreshNewItemImageUI();
+  if (itemImageStatus) {
+    itemImageStatus.textContent = '已移除圖片';
+    setTimeout(() => {
+      if (itemImageStatus.textContent === '已移除圖片') itemImageStatus.textContent = '';
+    }, 2000);
+  }
+}
+
+async function handleMenuItemImageUpload(input){
+  if (!input || input.disabled) return;
+  const file = input.files?.[0];
+  const tr = input.closest('tr');
+  if (!file || !tr) return;
+  const statusEl = tr.querySelector('.menu-image-status');
+  if (statusEl) statusEl.textContent = '上傳中...';
+  try {
+    const url = await uploadImageFile(file);
+    const imageInput = tr.querySelector('.imageEdit');
+    if (imageInput) {
+      imageInput.value = url;
+      const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
+      const previewEl = tr.querySelector('.menu-image-preview');
+      if (previewEl) previewEl.innerHTML = buildImageThumb(url, name);
+      const clearBtn = tr.querySelector('.clearImage');
+      if (clearBtn) {
+        clearBtn.disabled = false;
+        clearBtn.classList.remove('hidden');
+      }
+      imageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (statusEl) {
+      statusEl.textContent = '上傳完成';
+      setTimeout(()=>{ if (statusEl.textContent === '上傳完成') statusEl.textContent=''; }, 2000);
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = '上傳失敗：' + err.message;
+  } finally {
+    input.value = '';
+  }
 }
 
 function showImageLightbox(url, alt=''){
@@ -260,6 +355,31 @@ async function api(path, options = {}) {
   return data ?? raw;
 }
 
+async function uploadImageFile(file){
+  const form = new FormData();
+  form.append('image', file);
+  const res = await fetch(API_BASE + '/uploads/images', {
+    method: 'POST',
+    headers: { ...authHeader() },
+    body: form,
+  });
+  const raw = await res.text();
+  let data = null;
+  if (raw) { try { data = JSON.parse(raw); } catch {} }
+
+  if (res.status === 401) {
+    localStorage.removeItem('jwt'); token = null;
+    showLogin();
+    throw new Error(data?.message || 'unauthorized');
+  }
+  if (!res.ok) {
+    const msg = data?.message || raw || `${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
+  if (!data?.url) throw new Error('未取得上傳結果');
+  return data.url;
+}
+
 /* =========================
    狀態
    ========================= */
@@ -282,6 +402,8 @@ const state = {
   unpaidOrders: [],
   unpaidPreorders: [],
 };
+
+let newItemImageUrl = '';
 
 function isAdmin(){ return state.me?.role === 'admin'; }
 async function safeRenderAdminReports(){
@@ -640,13 +762,9 @@ function buildMenuPreview(menu, { compact=false } = {}){
   const listClass = compact ? 'menu-preview-list compact' : 'menu-preview-list';
   const body = items.map(it => {
     const safeName = escapeHtml(it.name || '');
-    const safeUrl = escapeHtml(it.imageUrl || '');
     const safeCode = escapeHtml(String(it.code ?? ''));
     const codeLabel = safeCode ? `#${safeCode} ` : '';
-    const imgHtml = safeUrl
-      ? `<button type="button" class="menu-thumb-btn" data-url="${safeUrl}" data-alt="${safeName}" title="點擊放大">` +
-        `<img src="${safeUrl}" alt="${safeName}" class="menu-thumb" loading="lazy"/></button>`
-      : '';
+    const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
     return `
       <div class="menu-preview-item">
         ${imgHtml}
@@ -712,6 +830,8 @@ function renderMenuPage(){
   if (itemName) itemName.disabled = !m;
   if (itemPrice) itemPrice.disabled = !m;
   if (itemImage) itemImage.disabled = !m;
+  if (itemImageClear) itemImageClear.disabled = !m || !newItemImageUrl;
+  refreshNewItemImageUI();
   if (addItem) addItem.disabled = !m;
   if (!menuTableBody) return;
   menuTableBody.innerHTML = '';
@@ -720,18 +840,21 @@ function renderMenuPage(){
     const tr = document.createElement('tr');
     const safeName = escapeHtml(it.name || '');
     const safePrice = escapeHtml(String(it.price ?? ''));
-    const safeImage = escapeHtml(it.imageUrl || '');
-    const preview = it.imageUrl
-      ? `<button type="button" class="menu-thumb-btn" data-url="${safeImage}" data-alt="${safeName}" title="點擊放大"><img src="${safeImage}" alt="${safeName}" class="menu-thumb" loading="lazy"/></button>`
-      : `<div class="menu-thumb placeholder">無圖片</div>`;
+    const hasImage = !!(it.imageUrl && it.imageUrl.trim());
+    const preview = buildImageThumb(it.imageUrl || '', it.name || '');
     tr.innerHTML = `
       <td>${it.code}</td>
       <td><input class="nameEdit" data-id="${it.id}" value="${safeName}" /></td>
       <td><input class="priceEdit w140" data-id="${it.id}" type="number" value="${safePrice}" /></td>
       <td>
         <div class="menu-image-editor">
-          <input class="imageEdit" data-id="${it.id}" placeholder="圖片 URL" value="${safeImage}" />
-          ${preview}
+          <div class="menu-image-preview">${preview}</div>
+          <div class="menu-image-upload-row">
+            <input class="imageUpload" data-id="${it.id}" type="file" accept="image/*" />
+            <button type="button" class="ghost small clearImage ${hasImage ? '' : 'hidden'}" data-id="${it.id}" ${hasImage ? '' : 'disabled'}>移除</button>
+          </div>
+          <div class="menu-image-status small muted"></div>
+          <input class="imageEdit" data-id="${it.id}" type="hidden" value="${escapeHtml(it.imageUrl || '')}" />
         </div>
       </td>
       <td><button class="danger delItem" data-id="${it.id}">刪除</button></td>`;
@@ -1160,22 +1283,35 @@ delMenu.addEventListener('click', async ()=>{
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
 });
+
+itemImage?.addEventListener('change', handleNewItemImageChange);
+itemImageClear?.addEventListener('click', (e)=>{ e.preventDefault(); clearNewItemImage(); });
+itemName?.addEventListener('input', ()=>{ if (newItemImageUrl) refreshNewItemImageUI(); });
+refreshNewItemImageUI();
+
 addItem.addEventListener('click', async ()=>{
   const mId = Number(menuSelect.value);
   const name = itemName.value.trim();
   const price = Number(itemPrice.value||0);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
-  const imageUrl = itemImage ? itemImage.value.trim() : '';
+  const imageUrl = newItemImageUrl || '';
   await addMenuItemReq(mId, name, price, imageUrl);
   itemName.value=''; itemPrice.value='';
+  newItemImageUrl = '';
   if (itemImage) itemImage.value='';
+  if (itemImageStatus) itemImageStatus.textContent = '';
+  refreshNewItemImageUI();
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
 });
 
 menuTableBody?.addEventListener('change', async (e)=>{
   const t = e.target;
+  if (t.classList.contains('imageUpload')) {
+    await handleMenuItemImageUpload(t);
+    return;
+  }
   if (!t.classList.contains('nameEdit') && !t.classList.contains('priceEdit') && !t.classList.contains('imageEdit')) return;
   const tr = t.closest('tr');
   if (!tr) return;
@@ -1200,6 +1336,27 @@ menuTableBody?.addEventListener('change', async (e)=>{
   }
 });
 menuTableBody?.addEventListener('click', async (e)=>{
+  const clearBtn = e.target.closest('.clearImage');
+  if (clearBtn) {
+    e.preventDefault();
+    const tr = clearBtn.closest('tr');
+    if (!tr) return;
+    const imageInput = tr.querySelector('.imageEdit');
+    if (!imageInput) return;
+    imageInput.value = '';
+    const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
+    const previewEl = tr.querySelector('.menu-image-preview');
+    if (previewEl) previewEl.innerHTML = buildImageThumb('', name);
+    clearBtn.disabled = true;
+    clearBtn.classList.add('hidden');
+    const statusEl = tr.querySelector('.menu-image-status');
+    if (statusEl) {
+      statusEl.textContent = '已移除圖片';
+      setTimeout(()=>{ if (statusEl.textContent === '已移除圖片') statusEl.textContent=''; }, 2000);
+    }
+    imageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    return;
+  }
   const btn = e.target.closest('.delItem');
   if (!btn) return;
   const id = Number(btn.dataset.id);

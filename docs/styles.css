@@ -50,6 +50,13 @@ th{color:var(--muted);font-weight:600}
 .menu-thumb.placeholder{display:flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:10px;border:1px dashed #2b3a63;color:var(--muted);font-size:12px;background:#0f1730}
 
 .menu-image-editor{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.menu-image-upload{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.menu-image-upload-row{display:flex;align-items:center;gap:6px;width:100%}
+.menu-image-upload-row input[type=file]{flex:1}
+.menu-image-preview{display:flex;align-items:center;justify-content:flex-start;min-height:56px}
+.menu-image-preview .menu-thumb-btn{padding:0}
+.menu-image-preview .menu-thumb.placeholder{margin:0}
+.menu-image-status{min-height:16px}
 
 .image-lightbox{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.75);z-index:200;padding:24px}
 .image-lightbox.hidden{display:none}

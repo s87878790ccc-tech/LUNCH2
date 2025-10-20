@@ -1,6 +1,7 @@
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
@@ -9,6 +10,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -28,6 +30,34 @@ app.set('trust proxy', 1);
    ========================= */
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024);
+const allowedImageTypes = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']);
+
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '') || '').toLowerCase();
+    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
+    const randomPart = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString('hex');
+    const name = `${Date.now()}-${randomPart}${safeExt}`;
+    cb(null, name);
+  },
+});
+
+const imageUpload = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (allowedImageTypes.has(file.mimetype)) return cb(null, true);
+    cb(new Error('僅接受 PNG/JPG/GIF/WebP 圖片')); // handled in route
+  },
+}).single('image');
 
 /* =========================
    Security / Middleware
@@ -56,6 +86,12 @@ app.use(morgan('dev'));
 
 // rate limit
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
+
+app.use('/uploads', express.static(UPLOAD_DIR, {
+  setHeaders(res) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  },
+}));
 
 /* =========================
    DB (pg)
@@ -284,6 +320,11 @@ function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
   next();
 }
+function getPublicBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0];
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`;
+}
 async function logAction(user, action, details, req) {
   await q(
     `insert into audit_logs(user_id, action, details, ip, ua, ts)
@@ -349,6 +390,27 @@ async function isOpenNow() {
 /* =========================
    Routes
    ========================= */
+app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
+  imageUpload(req, res, async (err) => {
+    if (err) {
+      const maxMb = Math.round((MAX_UPLOAD_BYTES / (1024 * 1024)) * 10) / 10;
+      let message = err.message || '上傳失敗';
+      if (err.code === 'LIMIT_FILE_SIZE') message = `檔案過大，限制 ${maxMb} MB`;
+      return res.status(400).json({ message });
+    }
+    if (!req.file) return res.status(400).json({ message: '請選擇圖片檔' });
+    const fileName = req.file.filename;
+    try {
+      const url = `${getPublicBaseUrl(req)}/uploads/${fileName}`;
+      await logAction(req.user, 'upload.image', { filename: fileName, size: req.file.size }, req);
+      res.json({ url });
+    } catch (e) {
+      console.error('Failed to log upload', e);
+      fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
+      res.status(500).json({ message: '上傳失敗' });
+    }
+  });
+});
 // Auth
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};

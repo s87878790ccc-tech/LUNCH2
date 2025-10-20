@@ -233,7 +233,16 @@
         <div class="row">
           <input id="itemName" placeholder="品名" />
           <input id="itemPrice" type="number" placeholder="價格" class="w140" />
-          <input id="itemImage" placeholder="圖片 URL (選填)" class="flex1" />
+          <div class="flex1 menu-image-upload">
+            <div class="menu-image-upload-row">
+              <input id="itemImage" type="file" accept="image/*" />
+              <button type="button" id="itemImageClear" class="ghost small hidden">移除</button>
+            </div>
+            <div id="itemImagePreview" class="menu-image-preview">
+              <div class="menu-thumb placeholder">無圖片</div>
+            </div>
+            <div id="itemImageStatus" class="small muted menu-image-status"></div>
+          </div>
           <button id="addItem">新增項目</button>
         </div>
 
