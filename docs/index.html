@@ -84,7 +84,7 @@
               <input id="qtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
               <button id="addByCode" class="primary">加入</button>
             </div>
-            <div id="menuView" class="small muted mt8"></div>
+            <div id="menuView" class="menu-preview-host compact mt8"></div>
           </details>
 
           <details>
@@ -121,7 +121,8 @@
             <h3>目前菜單</h3>
             <span id="activeMenuName" class="pill">(未選擇)</span>
           </div>
-          <div id="activeMenuList" class="small muted"></div>
+          <div id="activeMenuNote" class="menu-note-block hidden"></div>
+          <div id="activeMenuList" class="menu-preview-host"></div>
         </div>
       </div>
 
@@ -225,16 +226,19 @@
           <button id="delMenu" class="danger">刪除</button>
         </div>
 
+        <textarea id="menuNote" class="menu-note-input mt8" placeholder="菜單備註（顯示給所有使用者）"></textarea>
+
         <div class="hr"></div>
 
         <div class="row">
           <input id="itemName" placeholder="品名" />
           <input id="itemPrice" type="number" placeholder="價格" class="w140" />
+          <input id="itemImage" placeholder="圖片 URL (選填)" class="flex1" />
           <button id="addItem">新增項目</button>
         </div>
 
         <table id="menuTable" class="mt8">
-          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
+          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th>圖片</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -348,6 +352,13 @@
         </table>
       </div>
     </section>
+  </div>
+
+  <div id="imageLightbox" class="image-lightbox hidden">
+    <div class="image-lightbox-content">
+      <button type="button" class="image-lightbox-close">✕</button>
+      <img src="" alt="預覽圖片" />
+    </div>
   </div>
 
   <script src="app.js"></script>

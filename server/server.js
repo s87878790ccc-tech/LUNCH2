@@ -145,6 +145,11 @@ async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
 }
 
+async function ensureMenuExtraColumns() {
+  await pool.query(`alter table if exists menus add column if not exists note text`);
+  await pool.query(`alter table if exists menu_items add column if not exists image_url text`);
+}
+
 async function ensurePreorderSchema() {
   // 設定
   await pool.query(`
@@ -400,23 +405,33 @@ app.get('/api/menus', auth(false), async (req, res) => {
   const items = await q('select * from menu_items order by menu_id asc, code asc');
   const setting = await one('select active_menu_id from settings where id=1');
   const grouped = menus.map(m => ({
-    id: m.id, name: m.name,
-    items: items.filter(x => x.menu_id === m.id).map(x => ({ id: x.id, code: x.code, name: x.name, price: x.price }))
+    id: m.id,
+    name: m.name,
+    note: m.note || '',
+    items: items
+      .filter(x => x.menu_id === m.id)
+      .map(x => ({
+        id: x.id,
+        code: x.code,
+        name: x.name,
+        price: x.price,
+        imageUrl: x.image_url || '',
+      }))
   }));
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
 app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
-  const { name } = req.body || {};
+  const { name, note } = req.body || {};
   if (!name) return res.status(400).json({ message: 'name required' });
-  const row = await one('insert into menus(name) values ($1) returning id', [name]);
-  await logAction(req.user, 'menu.create', { id: row.id, name }, req);
-  res.json({ id: row.id, name, items: [] });
+  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note ?? null]);
+  await logAction(req.user, 'menu.create', { id: row.id, name, note }, req);
+  res.json({ id: row.id, name: row.name, note: row.note || '', items: [] });
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const { name } = req.body || {};
-  await q('update menus set name=$1 where id=$2', [name, id]);
-  await logAction(req.user, 'menu.update', { id, name }, req);
+  const { name, note } = req.body || {};
+  await q('update menus set name=$1, note=$2 where id=$3', [name, note ?? null, id]);
+  await logAction(req.user, 'menu.update', { id, name, note }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
@@ -432,21 +447,27 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
 });
 app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
-  const { name, price } = req.body || {};
+  const { name, price, imageUrl } = req.body || {};
   if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
-    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
-    [menuId, Number(max.c) + 1, name, Number(price)]
+    'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
+    [menuId, Number(max.c) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
   );
-  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
-  res.json(row);
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
+  res.json({
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    price: row.price,
+    imageUrl: row.image_url || '',
+  });
 });
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const { name, price } = req.body || {};
-  await q('update menu_items set name=$1, price=$2 where id=$3', [name, Number(price), itemId]);
-  await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
+  const { name, price, imageUrl } = req.body || {};
+  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, Number(price), imageUrl ? String(imageUrl) : null, itemId]);
+  await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
@@ -845,6 +866,7 @@ app.get('/', (req, res) => {
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
+    await ensureMenuExtraColumns();
     await ensurePreorderSchema();
     await seed();
     console.log('[tz check]', zonedNowInfo());

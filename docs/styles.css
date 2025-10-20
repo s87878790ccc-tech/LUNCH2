@@ -18,7 +18,7 @@ body{margin:0;background:var(--bg);color:var(--text);
 .pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#0f1730;border:1px solid #2b3a63;color:var(--muted);font-size:12px}
 .grid{display:grid;gap:16px}
 @media(min-width:900px){.grid{grid-template-columns:1.1fr 1fr}}
-input,select,button{background:#0f1730;color:var(--text);border:1px solid #223055;border-radius:10px;padding:8px 10px;font:inherit}
+input,select,button,textarea{background:#0f1730;color:var(--text);border:1px solid #223055;border-radius:10px;padding:8px 10px;font:inherit}
 button{cursor:pointer}
 button.primary{background:var(--accent);color:#002236;border:none}
 button.ghost{background:transparent;border:1px dashed #2b3a63}
@@ -26,6 +26,38 @@ button.danger{background:var(--danger);color:#2e0909;border:none}
 table{width:100%;border-collapse:collapse}
 th,td{border-bottom:1px solid #24365c;padding:8px;text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600}
+
+.menu-note-input{width:100%;min-height:80px;resize:vertical}
+.flex1{flex:1 1 220px}
+
+.menu-note-block{background:#0f1730;border:1px solid #2b3a63;border-radius:12px;padding:8px 12px;color:var(--muted);white-space:pre-wrap}
+.menu-note-block.compact{padding:6px 8px;font-size:12px}
+
+.menu-preview-host{margin-top:8px}
+.menu-preview-list{display:flex;flex-wrap:wrap;gap:8px}
+.menu-preview-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:12px;background:#0f1730;border:1px solid #2b3a63;min-width:0}
+.menu-preview-text{display:flex;flex-direction:column;gap:2px}
+.menu-preview-name{font-weight:600}
+.menu-preview-price{font-size:12px;color:var(--muted)}
+.menu-preview-host.compact .menu-preview-list{gap:6px}
+.menu-preview-host.compact .menu-preview-item{padding:4px 8px;font-size:12px}
+.menu-preview-host.compact .menu-preview-price{font-size:11px}
+.menu-preview-host.compact .menu-thumb{width:44px;height:44px}
+.menu-preview-host.compact .menu-thumb.placeholder{width:44px;height:44px;font-size:11px}
+
+.menu-thumb-btn{border:none;background:transparent;padding:0;line-height:0;cursor:pointer}
+.menu-thumb{width:56px;height:56px;border-radius:10px;border:1px solid #2b3a63;object-fit:cover;background:#0f1730}
+.menu-thumb.placeholder{display:flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:10px;border:1px dashed #2b3a63;color:var(--muted);font-size:12px;background:#0f1730}
+
+.menu-image-editor{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+
+.image-lightbox{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.75);z-index:200;padding:24px}
+.image-lightbox.hidden{display:none}
+.image-lightbox-content{position:relative;max-width:90vw;max-height:90vh}
+.image-lightbox-content img{max-width:100%;max-height:100%;border-radius:12px;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+.image-lightbox-close{position:absolute;top:-16px;right:-16px;background:#0b1020;border:none;color:#fff;border-radius:50%;width:32px;height:32px;display:grid;place-items:center;cursor:pointer;font-size:18px}
+
+.menu-note-block.hidden{display:none}
 
 .layer{position:fixed;inset:0;display:grid;place-items:center;padding:16px;background:rgba(0,0,0,.5)}
 .topbar{position:sticky;top:0;background:rgba(18,26,46,.9);backdrop-filter:blur(8px);
