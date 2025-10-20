@@ -152,15 +152,6 @@ async function tx(fn) {
 async function t_one(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows[0] || null; }
 async function t_q(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows; }
 
-async function removeMenuImageIfUnused(publicUrl) {
-  if (!publicUrl) return;
-  const row = await one('select count(*)::int as cnt from menu_items where image_url=$1', [publicUrl]);
-  let count = Number(row?.cnt ?? row?.count ?? 0);
-  if (!Number.isFinite(count)) count = 0;
-  if (count > 0) return;
-  await removeMenuImage(publicUrl);
-}
-
 /* =========================
    Schema 升級（不破壞既有資料）
    ========================= */
@@ -541,9 +532,8 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
     if (s?.active_menu_id === id) await c.query('update settings set active_menu_id=null where id=1');
     return imgs.map(i => i.image_url).filter(Boolean);
   }) || [];
-  const uniqueImages = [...new Set(removedImages)];
-  for (const img of uniqueImages) {
-    await removeMenuImageIfUnused(img);
+  for (const img of removedImages) {
+    await removeMenuImage(img);
   }
   await logAction(req.user, 'menu.delete', { id }, req);
   res.json({ ok: true });
@@ -580,7 +570,7 @@ app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const newImage = trimmedImage ? trimmedImage : null;
   await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, nextPrice, newImage, itemId]);
   if (existing.image_url && existing.image_url !== newImage) {
-    await removeMenuImageIfUnused(existing.image_url);
+    await removeMenuImage(existing.image_url);
   }
   await logAction(req.user, 'menu.item.update', { itemId, name, price: nextPrice, imageUrl: newImage }, req);
   res.json({ ok: true });
@@ -597,7 +587,7 @@ app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => 
       }
     });
     if (row.image_url) {
-      await removeMenuImageIfUnused(row.image_url);
+      await removeMenuImage(row.image_url);
     }
   }
   await logAction(req.user, 'menu.item.delete', { itemId }, req);
