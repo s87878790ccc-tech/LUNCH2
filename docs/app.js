@@ -774,6 +774,7 @@ function buildMenuPreview(menu, { compact=false } = {}){
     const safeCode = escapeHtml(String(it.code ?? ''));
     const codeLabel = safeCode ? `#${safeCode} ` : '';
     const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
+
     const hasPrice = it.price !== null && it.price !== undefined && it.price !== '';
     const priceHtml = hasPrice ? `<div class="menu-preview-price">$${fmt(it.price)}</div>` : '';
     return `
