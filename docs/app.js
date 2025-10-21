@@ -46,6 +46,7 @@ const seatSelect = document.getElementById('seatSelect');
 const toggleSubmitted = document.getElementById('toggleSubmitted');
 
 const clearSeat = document.getElementById('clearSeat');
+const purgeOrdersBtn = document.getElementById('purgeOrdersBtn');
 const codeInput = document.getElementById('codeInput');
 const qtyInput  = document.getElementById('qtyInput');
 const addByCode = document.getElementById('addByCode');
@@ -59,6 +60,7 @@ const seatSubtotal = document.getElementById('seatSubtotal');
 const internalOnlyEl = document.getElementById('internalOnly');
 
 const activeMenuName = document.getElementById('activeMenuName');
+const activeMenuNote = document.getElementById('activeMenuNote');
 const activeMenuList = document.getElementById('activeMenuList');
 const menuView = document.getElementById('menuView');
 
@@ -69,8 +71,13 @@ const menuNewName = document.getElementById('menuNewName');
 const renameMenu = document.getElementById('renameMenu');
 const dupMenu = document.getElementById('dupMenu');
 const delMenu = document.getElementById('delMenu');
+const menuNote = document.getElementById('menuNote');
 const itemName = document.getElementById('itemName');
 const itemPrice = document.getElementById('itemPrice');
+const itemImage = document.getElementById('itemImage');
+const itemImageClear = document.getElementById('itemImageClear');
+const itemImagePreview = document.getElementById('itemImagePreview');
+const itemImageStatus = document.getElementById('itemImageStatus');
 const addItem = document.getElementById('addItem');
 const menuTableBody = document.querySelector('#menuTable tbody');
 
@@ -94,6 +101,8 @@ const refreshAllSeats = document.getElementById('refreshAllSeats');
 // 開放時段狀態
 let isOpenWindow = true;
 const closedBanner = document.getElementById('closedBanner');
+
+const imageLightbox = document.getElementById('imageLightbox');
 
 // 後台：點餐時段設定（DOM）
 const owDayInputs = Array.from(document.querySelectorAll('input[name="owDay"]'));
@@ -126,6 +135,149 @@ function normalizeUsername(u=''){
 function normalizePassword(p=''){
   return String(p).replace(/\u3000/g,' ').trim();
 }
+
+function escapeHtml(str=''){
+  return String(str)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function noteToHtml(note=''){
+  return escapeHtml(note).replace(/\r?\n/g,'<br>');
+}
+
+function buildImageThumb(url='', alt=''){
+  const safeUrl = escapeHtml(url || '');
+  const safeAlt = escapeHtml(alt || '');
+  if (!url) return '<div class="menu-thumb placeholder">無圖片</div>';
+  return `<button type="button" class="menu-thumb-btn" data-url="${safeUrl}" data-alt="${safeAlt}" title="點擊放大">` +
+    `<img src="${safeUrl}" alt="${safeAlt}" class="menu-thumb" loading="lazy"/></button>`;
+}
+
+function refreshNewItemImageUI(){
+  const nameHint = itemName?.value?.trim() || '';
+  if (itemImagePreview) itemImagePreview.innerHTML = buildImageThumb(newItemImageUrl, nameHint);
+  if (itemImageClear) {
+    const shouldHide = !newItemImageUrl;
+    itemImageClear.classList.toggle('hidden', shouldHide);
+    itemImageClear.disabled = shouldHide || itemImage?.disabled;
+  }
+}
+
+async function handleNewItemImageChange(){
+  if (!itemImage || itemImage.disabled) return;
+  const file = itemImage.files?.[0];
+  if (!file) {
+    newItemImageUrl = '';
+    refreshNewItemImageUI();
+    if (itemImageStatus) itemImageStatus.textContent = '';
+    return;
+  }
+  if (itemImageStatus) itemImageStatus.textContent = '上傳中...';
+  try {
+    const url = await uploadImageFile(file);
+    newItemImageUrl = url;
+    refreshNewItemImageUI();
+    if (itemImageStatus) {
+      itemImageStatus.textContent = '上傳完成';
+      setTimeout(() => {
+        if (itemImageStatus.textContent === '上傳完成') itemImageStatus.textContent = '';
+      }, 2000);
+    }
+  } catch (err) {
+    newItemImageUrl = '';
+    refreshNewItemImageUI();
+    if (itemImageStatus) itemImageStatus.textContent = '上傳失敗：' + err.message;
+  } finally {
+    itemImage.value = '';
+  }
+}
+
+function clearNewItemImage(){
+  newItemImageUrl = '';
+  if (itemImage) itemImage.value = '';
+  refreshNewItemImageUI();
+  if (itemImageStatus) {
+    itemImageStatus.textContent = '已移除圖片';
+    setTimeout(() => {
+      if (itemImageStatus.textContent === '已移除圖片') itemImageStatus.textContent = '';
+    }, 2000);
+  }
+}
+
+async function handleMenuItemImageUpload(input){
+  if (!input || input.disabled) return;
+  const file = input.files?.[0];
+  const tr = input.closest('tr');
+  if (!file || !tr) return;
+  const statusEl = tr.querySelector('.menu-image-status');
+  if (statusEl) statusEl.textContent = '上傳中...';
+  try {
+    const url = await uploadImageFile(file);
+    const imageInput = tr.querySelector('.imageEdit');
+    if (imageInput) {
+      imageInput.value = url;
+      const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
+      const previewEl = tr.querySelector('.menu-image-preview');
+      if (previewEl) previewEl.innerHTML = buildImageThumb(url, name);
+      const clearBtn = tr.querySelector('.clearImage');
+      if (clearBtn) {
+        clearBtn.disabled = false;
+        clearBtn.classList.remove('hidden');
+      }
+      imageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (statusEl) {
+      statusEl.textContent = '上傳完成';
+      setTimeout(()=>{ if (statusEl.textContent === '上傳完成') statusEl.textContent=''; }, 2000);
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = '上傳失敗：' + err.message;
+  } finally {
+    input.value = '';
+  }
+}
+
+function showImageLightbox(url, alt=''){
+  if (!url) return;
+  if (!imageLightbox) { window.open(url, '_blank'); return; }
+  const img = imageLightbox.querySelector('img');
+  if (img) {
+    img.src = url;
+    img.alt = alt || '預覽圖片';
+  }
+  imageLightbox.classList.remove('hidden');
+}
+
+function hideImageLightbox(){
+  if (!imageLightbox) return;
+  const img = imageLightbox.querySelector('img');
+  if (img) img.src = '';
+  imageLightbox.classList.add('hidden');
+}
+
+if (imageLightbox){
+  imageLightbox.addEventListener('click', (e)=>{
+    if (e.target === imageLightbox) hideImageLightbox();
+  });
+  imageLightbox.querySelector('.image-lightbox-close')?.addEventListener('click', hideImageLightbox);
+  document.addEventListener('keydown', (e)=>{
+    if (e.key === 'Escape' && !imageLightbox.classList.contains('hidden')) hideImageLightbox();
+  });
+}
+
+document.addEventListener('click', (e)=>{
+  const btn = e.target.closest('.menu-thumb-btn');
+  if (!btn) return;
+  e.preventDefault();
+  const url = btn.dataset.url;
+  if (!url) return;
+  const alt = btn.dataset.alt || '';
+  showImageLightbox(url, alt);
+});
 
 function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
@@ -204,6 +356,31 @@ async function api(path, options = {}) {
   return data ?? raw;
 }
 
+async function uploadImageFile(file){
+  const form = new FormData();
+  form.append('image', file);
+  const res = await fetch(API_BASE + '/uploads/images', {
+    method: 'POST',
+    headers: { ...authHeader() },
+    body: form,
+  });
+  const raw = await res.text();
+  let data = null;
+  if (raw) { try { data = JSON.parse(raw); } catch {} }
+
+  if (res.status === 401) {
+    localStorage.removeItem('jwt'); token = null;
+    showLogin();
+    throw new Error(data?.message || 'unauthorized');
+  }
+  if (!res.ok) {
+    const msg = data?.message || raw || `${res.status} ${res.statusText}`;
+    throw new Error(msg);
+  }
+  if (!data?.url) throw new Error('未取得上傳結果');
+  return data.url;
+}
+
 /* =========================
    狀態
    ========================= */
@@ -226,6 +403,8 @@ const state = {
   unpaidOrders: [],
   unpaidPreorders: [],
 };
+
+let newItemImageUrl = '';
 
 function isAdmin(){ return state.me?.role === 'admin'; }
 async function safeRenderAdminReports(){
@@ -517,29 +696,30 @@ async function setActiveMenu(menuId){
   await api('/settings/active-menu', { method:'PUT', body: JSON.stringify({ menuId }) });
   state.activeMenuId = menuId;
 }
-async function createMenu(name){
-  const m = await api('/menus', { method:'POST', body: JSON.stringify({ name })});
+async function createMenu(name, note=''){
+  const m = await api('/menus', { method:'POST', body: JSON.stringify({ name, note })});
   state.menus.push(m);
 }
-async function renameMenuReq(id, name){
-  await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify({ name })});
-  const m = state.menus.find(x=>x.id===id); if (m) m.name = name;
+async function renameMenuReq(id, name, note=''){
+  await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify({ name, note })});
+  const m = state.menus.find(x=>x.id===id);
+  if (m) { m.name = name; m.note = note; }
 }
 async function deleteMenuReq(id){
   await api(`/menus/${id}`, { method:'DELETE' });
   state.menus = state.menus.filter(x=>x.id!==id);
   if (state.activeMenuId===id) state.activeMenuId = state.menus[0]?.id ?? null;
 }
-async function addMenuItemReq(menuId, name, price){
-  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price })});
+async function addMenuItemReq(menuId, name, price, imageUrl=''){
+  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price, imageUrl })});
   const m = state.menus.find(x=>x.id===menuId);
   if (m) m.items.push(it);
 }
-async function updateMenuItemReq(itemId, name, price){
-  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price })});
+async function updateMenuItemReq(itemId, name, price, imageUrl=''){
+  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price, imageUrl })});
   for (const m of state.menus) {
     const it = m.items.find(i=>i.id===itemId);
-    if (it) { it.name=name; it.price=Number(price); break; }
+    if (it) { it.name=name; it.price=Number(price); it.imageUrl=imageUrl; break; }
   }
 }
 async function deleteMenuItemReq(itemId){
@@ -575,6 +755,29 @@ async function getUnpaidOrders(){ return api('/reports/unpaid'); }
    Render（一般訂單頁）
    ========================= */
 function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
+
+function buildMenuPreview(menu, { compact=false } = {}){
+  if (!menu) return '<div class="muted small">(尚未選擇菜單)</div>';
+  const items = Array.isArray(menu.items) ? menu.items : [];
+  if (!items.length) return '<div class="muted small">(此菜單沒有項目)</div>';
+  const listClass = compact ? 'menu-preview-list compact' : 'menu-preview-list';
+  const body = items.map(it => {
+    const safeName = escapeHtml(it.name || '');
+    const safeCode = escapeHtml(String(it.code ?? ''));
+    const codeLabel = safeCode ? `#${safeCode} ` : '';
+    const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
+    return `
+      <div class="menu-preview-item">
+        ${imgHtml}
+        <div class="menu-preview-text">
+          <div class="menu-preview-name">${codeLabel}${safeName}</div>
+          <div class="menu-preview-price">$${fmt(it.price)}</div>
+        </div>
+      </div>`;
+  }).join('');
+  return `<div class="${listClass}">${body}</div>`;
+}
+
 function renderSeats(){
   seatSelect.innerHTML = '';
   for(let s=MIN_SEAT; s<=MAX_SEAT; s++){
@@ -587,25 +790,74 @@ function renderSeats(){
 function renderActiveMenu() {
   const m = state.menus.find(x=>x.id===state.activeMenuId);
   if (activeMenuName) activeMenuName.textContent = m ? m.name : '(未選擇)';
-  const list = (m?.items||[]).map(it =>
-    `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
-  if (activeMenuList) activeMenuList.innerHTML = list || '(此菜單沒有項目)';
-  if (menuView) menuView.innerHTML = list;
+  const rawNote = m?.note ?? '';
+  const hasNote = rawNote.trim().length > 0;
+  if (activeMenuNote) {
+    if (hasNote) {
+      activeMenuNote.innerHTML = noteToHtml(rawNote);
+      activeMenuNote.classList.remove('hidden');
+    } else {
+      activeMenuNote.innerHTML = '';
+      activeMenuNote.classList.add('hidden');
+    }
+  }
+  if (activeMenuList) activeMenuList.innerHTML = buildMenuPreview(m);
+  const compactNote = hasNote ? `<div class="menu-note-block compact">${noteToHtml(rawNote)}</div>` : '';
+  const compactList = buildMenuPreview(m, { compact:true });
+  if (menuView) menuView.innerHTML = compactNote + compactList;
+  const preMenuViewEl = document.getElementById('preMenuView');
+  if (preMenuViewEl) preMenuViewEl.innerHTML = compactNote + compactList;
 }
 function renderMenuPage(){
   if (!menuSelect) return;
-  menuSelect.innerHTML = state.menus.map((m,i)=>`<option value="${m.id}">${i+1}. ${m.name}</option>`).join('');
+  menuSelect.innerHTML = state.menus
+    .map((m,i)=>`<option value="${m.id}">${i+1}. ${escapeHtml(m.name)}</option>`)
+    .join('');
   if (state.activeMenuId) menuSelect.value = String(state.activeMenuId);
+  menuSelect.disabled = state.menus.length === 0;
+  const m = state.menus.find(x=>x.id===state.activeMenuId);
+  if (menuNewName) {
+    menuNewName.value = m?.name || '';
+    menuNewName.disabled = !m;
+  }
+  if (menuNote) {
+    menuNote.value = m?.note || '';
+    menuNote.disabled = !m;
+  }
+  if (useMenu) useMenu.disabled = !m;
+  if (renameMenu) renameMenu.disabled = !m;
+  if (dupMenu) dupMenu.disabled = !m;
+  if (delMenu) delMenu.disabled = !m;
+  if (itemName) itemName.disabled = !m;
+  if (itemPrice) itemPrice.disabled = !m;
+  if (itemImage) itemImage.disabled = !m;
+  if (itemImageClear) itemImageClear.disabled = !m || !newItemImageUrl;
+  refreshNewItemImageUI();
+  if (addItem) addItem.disabled = !m;
   if (!menuTableBody) return;
   menuTableBody.innerHTML = '';
-  const m = state.menus.find(x=>x.id===state.activeMenuId);
   if (!m) return;
   m.items.forEach((it)=>{
     const tr = document.createElement('tr');
+    const safeName = escapeHtml(it.name || '');
+    const safePrice = escapeHtml(String(it.price ?? ''));
+    const hasImage = !!(it.imageUrl && it.imageUrl.trim());
+    const preview = buildImageThumb(it.imageUrl || '', it.name || '');
     tr.innerHTML = `
       <td>${it.code}</td>
-      <td><input class="nameEdit" data-id="${it.id}" value="${it.name}" /></td>
-      <td><input class="priceEdit w140" data-id="${it.id}" type="number" value="${it.price}" /></td>
+      <td><input class="nameEdit" data-id="${it.id}" value="${safeName}" /></td>
+      <td><input class="priceEdit w140" data-id="${it.id}" type="number" value="${safePrice}" /></td>
+      <td>
+        <div class="menu-image-editor">
+          <div class="menu-image-preview">${preview}</div>
+          <div class="menu-image-upload-row">
+            <input class="imageUpload" data-id="${it.id}" type="file" accept="image/*" />
+            <button type="button" class="ghost small clearImage ${hasImage ? '' : 'hidden'}" data-id="${it.id}" ${hasImage ? '' : 'disabled'}>移除</button>
+          </div>
+          <div class="menu-image-status small muted"></div>
+          <input class="imageEdit" data-id="${it.id}" type="hidden" value="${escapeHtml(it.imageUrl || '')}" />
+        </div>
+      </td>
       <td><button class="danger delItem" data-id="${it.id}">刪除</button></td>`;
     menuTableBody.appendChild(tr);
   });
@@ -877,6 +1129,28 @@ clearSeat.addEventListener('click', async ()=>{
   if (isAdmin()) await renderSeatCardInto(seat);
 });
 
+purgeOrdersBtn?.addEventListener('click', async ()=>{
+  if (!isAdmin()) return alert('僅限管理員可操作');
+  if (!confirm('確定要刪除今日全部訂單？此動作無法復原。')) return;
+  if (!confirm('再次確認：真的要刪除今日全部訂單嗎？')) return;
+  const originalLabel = purgeOrdersBtn.textContent;
+  purgeOrdersBtn.disabled = true;
+  purgeOrdersBtn.textContent = '刪除中…';
+  try {
+    await api('/orders/today', { method: 'DELETE' });
+    state.ordersCache.clear();
+    await renderSeatOrder();
+    await safeRenderAdminReports();
+    if (isAdmin()) await renderAllSeatsAdmin();
+    alert('已刪除今日全部訂單');
+  } catch (err) {
+    alert('刪除失敗：' + err.message);
+  } finally {
+    purgeOrdersBtn.disabled = false;
+    purgeOrdersBtn.textContent = originalLabel;
+  }
+});
+
 // 內訂勾選（單座）
 internalOnlyEl?.addEventListener('change', async ()=>{
   const seat = Number(seatSelect.value||1);
@@ -987,6 +1261,11 @@ document.querySelector('#orderTable tfoot')?.addEventListener('change', async (e
   }
 });
 
+menuSelect?.addEventListener('change', ()=>{
+  state.activeMenuId = Number(menuSelect.value) || null;
+  renderMenuPage();
+  renderActiveMenu();
+});
 useMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   await setActiveMenu(id);
@@ -1004,7 +1283,8 @@ renameMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   const name = menuNewName.value.trim();
   if (!name) return alert('請輸入新名稱');
-  await renameMenuReq(id, name);
+  const note = menuNote ? menuNote.value : '';
+  await renameMenuReq(id, name, note);
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
 });
@@ -1012,9 +1292,9 @@ dupMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   const src = state.menus.find(x=>x.id===id);
   if (!src) return;
-  await createMenu(src.name + '（副本）');
+  await createMenu(src.name + '（副本）', src.note || '');
   const newMenu = state.menus[state.menus.length-1];
-  for (const it of src.items) await addMenuItemReq(newMenu.id, it.name, it.price);
+  for (const it of src.items) await addMenuItemReq(newMenu.id, it.name, it.price, it.imageUrl || '');
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
   alert('已建立副本');
@@ -1026,16 +1306,94 @@ delMenu.addEventListener('click', async ()=>{
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
 });
+
+itemImage?.addEventListener('change', handleNewItemImageChange);
+itemImageClear?.addEventListener('click', (e)=>{ e.preventDefault(); clearNewItemImage(); });
+itemName?.addEventListener('input', ()=>{ if (newItemImageUrl) refreshNewItemImageUI(); });
+refreshNewItemImageUI();
+
 addItem.addEventListener('click', async ()=>{
   const mId = Number(menuSelect.value);
   const name = itemName.value.trim();
   const price = Number(itemPrice.value||0);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
-  await addMenuItemReq(mId, name, price);
+  const imageUrl = newItemImageUrl || '';
+  await addMenuItemReq(mId, name, price, imageUrl);
   itemName.value=''; itemPrice.value='';
+  newItemImageUrl = '';
+  if (itemImage) itemImage.value='';
+  if (itemImageStatus) itemImageStatus.textContent = '';
+  refreshNewItemImageUI();
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
+});
+
+menuTableBody?.addEventListener('change', async (e)=>{
+  const t = e.target;
+  if (t.classList.contains('imageUpload')) {
+    await handleMenuItemImageUpload(t);
+    return;
+  }
+  if (!t.classList.contains('nameEdit') && !t.classList.contains('priceEdit') && !t.classList.contains('imageEdit')) return;
+  const tr = t.closest('tr');
+  if (!tr) return;
+  const id = Number(t.dataset.id || tr.querySelector('.nameEdit')?.dataset.id || tr.querySelector('.priceEdit')?.dataset.id);
+  if (!id) return;
+  const nameInput = tr.querySelector('.nameEdit');
+  const priceInput = tr.querySelector('.priceEdit');
+  const imageInput = tr.querySelector('.imageEdit');
+  const name = nameInput?.value?.trim() || '';
+  const price = Number(priceInput?.value || 0);
+  if (!name) { alert('品名不可為空'); renderMenuPage(); return; }
+  if (!Number.isFinite(price) || price < 0) { alert('價格需 >= 0'); renderMenuPage(); return; }
+  const imageUrl = imageInput?.value?.trim() || '';
+  try{
+    await updateMenuItemReq(id, name, price, imageUrl);
+    await loadMenus();
+    renderActiveMenu();
+    renderMenuPage();
+  }catch(err){
+    alert('更新失敗：' + err.message);
+    renderMenuPage();
+  }
+});
+menuTableBody?.addEventListener('click', async (e)=>{
+  const clearBtn = e.target.closest('.clearImage');
+  if (clearBtn) {
+    e.preventDefault();
+    const tr = clearBtn.closest('tr');
+    if (!tr) return;
+    const imageInput = tr.querySelector('.imageEdit');
+    if (!imageInput) return;
+    imageInput.value = '';
+    const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
+    const previewEl = tr.querySelector('.menu-image-preview');
+    if (previewEl) previewEl.innerHTML = buildImageThumb('', name);
+    clearBtn.disabled = true;
+    clearBtn.classList.add('hidden');
+    const statusEl = tr.querySelector('.menu-image-status');
+    if (statusEl) {
+      statusEl.textContent = '已移除圖片';
+      setTimeout(()=>{ if (statusEl.textContent === '已移除圖片') statusEl.textContent=''; }, 2000);
+    }
+    imageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    return;
+  }
+  const btn = e.target.closest('.delItem');
+  if (!btn) return;
+  const id = Number(btn.dataset.id);
+  if (!id) return;
+  if (!confirm('確定刪除此項目？')) return;
+  try{
+    await deleteMenuItemReq(id);
+    await loadMenus();
+    renderActiveMenu();
+    renderMenuPage();
+  }catch(err){
+    alert('刪除失敗：' + err.message);
+    renderMenuPage();
+  }
 });
 
 /* =========================
@@ -1076,7 +1434,7 @@ function ensurePreorderUI(){
             <input id="preQtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
             <button id="preAddByCode" class="primary">加入</button>
           </div>
-          <div id="preMenuView" class="small muted mt8"></div>
+          <div id="preMenuView" class="menu-preview-host compact mt8"></div>
         </details>
 
         <details>
@@ -1130,8 +1488,12 @@ function ensurePreorderUI(){
 
   // 預設把菜單清單也顯示在預訂頁
   const m = state.menus.find(x=>x.id===state.activeMenuId);
-  const list = (m?.items||[]).map(it => `<span class="pill" title="${it.name}">#${it.code} ${it.name} $${it.price}</span>`).join(' ');
-  document.getElementById('preMenuView').innerHTML = list || '(此菜單沒有項目)';
+  const preMenuView = document.getElementById('preMenuView');
+  if (preMenuView) {
+    const note = m?.note ?? '';
+    const noteHtml = note.trim() ? `<div class="menu-note-block compact">${noteToHtml(note)}</div>` : '';
+    preMenuView.innerHTML = noteHtml + buildMenuPreview(m, { compact:true });
+  }
 
   // 填座號下拉
   const sel = document.getElementById('preSeatSelect');

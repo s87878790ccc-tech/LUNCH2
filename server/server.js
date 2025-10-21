@@ -1,6 +1,7 @@
 require('dotenv').config();
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
@@ -9,6 +10,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -28,6 +30,34 @@ app.set('trust proxy', 1);
    ========================= */
 const LOG_DIR = path.join(__dirname, 'logs');
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024);
+const allowedImageTypes = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']);
+
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname || '') || '').toLowerCase();
+    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
+    const randomPart = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString('hex');
+    const name = `${Date.now()}-${randomPart}${safeExt}`;
+    cb(null, name);
+  },
+});
+
+const imageUpload = multer({
+  storage: uploadStorage,
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (allowedImageTypes.has(file.mimetype)) return cb(null, true);
+    cb(new Error('僅接受 PNG/JPG/GIF/WebP 圖片')); // handled in route
+  },
+}).single('image');
 
 /* =========================
    Security / Middleware
@@ -56,6 +86,12 @@ app.use(morgan('dev'));
 
 // rate limit
 app.use(rateLimit({ windowMs: 60_000, max: 200 }));
+
+app.use('/uploads', express.static(UPLOAD_DIR, {
+  setHeaders(res) {
+    res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  },
+}));
 
 /* =========================
    DB (pg)
@@ -143,6 +179,11 @@ async function ensureSettingsSchema() {
 async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists internal_only boolean default false`);
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
+}
+
+async function ensureMenuExtraColumns() {
+  await pool.query(`alter table if exists menus add column if not exists note text`);
+  await pool.query(`alter table if exists menu_items add column if not exists image_url text`);
 }
 
 async function ensurePreorderSchema() {
@@ -279,6 +320,11 @@ function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
   next();
 }
+function getPublicBaseUrl(req) {
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0];
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`;
+}
 async function logAction(user, action, details, req) {
   await q(
     `insert into audit_logs(user_id, action, details, ip, ua, ts)
@@ -344,6 +390,27 @@ async function isOpenNow() {
 /* =========================
    Routes
    ========================= */
+app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
+  imageUpload(req, res, async (err) => {
+    if (err) {
+      const maxMb = Math.round((MAX_UPLOAD_BYTES / (1024 * 1024)) * 10) / 10;
+      let message = err.message || '上傳失敗';
+      if (err.code === 'LIMIT_FILE_SIZE') message = `檔案過大，限制 ${maxMb} MB`;
+      return res.status(400).json({ message });
+    }
+    if (!req.file) return res.status(400).json({ message: '請選擇圖片檔' });
+    const fileName = req.file.filename;
+    try {
+      const url = `${getPublicBaseUrl(req)}/uploads/${fileName}`;
+      await logAction(req.user, 'upload.image', { filename: fileName, size: req.file.size }, req);
+      res.json({ url });
+    } catch (e) {
+      console.error('Failed to log upload', e);
+      fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
+      res.status(500).json({ message: '上傳失敗' });
+    }
+  });
+});
 // Auth
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
@@ -400,23 +467,33 @@ app.get('/api/menus', auth(false), async (req, res) => {
   const items = await q('select * from menu_items order by menu_id asc, code asc');
   const setting = await one('select active_menu_id from settings where id=1');
   const grouped = menus.map(m => ({
-    id: m.id, name: m.name,
-    items: items.filter(x => x.menu_id === m.id).map(x => ({ id: x.id, code: x.code, name: x.name, price: x.price }))
+    id: m.id,
+    name: m.name,
+    note: m.note || '',
+    items: items
+      .filter(x => x.menu_id === m.id)
+      .map(x => ({
+        id: x.id,
+        code: x.code,
+        name: x.name,
+        price: x.price,
+        imageUrl: x.image_url || '',
+      }))
   }));
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
 app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
-  const { name } = req.body || {};
+  const { name, note } = req.body || {};
   if (!name) return res.status(400).json({ message: 'name required' });
-  const row = await one('insert into menus(name) values ($1) returning id', [name]);
-  await logAction(req.user, 'menu.create', { id: row.id, name }, req);
-  res.json({ id: row.id, name, items: [] });
+  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note ?? null]);
+  await logAction(req.user, 'menu.create', { id: row.id, name, note }, req);
+  res.json({ id: row.id, name: row.name, note: row.note || '', items: [] });
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const { name } = req.body || {};
-  await q('update menus set name=$1 where id=$2', [name, id]);
-  await logAction(req.user, 'menu.update', { id, name }, req);
+  const { name, note } = req.body || {};
+  await q('update menus set name=$1, note=$2 where id=$3', [name, note ?? null, id]);
+  await logAction(req.user, 'menu.update', { id, name, note }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
@@ -432,21 +509,27 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
 });
 app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
-  const { name, price } = req.body || {};
+  const { name, price, imageUrl } = req.body || {};
   if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
-    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
-    [menuId, Number(max.c) + 1, name, Number(price)]
+    'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
+    [menuId, Number(max.c) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
   );
-  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
-  res.json(row);
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
+  res.json({
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    price: row.price,
+    imageUrl: row.image_url || '',
+  });
 });
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const { name, price } = req.body || {};
-  await q('update menu_items set name=$1, price=$2 where id=$3', [name, Number(price), itemId]);
-  await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
+  const { name, price, imageUrl } = req.body || {};
+  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, Number(price), imageUrl ? String(imageUrl) : null, itemId]);
+  await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
@@ -527,6 +610,18 @@ app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   await q('update orders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
   await logAction(req.user, 'order.paid', { seat, paid: !!paid }, req);
   res.json({ ok: true });
+});
+app.delete('/api/orders/today', auth(), requireAdmin, async (req, res) => {
+  let deletedItems = 0;
+  let resetOrders = 0;
+  await tx(async (c) => {
+    const del = await c.query('delete from order_items');
+    deletedItems = del?.rowCount || 0;
+    const upd = await c.query('update orders set submitted=false, internal_only=false, paid=false, updated_at=now()');
+    resetOrders = upd?.rowCount || 0;
+  });
+  await logAction(req.user, 'orders.purgeToday', { deletedItems, resetOrders }, req);
+  res.json({ ok: true, deletedItems, resetOrders });
 });
 
 // Reports（僅 admin）
@@ -845,6 +940,7 @@ app.get('/', (req, res) => {
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
+    await ensureMenuExtraColumns();
     await ensurePreorderSchema();
     await seed();
     console.log('[tz check]', zonedNowInfo());
