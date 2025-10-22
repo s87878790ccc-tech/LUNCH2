@@ -244,7 +244,7 @@ async function ensurePreorderSchema() {
       qty integer not null
     )
   `);
-  // 兼容：若曾有 order_id，把它改名為 preorder_id；若兩者都不存在就補上 preorder_id
+  // 兼容：order_id → preorder_id
   await pool.query(`
     do $$
     begin
@@ -411,6 +411,7 @@ app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
     }
   });
 });
+
 // Auth
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
@@ -427,10 +428,14 @@ app.post('/api/auth/login', async (req, res) => {
 
   const token = sign(u);
   await logAction({ uid: u.id }, 'login', { username }, req);
+  // 統一回傳 shape（id/username/role）
   res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
 });
+
+// ✅ 統一 /auth/me 回傳 shape（修正原本只有 uid 導致前端 id 為 undefined）
 app.get('/api/auth/me', auth(), async (req, res) => {
-  res.json({ user: req.user });
+  const u = req.user;
+  res.json({ user: { id: u.uid, username: u.username, role: u.role } });
 });
 
 // Settings（admin）
@@ -491,9 +496,8 @@ app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  const { name, note } = req.body || {};
-  await q('update menus set name=$1, note=$2 where id=$3', [name, note ?? null, id]);
-  await logAction(req.user, 'menu.update', { id, name, note }, req);
+  await q('update menus set name=$1, note=$2 where id=$3', [req.body?.name, req.body?.note ?? null, id]);
+  await logAction(req.user, 'menu.update', { id, name: req.body?.name, note: req.body?.note }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
@@ -514,7 +518,7 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
     'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
-    [menuId, Number(max.c) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
+    [menuId, Number(max?.c || 0) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
   );
   await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
   res.json({
@@ -557,6 +561,7 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
 // Orders
 app.get('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
   const o = await ensureOrder(seat);
   const items = await q('select * from order_items where order_id=$1 order by id asc', [o.id]);
@@ -570,6 +575,7 @@ app.get('/api/orders/:seat', auth(), async (req, res) => {
 });
 app.put('/api/orders/:seat', auth(), async (req, res) => {
   const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
 
   if (req.user.role !== 'admin' && !(await isOpenNow())) {
@@ -605,6 +611,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
 // 訂單「已付款」切換（admin）
 app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   const { paid } = req.body || {};
   const o = await ensureOrder(seat);
   await q('update orders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
@@ -700,6 +707,7 @@ async function checkPreUserAllowed(user, date) {
 app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
   try{
     const seat = Number(req.params.seat);
+    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
     const date = toDateOrNull(req.params.date);
     if (!date) return res.status(400).json({ message:'bad date' });
     if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
@@ -720,6 +728,7 @@ app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
 app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
   try{
     const seat = Number(req.params.seat);
+    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
     const date = toDateOrNull(req.params.date);
     if (!date) return res.status(400).json({ message:'bad date' });
     if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
@@ -758,6 +767,7 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
 app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res)=>{
   try{
     const seat = Number(req.params.seat);
+    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
     const date = toDateOrNull(req.params.date);
     if (!date) return res.status(400).json({ message:'bad date' });
     const o = await ensurePreorder(date, seat);
@@ -833,6 +843,8 @@ app.get('/api/users', auth(), requireAdmin, async (req, res) => {
 });
 app.put('/api/users/:id/password', auth(), async (req, res) => {
   const targetId = Number(req.params.id);
+  if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
+
   const { oldPassword, newPassword } = req.body || {};
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ message: 'newPassword too short' });
 
@@ -856,6 +868,7 @@ app.put('/api/users/:id/password', auth(), async (req, res) => {
 });
 app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
   const { status } = req.body || {};
   if (!['active', 'disabled'].includes(status)) return res.status(400).json({ message: 'bad status' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的狀態' });
@@ -869,6 +882,7 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
 });
 app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
   const { role } = req.body || {};
   if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: 'bad role' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的角色' });
@@ -887,6 +901,7 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
 });
 app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   const targetId = Number(req.params.id);
+  if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
   if (req.user && req.user.uid === targetId) return res.status(400).json({ message: '無法刪除自己' });
 
   const u = await one('select * from users where id=$1', [targetId]);
@@ -904,6 +919,7 @@ app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
 app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
   const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
   if (!ids.length) return res.status(400).json({ message: 'ids required' });
+  if (ids.some(id => !Number.isInteger(id))) return res.status(400).json({ message: 'bad user id in list' });
   if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
 
   const admins = await q(`select id from users where role='admin'`);

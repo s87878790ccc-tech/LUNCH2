@@ -119,7 +119,7 @@ const loadBySeatMsg = document.getElementById('loadBySeatMsg');
 
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
 let token = localStorage.getItem('jwt') || null;
-apiBaseHint.textContent = `API: ${API_BASE}`;
+if (apiBaseHint) apiBaseHint.textContent = `API: ${API_BASE}`;
 
 // 手機偵測 & 帳密正規化
 const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
@@ -416,7 +416,7 @@ async function safeRenderAdminReports(){
 }
 
 function onLoginUser(user){
-  state.me = user;
+  state.me = user; // 預期 { id, username, role }
   whoami.textContent = `${user.username}（${user.role}）`;
   const admin = isAdmin();
 
@@ -1012,8 +1012,13 @@ async function loadUsers(){
       const oldP = document.getElementById('selfOldPwd').value;
       const newP = document.getElementById('selfNewPwd').value;
       if (!newP || newP.length<6) return alert('新密碼至少 6 碼');
+
+      // ✅ 兼容 id/uid；仍拿不到則請使用者重新登入（避免 /users/undefined/password）
+      const uid = Number(state.me?.id ?? state.me?.uid);
+      if (!Number.isInteger(uid)) { alert('找不到使用者 ID，請重新登入後再試一次'); return; }
+
       try{
-        await resetPasswordSelf(state.me.id, oldP, newP);
+        await resetPasswordSelf(uid, oldP, newP);
         alert('已更新');
       }catch(e){
         alert('失敗：'+e.message);
@@ -1866,7 +1871,7 @@ async function initApp(){
   if (tab) tab.classList.toggle('hidden', !isAdmin() && !state.pre.settings.enabled);
 }
 
-// 自動登入驗證
+// 自動登入驗證（✅ /auth/me 現在統一回傳 { id, username, role }）
 (async function bootstrap(){
   renderStatic();
   if (!token) return showLogin();
