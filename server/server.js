@@ -184,6 +184,7 @@ async function ensureOrdersExtraColumns() {
 async function ensureMenuExtraColumns() {
   await pool.query(`alter table if exists menus add column if not exists note text`);
   await pool.query(`alter table if exists menu_items add column if not exists image_url text`);
+  await pool.query(`alter table if exists menu_items alter column price drop not null`);
 }
 
 async function ensurePreorderSchema() {
@@ -510,11 +511,17 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
 app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
   const { name, price, imageUrl } = req.body || {};
-  if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
+  if (!name) return res.status(400).json({ message: 'name required' });
+  let normalizedPrice = null;
+  if (price !== undefined && price !== null && price !== '') {
+    const parsed = Number(price);
+    if (!Number.isFinite(parsed) || parsed < 0) return res.status(400).json({ message: 'price must be >= 0' });
+    normalizedPrice = parsed;
+  }
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
     'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
-    [menuId, Number(max.c) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
+    [menuId, Number(max.c) + 1, name, normalizedPrice, imageUrl ? String(imageUrl) : null]
   );
   await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
   res.json({
@@ -528,7 +535,13 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
   const { name, price, imageUrl } = req.body || {};
-  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, Number(price), imageUrl ? String(imageUrl) : null, itemId]);
+  let normalizedPrice = null;
+  if (price !== undefined && price !== null && price !== '') {
+    const parsed = Number(price);
+    if (!Number.isFinite(parsed) || parsed < 0) return res.status(400).json({ message: 'price must be >= 0' });
+    normalizedPrice = parsed;
+  }
+  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, normalizedPrice, imageUrl ? String(imageUrl) : null, itemId]);
   await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl }, req);
   res.json({ ok: true });
 });

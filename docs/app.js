@@ -711,15 +711,24 @@ async function deleteMenuReq(id){
   if (state.activeMenuId===id) state.activeMenuId = state.menus[0]?.id ?? null;
 }
 async function addMenuItemReq(menuId, name, price, imageUrl=''){
-  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price, imageUrl })});
+  const payload = { name, imageUrl };
+  if (price !== undefined) payload.price = price;
+  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify(payload)});
   const m = state.menus.find(x=>x.id===menuId);
   if (m) m.items.push(it);
 }
 async function updateMenuItemReq(itemId, name, price, imageUrl=''){
-  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price, imageUrl })});
+  const payload = { name, imageUrl };
+  if (price !== undefined) payload.price = price;
+  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify(payload)});
   for (const m of state.menus) {
     const it = m.items.find(i=>i.id===itemId);
-    if (it) { it.name=name; it.price=Number(price); it.imageUrl=imageUrl; break; }
+    if (it) {
+      it.name = name;
+      it.price = price === null || price === undefined ? null : Number(price);
+      it.imageUrl = imageUrl;
+      break;
+    }
   }
 }
 async function deleteMenuItemReq(itemId){
@@ -766,12 +775,15 @@ function buildMenuPreview(menu, { compact=false } = {}){
     const safeCode = escapeHtml(String(it.code ?? ''));
     const codeLabel = safeCode ? `#${safeCode} ` : '';
     const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
+
+    const hasPrice = it.price !== null && it.price !== undefined && it.price !== '';
+    const priceHtml = hasPrice ? `<div class="menu-preview-price">$${fmt(it.price)}</div>` : '';
     return `
       <div class="menu-preview-item">
         ${imgHtml}
         <div class="menu-preview-text">
           <div class="menu-preview-name">${codeLabel}${safeName}</div>
-          <div class="menu-preview-price">$${fmt(it.price)}</div>
+          ${priceHtml}
         </div>
       </div>`;
   }).join('');
@@ -1184,7 +1196,8 @@ addByCode.addEventListener('click', async ()=>{
   const it = m.items.find(x=>x.code===code);
   if (!it) return alert('查無此代號');
   if (qty<=0) return alert('數量需 >= 1');
-  o.items.push({ name: it.name, unitPrice: it.price, qty });
+  const unitPrice = Number(it.price || 0);
+  o.items.push({ name: it.name, unitPrice, qty });
   await saveOrder(seat, o);
   codeInput.value=''; qtyInput.value='1';
   await renderSeatOrder();
@@ -1315,9 +1328,10 @@ refreshNewItemImageUI();
 addItem.addEventListener('click', async ()=>{
   const mId = Number(menuSelect.value);
   const name = itemName.value.trim();
-  const price = Number(itemPrice.value||0);
+  const rawPrice = itemPrice.value;
+  const price = rawPrice === '' ? null : Number(rawPrice);
   if (!name) return alert('請輸入品名');
-  if (price<0) return alert('價格需 >= 0');
+  if (price !== null && (!Number.isFinite(price) || price < 0)) return alert('價格需 >= 0');
   const imageUrl = newItemImageUrl || '';
   await addMenuItemReq(mId, name, price, imageUrl);
   itemName.value=''; itemPrice.value='';
@@ -1344,9 +1358,10 @@ menuTableBody?.addEventListener('change', async (e)=>{
   const priceInput = tr.querySelector('.priceEdit');
   const imageInput = tr.querySelector('.imageEdit');
   const name = nameInput?.value?.trim() || '';
-  const price = Number(priceInput?.value || 0);
+  const rawPrice = priceInput?.value ?? '';
+  const price = rawPrice === '' ? null : Number(rawPrice);
   if (!name) { alert('品名不可為空'); renderMenuPage(); return; }
-  if (!Number.isFinite(price) || price < 0) { alert('價格需 >= 0'); renderMenuPage(); return; }
+  if (price !== null && (!Number.isFinite(price) || price < 0)) { alert('價格需 >= 0'); renderMenuPage(); return; }
   const imageUrl = imageInput?.value?.trim() || '';
   try{
     await updateMenuItemReq(id, name, price, imageUrl);
@@ -1761,7 +1776,8 @@ async function preAddByCode(){
   const it = m.items.find(x=>x.code===code);
   if (!it) return alert('查無此代號');
   if (qty<=0) return alert('數量需 >= 1');
-  o.items.push({ name: it.name, unitPrice: it.price, qty });
+  const unitPrice = Number(it.price || 0);
+  o.items.push({ name: it.name, unitPrice, qty });
   await savePreorder(date, seat, o);
   document.getElementById('preCodeInput').value='';
   document.getElementById('preQtyInput').value='1';
