@@ -14,8 +14,52 @@ const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const JWT_SECRET = process.env.JWT_SECRET || 'change_me';
 const DATABASE_URL = process.env.DATABASE_URL;
+
+function ensureJwtSecret() {
+  const secret = process.env.JWT_SECRET ? String(process.env.JWT_SECRET) : '';
+  if (!secret || secret.length < 16 || secret === 'change_me') {
+    console.error('Missing or insecure JWT_SECRET (must be set and at least 16 characters).');
+    process.exit(1);
+  }
+  return secret;
+}
+
+function randomString(length, alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') {
+  const bytes = crypto.randomBytes(length * 2);
+  let output = '';
+  for (let i = 0; i < bytes.length && output.length < length; i++) {
+    output += alphabet[bytes[i] % alphabet.length];
+  }
+  if (output.length < length) {
+    // Fallback to recursion only if necessary (should be rare due to buffer sizing)
+    return output + randomString(length - output.length, alphabet);
+  }
+  return output;
+}
+
+function ensurePasswordFromEnv(key, { minLength, generator }) {
+  const raw = process.env[key];
+  if (raw && raw.length >= minLength) return { value: raw, generated: false, insecure: false };
+  if (raw && raw.length < minLength) {
+    console.warn(`[security] ${key} is shorter than the recommended minimum of ${minLength} characters.`);
+    return { value: raw, generated: false, insecure: true };
+  }
+  const generatedValue = generator();
+  console.warn(`[security] ${key} not set; generated ephemeral fallback for this process. Set ${key} to persist.`);
+  return { value: generatedValue, generated: true, insecure: false };
+}
+
+const JWT_SECRET = ensureJwtSecret();
+const ADMIN_DEFAULT_USER = process.env.ADMIN_DEFAULT_USER || 'admin';
+const ADMIN_PASS_CONFIG = ensurePasswordFromEnv('ADMIN_DEFAULT_PASS', {
+  minLength: 12,
+  generator: () => randomString(24),
+});
+const SEAT_PASS_CONFIG = ensurePasswordFromEnv('SEAT_DEFAULT_PASS', {
+  minLength: 6,
+  generator: () => randomString(8, '0123456789'),
+});
 
 // 允許的前端網域（GitHub Pages）
 const ALLOW_ORIGINS = [
@@ -270,9 +314,9 @@ async function ensurePreorderSchema() {
    bootstrap（seed）
    ========================= */
 async function seed() {
-  const adminName = process.env.ADMIN_DEFAULT_USER || 'admin';
-  const adminPass = process.env.ADMIN_DEFAULT_PASS || 'admin123';
-  const seatPass = process.env.SEAT_DEFAULT_PASS || '123456';
+  const adminName = ADMIN_DEFAULT_USER;
+  const adminPass = ADMIN_PASS_CONFIG.value;
+  const seatPass = SEAT_PASS_CONFIG.value;
 
   const u = await one('select * from users where username=$1', [adminName]);
   if (!u) {
@@ -283,18 +327,39 @@ async function seed() {
       [adminName, hash]
     );
     console.log('[seed] admin created:', adminName);
+    if (ADMIN_PASS_CONFIG.generated) {
+      console.warn(`[seed] Admin default password (auto-generated): ${adminPass}`);
+    }
+  } else {
+    console.log('[seed] admin exists:', adminName);
+    if (ADMIN_PASS_CONFIG.generated) {
+      console.warn('[seed] Admin user already existed; generated fallback password was not applied. Set ADMIN_DEFAULT_PASS to rotate manually.');
+    }
   }
 
   const hashSeat = await bcrypt.hash(seatPass, 10);
+  let createdSeats = 0;
   for (let s = 1; s <= 36; s++) {
-    await q(
+    const inserted = await one(
       `insert into users(username, password_hash, role, status, created_at, updated_at)
        values ($1,$2,'user','active',now(),now())
-       on conflict (username) do nothing`,
+       on conflict (username) do nothing
+       returning id`,
       [String(s), hashSeat]
     );
+    if (inserted) createdSeats++;
   }
-  console.log('[seed] seat users 1~36 ready (default pass = 123456)');
+  if (createdSeats > 0) {
+    console.log(`[seed] seat users 1~36 ready (default pass = ${seatPass})`);
+    if (SEAT_PASS_CONFIG.generated) {
+      console.warn('[seed] Seat default password auto-generated for this run. Set SEAT_DEFAULT_PASS to persist across restarts.');
+    }
+  } else {
+    console.log('[seed] seat users 1~36 already existed');
+    if (SEAT_PASS_CONFIG.generated) {
+      console.warn('[seed] Seat accounts already existed; generated fallback password was not applied. Set SEAT_DEFAULT_PASS to rotate if needed.');
+    }
+  }
 }
 
 /* =========================
@@ -652,13 +717,35 @@ app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
 });
 // 未付款清單（目前 orders 不分日期）
 app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
-  const os = await q('select * from orders where paid=false and submitted=true order by seat asc');
-  const list = [];
-  for (const o of os) {
-    const items = await q('select name, unit_price, qty from order_items where order_id=$1 order by id asc', [o.id]);
-    const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
-    list.push({ seat: o.seat, subtotal, items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })) });
+  const rows = await q(
+    `select o.seat, oi.name, oi.unit_price, oi.qty
+       from orders o
+       left join order_items oi on oi.order_id=o.id
+      where o.paid=false and o.submitted=true
+      order by o.seat asc, oi.id asc`
+  );
+  const map = new Map();
+  for (const row of rows) {
+    const seat = Number(row.seat);
+    if (!map.has(seat)) {
+      map.set(seat, { seat, subtotal: 0, items: [] });
+    }
+    if (row.name) {
+      const item = {
+        name: row.name,
+        unitPrice: Number(row.unit_price),
+        qty: Number(row.qty),
+      };
+      const entry = map.get(seat);
+      entry.items.push(item);
+      entry.subtotal += item.unitPrice * item.qty;
+    }
   }
+  const list = Array.from(map.values()).map(entry => ({
+    seat: entry.seat,
+    subtotal: entry.subtotal,
+    items: entry.items,
+  }));
   res.json({ list });
 });
 
@@ -682,17 +769,20 @@ function toDateOrNull(s){
   if (!m) return null;
   return `${m[1]}-${m[2]}-${m[3]}`; // 存 DB 用原字串，避免時區偏移
 }
-async function ensurePreorder(date, seat){
+async function ensurePreorder(date, seat, client = null) {
   const d = toDateOrNull(date);
   if (!d) throw new Error('bad date');
-  let o = await one('select * from preorders where d=$1 and seat=$2', [d, seat]);
+  const execOne = client ? (sql, params) => t_one(client, sql, params) : (sql, params) => one(sql, params);
+  const execQuery = client ? (sql, params) => client.query(sql, params) : (sql, params) => pool.query(sql, params);
+  let o = await execOne('select * from preorders where d=$1 and seat=$2', [d, seat]);
   if (!o) {
-    o = await one(
+    const inserted = await execQuery(
       `insert into preorders(d, seat, submitted, internal_only, paid, created_at, updated_at)
        values ($1,$2,false,false,false,now(),now())
        returning *`,
       [d, seat]
     );
+    o = inserted.rows[0];
   }
   return o;
 }
@@ -740,7 +830,7 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
 
     const { items = [], internalOnly = false } = req.body || {};
     await tx(async (c)=>{
-      const o = await ensurePreorder(date, seat);
+      const o = await ensurePreorder(date, seat, c);
       let finalItems = items;
       let flag = !!internalOnly;
       if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
@@ -783,13 +873,36 @@ app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
   try{
     const date = toDateOrNull(req.params.date);
     if (!date) return res.status(400).json({ message:'bad date' });
-    const os = await q('select * from preorders where d=$1 and paid=false and submitted=true order by seat asc', [date]);
-    const list = [];
-    for (const o of os) {
-      const items = await q('select name, unit_price, qty from preorder_items where preorder_id=$1 order by id asc', [o.id]);
-      const subtotal = items.reduce((s, it)=> s + Number(it.unit_price)*Number(it.qty), 0);
-      list.push({ seat: o.seat, subtotal, items: items.map(i=>({ name:i.name, unitPrice:i.unit_price, qty:i.qty })) });
+    const rows = await q(
+      `select p.seat, pi.name, pi.unit_price, pi.qty
+         from preorders p
+         left join preorder_items pi on pi.preorder_id=p.id
+        where p.d=$1 and p.paid=false and p.submitted=true
+        order by p.seat asc, pi.id asc`,
+      [date]
+    );
+    const map = new Map();
+    for (const row of rows) {
+      const seat = Number(row.seat);
+      if (!map.has(seat)) {
+        map.set(seat, { seat, subtotal: 0, items: [] });
+      }
+      if (row.name) {
+        const item = {
+          name: row.name,
+          unitPrice: Number(row.unit_price),
+          qty: Number(row.qty),
+        };
+        const entry = map.get(seat);
+        entry.items.push(item);
+        entry.subtotal += item.unitPrice * item.qty;
+      }
     }
+    const list = Array.from(map.values()).map(entry => ({
+      seat: entry.seat,
+      subtotal: entry.subtotal,
+      items: entry.items,
+    }));
     res.json({ list });
   }catch(e){
     res.status(500).json({ message:String(e.message||e) });
