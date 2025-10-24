@@ -978,7 +978,9 @@ async function fetchAllUsers() {
   return all;
 }
 async function createUser(username, password, role){
-  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
+  const payload = { password, role };
+  if (typeof username === 'string' && username.trim()) payload.username = username.trim();
+  return api('/users', { method:'POST', body: JSON.stringify(payload)});
 }
 async function resetPasswordAdmin(userId, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
@@ -1054,21 +1056,34 @@ async function loadUsers(){
         </tr>
       `;
     }).join('');
+
+    if (newUserName) {
+      const numericNames = users
+        .map(u => Number(u.username))
+        .filter(n => Number.isInteger(n) && n >= 0);
+      const nextSeat = numericNames.length > 0 ? Math.max(...numericNames) + 1 : 1;
+      if (document.activeElement !== newUserName) {
+        newUserName.value = String(nextSeat);
+      }
+      newUserName.placeholder = `帳號（預設 ${nextSeat}）`;
+    }
   }catch(e){
     usersTableBody.innerHTML = `<tr><td colspan="${headCols}">失敗：${e.message}</td></tr>`;
   }
 }
 
 createUserBtn?.addEventListener('click', async ()=>{
-  const username = newUserName.value.trim();
+  const username = (newUserName?.value || '').trim();
   const password = newUserPass.value;
   const role     = newUserRole.value;
-  if (!username || !password || password.length<6) return alert('請填帳號與密碼(>=6)');
+  if (!password || password.length<6) return alert('請填密碼(>=6)');
   try{
-    await createUser(username, password, role);
-    newUserName.value=''; newUserPass.value='';
+    const data = await createUser(username, password, role);
+    newUserPass.value='';
+    if (newUserName && document.activeElement === newUserName) newUserName.blur();
     await loadUsers();
-    alert('已建立');
+    const createdUsername = data?.username || (username || '');
+    alert(`已建立${createdUsername ? `（帳號：${createdUsername}）` : ''}`);
   }catch(e){ alert('建立失敗：'+e.message); }
 });
 usersTableBody.addEventListener('click', async (e)=>{

@@ -15,6 +15,7 @@ const multer = require('multer');
 const app = express();
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
+const PG_UNIQUE_VIOLATION = '23505';
 
 function ensureJwtSecret() {
   const secret = process.env.JWT_SECRET ? String(process.env.JWT_SECRET) : '';
@@ -914,19 +915,55 @@ app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
    ========================= */
 app.post('/api/users', auth(), requireAdmin, async (req, res) => {
   const { username, password, role } = req.body || {};
-  if (!username || !password) return res.status(400).json({ message: 'username/password required' });
+  if (!password) return res.status(400).json({ message: 'password required' });
   const r = (role === 'admin' || role === 'user') ? role : 'user';
-  const exist = await one('select 1 from users where username=$1', [username]);
-  if (exist) return res.status(409).json({ message: 'username already exists' });
+  const normalizedUsername = typeof username === 'string' ? username.trim() : '';
   const hash = await bcrypt.hash(password, 10);
-  const row = await one(
-    `insert into users(username, password_hash, role, status, created_at, updated_at)
-     values ($1,$2,$3,'active',now(),now())
-     returning id, username, role, status`,
-    [username, hash, r]
-  );
-  await logAction(req.user, 'user.create', { id: row.id, username, role: r }, req);
-  res.json(row);
+
+  async function insertWithAutoUsername() {
+    while (true) {
+      try {
+        const row = await one(
+          `with next_username as (
+             select coalesce(max(case when username ~ '^[0-9]+$' then username::int end), 0) + 1 as next
+             from users
+           )
+           insert into users(username, password_hash, role, status, created_at, updated_at)
+           select (next_username.next)::text, $1, $2, 'active', now(), now()
+             from next_username
+           returning id, username, role, status`,
+          [hash, r]
+        );
+        return row;
+      } catch (err) {
+        if (err && err.code === PG_UNIQUE_VIOLATION) continue;
+        throw err;
+      }
+    }
+  }
+
+  try {
+    let row;
+    if (normalizedUsername) {
+      const exist = await one('select 1 from users where username=$1', [normalizedUsername]);
+      if (exist) return res.status(409).json({ message: 'username already exists' });
+      row = await one(
+        `insert into users(username, password_hash, role, status, created_at, updated_at)
+         values ($1,$2,$3,'active',now(),now())
+         returning id, username, role, status`,
+        [normalizedUsername, hash, r]
+      );
+    } else {
+      row = await insertWithAutoUsername();
+    }
+    await logAction(req.user, 'user.create', { id: row.id, username: row.username, role: row.role }, req);
+    res.json(row);
+  } catch (err) {
+    if (err && err.code === PG_UNIQUE_VIOLATION) {
+      return res.status(409).json({ message: 'username already exists' });
+    }
+    res.status(500).json({ message: String(err.message || err) });
+  }
 });
 app.get('/api/users', auth(), requireAdmin, async (req, res) => {
   const qkw = (req.query.q || '').trim();
