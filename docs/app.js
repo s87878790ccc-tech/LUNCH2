@@ -7,6 +7,7 @@ const API_BASE = 'https://lunch2.onrender.com/api';
 const app = document.getElementById('app');
 const loginLayer = document.getElementById('loginLayer');
 function initLoginLayerStyles() {
+  if (!loginLayer) return;
   Object.assign(loginLayer.style, {
     position: 'fixed',
     inset: '0',
@@ -150,6 +151,15 @@ function noteToHtml(note=''){
   return escapeHtml(note).replace(/\r?\n/g,'<br>');
 }
 
+function safeText(value) {
+  return escapeHtml(value == null ? '' : String(value));
+}
+
+function safeNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function buildImageThumb(url='', alt=''){
   const safeUrl = escapeHtml(url || '');
   const safeAlt = escapeHtml(alt || '');
@@ -285,23 +295,34 @@ function authHeader() {
 }
 function showLogin(options = {}) {
   const { keepLoading = false } = options;
+  if (!loginLayer || !app) return;
   setLoginLoading(!!keepLoading);
   loginLayer.classList.remove('hidden');
   loginLayer.style.display = 'flex';
   loginLayer.style.pointerEvents = 'auto';
+  loginLayer.setAttribute('aria-hidden', 'false');
   app.classList.add('hidden');
   app.style.filter = 'none';
+  app.setAttribute('aria-hidden', 'true');
+  if (!keepLoading && loginUser) {
+    requestAnimationFrame(() => loginUser.focus());
+  }
 }
 function showApp() {
+  if (!loginLayer || !app) return;
   loginLayer.classList.add('hidden');
   loginLayer.style.display = 'none';
   loginLayer.style.pointerEvents = 'none';
+  loginLayer.setAttribute('aria-hidden', 'true');
   app.classList.remove('hidden');
   app.style.filter = 'none';
+  app.setAttribute('aria-hidden', 'false');
 }
 function setLoginLoading(isLoading){
   if (!loginLoading) return;
   loginLoading.classList.toggle('hidden', !isLoading);
+  loginLoading.setAttribute('aria-hidden', String(!isLoading));
+  loginLoading.setAttribute('aria-busy', String(!!isLoading));
   [loginUser, loginPass, loginBtn].forEach((el)=>{
     if (el) el.disabled = !!isLoading;
   });
@@ -348,26 +369,51 @@ logoutBtn.onclick = () => {
 /* =========================
    API helper
    ========================= */
-async function api(path, options = {}) {
-  const res = await fetch(API_BASE + path, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) }
-  });
-  const raw = await res.text();
-  const ct = res.headers.get('content-type') || '';
-  let data = null;
-  if (ct.includes('application/json') && raw) { try { data = JSON.parse(raw); } catch {} }
+const pendingFetches = new Map();
 
-  if (res.status === 401) {
-    localStorage.removeItem('jwt'); token = null;
-    showLogin();
-    throw new Error(data?.message || 'unauthorized');
+async function api(path, options = {}) {
+  const method = (options.method || 'GET').toUpperCase();
+  const dedupeKey = method === 'GET' && options.dedupe !== false ? `${method}:${path}` : null;
+  if (dedupeKey && pendingFetches.has(dedupeKey)) {
+    return pendingFetches.get(dedupeKey);
   }
-  if (!res.ok) {
-    const msg = data?.message || raw || `${res.status} ${res.statusText}`;
-    throw new Error(msg);
+
+  const exec = (async () => {
+    let fetchOptions = { ...options, method };
+    const headers = { 'Content-Type': 'application/json', ...authHeader(), ...(options.headers || {}) };
+    // Avoid setting Content-Type when uploading FormData
+    if (options.body instanceof FormData) {
+      delete headers['Content-Type'];
+    }
+    fetchOptions = { ...fetchOptions, headers };
+
+    const res = await fetch(API_BASE + path, fetchOptions);
+    const raw = await res.text();
+    const ct = (res.headers.get('content-type') || '').split(';')[0].trim();
+    let data = null;
+    if (ct === 'application/json' && raw) {
+      try { data = JSON.parse(raw); } catch {}
+    }
+
+    if (res.status === 401) {
+      localStorage.removeItem('jwt'); token = null;
+      showLogin();
+      throw new Error(data?.message || 'unauthorized');
+    }
+    if (!res.ok) {
+      const msg = data?.message || raw || `${res.status} ${res.statusText}`;
+      throw new Error(msg);
+    }
+    return data ?? raw;
+  })();
+
+  if (!dedupeKey) return exec;
+  pendingFetches.set(dedupeKey, exec);
+  try {
+    return await exec;
+  } finally {
+    pendingFetches.delete(dedupeKey);
   }
-  return data ?? raw;
 }
 
 async function uploadImageFile(file){
@@ -483,10 +529,14 @@ function renderOpenBanner(data){
   closedBanner.classList.toggle('hidden', !show);
   if (show && data){
     const nowStr = data.nowLocal || new Date(data.nowISO || Date.now()).toLocaleString('zh-TW',{hour12:false});
-    closedBanner.innerHTML = `
-      <strong>目前不在點餐時段</strong>
-      <div class="small">開放時段：週${(data.openDays||[]).join('、')}，${data.openStart}~${data.openEnd}（現在：${nowStr}）</div>
-    `;
+    closedBanner.replaceChildren();
+    const title = document.createElement('strong');
+    title.textContent = '目前不在點餐時段';
+    const info = document.createElement('div');
+    info.className = 'small';
+    info.textContent = `開放時段：週${(data.openDays||[]).join('、')}，${data.openStart}~${data.openEnd}（現在：${nowStr}）`;
+    closedBanner.appendChild(title);
+    closedBanner.appendChild(info);
   }
 }
 function guardOpenWindow(){
@@ -556,20 +606,42 @@ async function loadBySeatReport(){
       subtotal: calcSubtotal(o.items||[]),
       items: o.items||[]
     }));
-    bySeatTBody.innerHTML = state.bySeatData.map(r=>{
-      const detail = r.items.length
-        ? r.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
-        : '<span class="muted small">—</span>';
-      return `<tr>
-        <td>${r.seat}</td>
-        <td>${seatStatusText(r)}</td>
-        <td>${r.subtotal.toLocaleString('zh-Hant-TW')}</td>
-        <td>${detail}</td>
-      </tr>`;
-    }).join('');
+    bySeatTBody.replaceChildren();
+    const frag = document.createDocumentFragment();
+    state.bySeatData.forEach(r => {
+      const tr = document.createElement('tr');
+
+      const seatTd = document.createElement('td');
+      seatTd.textContent = String(r.seat);
+      tr.appendChild(seatTd);
+
+      const statusTd = document.createElement('td');
+      statusTd.textContent = seatStatusText(r);
+      tr.appendChild(statusTd);
+
+      const subtotalTd = document.createElement('td');
+      subtotalTd.textContent = r.subtotal.toLocaleString('zh-Hant-TW');
+      tr.appendChild(subtotalTd);
+
+      const detailTd = document.createElement('td');
+      if (r.items.length) {
+        detailTd.textContent = r.items
+          .map(it => `${it.name}×${safeNumber(it.qty)}（$${fmt(it.unitPrice)}）`)
+          .join('，');
+      } else {
+        const span = document.createElement('span');
+        span.className = 'muted small';
+        span.textContent = '—';
+        detailTd.appendChild(span);
+      }
+      tr.appendChild(detailTd);
+
+      frag.appendChild(tr);
+    });
+    bySeatTBody.appendChild(frag);
     loadBySeatMsg.textContent = `完成（共 ${state.bySeatData.filter(x=>x.subtotal>0).length} 人有填單）`;
   }catch(e){
-    bySeatTBody.innerHTML = `<tr><td colspan="4">讀取失敗：${e.message}</td></tr>`;
+    bySeatTBody.innerHTML = `<tr><td colspan="4">讀取失敗：${safeText(e.message)}</td></tr>`;
     loadBySeatMsg.textContent = '讀取失敗';
   }
 }
@@ -582,12 +654,13 @@ function seatCardHTML(o){
   const subtotal = calcSubtotal(o.items||[]);
   const done = (o.items && o.items.length>0);
   const detail = o.items.length
-    ? o.items.map(it=>`${it.name}×${it.qty}（$${it.unitPrice}）`).join('，')
+    ? o.items.map(it=>`${safeText(it.name)}×${safeNumber(it.qty)}（$${fmt(it.unitPrice)}）`).join('，')
     : '<span class="muted small">—</span>';
+  const seatNum = safeNumber(o.seat);
   return `
-  <div class="seat-card" id="seat-card-${o.seat}">
+  <div class="seat-card" id="seat-card-${seatNum}">
     <div class="hdr">
-      <strong>座號 ${o.seat}</strong>
+      <strong>座號 ${seatNum}</strong>
       <span class="badge ${done?'ok':'pending'}">${done?'完成':'未完成'}</span>
     </div>
     <div class="items">${detail}</div>
@@ -598,11 +671,11 @@ function seatCardHTML(o){
     </div>
     <div class="seat-actions">
       <label class="small">
-        <input type="checkbox" class="seat-internal" data-seat="${o.seat}" ${o.internalOnly?'checked':''}/>
+        <input type="checkbox" class="seat-internal" data-seat="${seatNum}" ${o.internalOnly?'checked':''}/>
         內訂
       </label>
-      <button class="seat-edit" data-seat="${o.seat}">編輯</button>
-      <button class="danger seat-clear" data-seat="${o.seat}">清空</button>
+      <button class="seat-edit" data-seat="${seatNum}">編輯</button>
+      <button class="danger seat-clear" data-seat="${seatNum}">清空</button>
     </div>
   </div>`;
 }
@@ -893,23 +966,56 @@ async function renderSeatOrder(){
   manualQty.disabled = lock;
   addManual.disabled = lock;
 
-  orderTableBody.innerHTML = '';
   let subtotal = 0;
+  const frag = document.createDocumentFragment();
   o.items.forEach((it,idx)=>{
-    const line = it.unitPrice * it.qty; subtotal += line;
+    const qty = safeNumber(it.qty, 1);
+    const unitPrice = safeNumber(it.unitPrice, 0);
+    const line = unitPrice * qty;
+    subtotal += line;
+
     const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${idx+1}</td>
-      <td>${it.name}</td>
-      <td>${fmt(it.unitPrice)}</td>
-      <td>
-        <input type="number" min="1" value="${it.qty}"
-               class="qtyInput w120" data-idx="${idx}" ${lock?'disabled':''}/>
-      </td>
-      <td>${fmt(line)}</td>
-      <td>${lock ? '' : `<button class="danger delBtn" data-idx="${idx}">刪除</button>`}</td>`;
-    orderTableBody.appendChild(tr);
+
+    const idxTd = document.createElement('td');
+    idxTd.textContent = String(idx + 1);
+    tr.appendChild(idxTd);
+
+    const nameTd = document.createElement('td');
+    nameTd.textContent = it.name;
+    tr.appendChild(nameTd);
+
+    const priceTd = document.createElement('td');
+    priceTd.textContent = fmt(unitPrice);
+    tr.appendChild(priceTd);
+
+    const qtyTd = document.createElement('td');
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.value = String(qty);
+    input.className = 'qtyInput w120';
+    input.dataset.idx = String(idx);
+    if (lock) input.disabled = true;
+    qtyTd.appendChild(input);
+    tr.appendChild(qtyTd);
+
+    const subtotalTd = document.createElement('td');
+    subtotalTd.textContent = fmt(line);
+    tr.appendChild(subtotalTd);
+
+    const actionTd = document.createElement('td');
+    if (!lock) {
+      const btn = document.createElement('button');
+      btn.className = 'danger delBtn';
+      btn.dataset.idx = String(idx);
+      btn.textContent = '刪除';
+      actionTd.appendChild(btn);
+    }
+    tr.appendChild(actionTd);
+
+    frag.appendChild(tr);
   });
+  orderTableBody.replaceChildren(frag);
   seatSubtotal.textContent = fmt(subtotal);
   if (typeof toggleSubmitted !== 'undefined' && toggleSubmitted) {
     toggleSubmitted.textContent = o.submitted ? '設為未完成' : '標記完成';
@@ -931,8 +1037,26 @@ async function renderSeatOrder(){
 }
 async function renderAgg(){
   const data = await getAggregate();
-  aggTableBody.innerHTML = data.items.map(r=>
-    `<tr><td>${r.name}</td><td>${fmt(r.totalQty)}</td><td>${fmt(r.totalMoney)}</td></tr>`).join('');
+  aggTableBody.replaceChildren();
+  const frag = document.createDocumentFragment();
+  data.items.forEach(r => {
+    const tr = document.createElement('tr');
+
+    const nameTd = document.createElement('td');
+    nameTd.textContent = r.name;
+    tr.appendChild(nameTd);
+
+    const qtyTd = document.createElement('td');
+    qtyTd.textContent = fmt(r.totalQty);
+    tr.appendChild(qtyTd);
+
+    const moneyTd = document.createElement('td');
+    moneyTd.textContent = fmt(r.totalMoney);
+    tr.appendChild(moneyTd);
+
+    frag.appendChild(tr);
+  });
+  aggTableBody.appendChild(frag);
   classTotalEl.textContent = fmt(data.classTotal);
 }
 async function renderMissing(){
@@ -948,23 +1072,55 @@ async function renderLogs(){
   logsTableBody.innerHTML = '<tr><td colspan="7">載入中…</td></tr>';
   try{
     const data = await getLogs();
-    logsTableBody.innerHTML = data.logs.map(l=>{
-      let details = l.details;
-      try{ if(details) details = JSON.stringify(JSON.parse(details), null, 2) }catch{}
+    logsTableBody.replaceChildren();
+    const frag = document.createDocumentFragment();
+    const logs = Array.isArray(data.logs) ? data.logs : [];
+    logs.forEach(l => {
+      const tr = document.createElement('tr');
+
+      const idTd = document.createElement('td');
+      idTd.textContent = l.id == null ? '' : String(l.id);
+      tr.appendChild(idTd);
+
       const ts = l.ts ? new Date(l.ts) : null;
-      const tsStr = ts ? ts.toLocaleString('zh-TW',{hour12:false}) : '';
-      return `<tr>
-        <td>${l.id}</td>
-        <td>${tsStr}</td>
-        <td>${l.user_id ?? ''}</td>
-        <td>${l.action}</td>
-        <td><pre style="white-space:pre-wrap;margin:0">${details||''}</pre></td>
-        <td>${l.ip||''}</td>
-        <td class="small muted">${(l.ua||'').slice(0,80)}</td>
-      </tr>`;
-    }).join('');
+      const tsTd = document.createElement('td');
+      tsTd.textContent = ts ? ts.toLocaleString('zh-TW',{hour12:false}) : '';
+      tr.appendChild(tsTd);
+
+      const userTd = document.createElement('td');
+      userTd.textContent = l.user_id == null ? '' : String(l.user_id);
+      tr.appendChild(userTd);
+
+      const actionTd = document.createElement('td');
+      actionTd.textContent = l.action || '';
+      tr.appendChild(actionTd);
+
+      const detailsTd = document.createElement('td');
+      const pre = document.createElement('pre');
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.style.margin = '0';
+      let details = l.details;
+      try {
+        if (details) details = JSON.stringify(JSON.parse(details), null, 2);
+      } catch {}
+      pre.textContent = details || '';
+      detailsTd.appendChild(pre);
+      tr.appendChild(detailsTd);
+
+      const ipTd = document.createElement('td');
+      ipTd.textContent = l.ip || '';
+      tr.appendChild(ipTd);
+
+      const uaTd = document.createElement('td');
+      uaTd.className = 'small muted';
+      uaTd.textContent = (l.ua || '').slice(0,80);
+      tr.appendChild(uaTd);
+
+      frag.appendChild(tr);
+    });
+    logsTableBody.appendChild(frag);
   }catch(e){
-    logsTableBody.innerHTML = `<tr><td colspan="7">讀取失敗：${e.message}</td></tr>`;
+    logsTableBody.innerHTML = `<tr><td colspan="7">讀取失敗：${safeText(e.message)}</td></tr>`;
   }
 }
 async function getLogs(){ return api('/logs'); }
@@ -1048,28 +1204,68 @@ async function loadUsers(){
 
     // 顯示總筆數
     const title = document.querySelector('#pageUsers h3');
-    if (title) title.innerHTML = `使用者列表 <span class="small muted">（共 ${users.length} 筆）</span>`;
+    if (title) {
+      title.textContent = '使用者列表 ';
+      const span = document.createElement('span');
+      span.className = 'small muted';
+      span.textContent = `（共 ${users.length} 筆）`;
+      title.appendChild(span);
+    }
 
-    // 仍維持 4 欄：ID / 帳號 / 角色 / 動作(重設+刪除)
-    usersTableBody.innerHTML = users.map(u=>{
-      const disableSelf = (u.id === state.me.id);
-      return `
-        <tr>
-          <td>${u.id}</td>
-          <td>${u.username}</td>
-          <td>${u.role}</td>
-          <td>
-            <div class="row" style="gap:6px;flex-wrap:wrap;align-items:center">
-              <input type="password" placeholder="新密碼(>=6)" id="reset_${u.id}" />
-              <button class="resetPwd" data-id="${u.id}">重設</button>
-              <button class="danger delUser" data-id="${u.id}" ${disableSelf ? 'disabled title="不可刪除自己"' : ''}>刪除</button>
-            </div>
-          </td>
-        </tr>
-      `;
-    }).join('');
+    usersTableBody.replaceChildren();
+    const frag = document.createDocumentFragment();
+    users.forEach(u => {
+      const tr = document.createElement('tr');
+
+      const idTd = document.createElement('td');
+      idTd.textContent = String(u.id);
+      tr.appendChild(idTd);
+
+      const usernameTd = document.createElement('td');
+      usernameTd.textContent = u.username;
+      tr.appendChild(usernameTd);
+
+      const roleTd = document.createElement('td');
+      roleTd.textContent = u.role;
+      tr.appendChild(roleTd);
+
+      const actionTd = document.createElement('td');
+      const rowDiv = document.createElement('div');
+      rowDiv.className = 'row';
+      rowDiv.style.gap = '6px';
+      rowDiv.style.flexWrap = 'wrap';
+      rowDiv.style.alignItems = 'center';
+
+      const input = document.createElement('input');
+      input.type = 'password';
+      input.placeholder = '新密碼(>=6)';
+      input.id = `reset_${u.id}`;
+      rowDiv.appendChild(input);
+
+      const resetBtn = document.createElement('button');
+      resetBtn.className = 'resetPwd';
+      resetBtn.dataset.id = String(u.id);
+      resetBtn.textContent = '重設';
+      rowDiv.appendChild(resetBtn);
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'danger delUser';
+      delBtn.dataset.id = String(u.id);
+      delBtn.textContent = '刪除';
+      if (u.id === state.me.id) {
+        delBtn.disabled = true;
+        delBtn.title = '不可刪除自己';
+      }
+      rowDiv.appendChild(delBtn);
+
+      actionTd.appendChild(rowDiv);
+      tr.appendChild(actionTd);
+
+      frag.appendChild(tr);
+    });
+    usersTableBody.appendChild(frag);
   }catch(e){
-    usersTableBody.innerHTML = `<tr><td colspan="${headCols}">失敗：${e.message}</td></tr>`;
+    usersTableBody.innerHTML = `<tr><td colspan="${headCols}">失敗：${safeText(e.message)}</td></tr>`;
   }
 }
 
@@ -1566,18 +1762,32 @@ function ensureUnpaidUI(){
 function renderUnpaidOrdersList(arr){
   const wrap = document.getElementById('unpaidOrdersList');
   if (!arr.length) { wrap.innerHTML = '<div class="muted">（無）</div>'; return; }
-  wrap.innerHTML = arr.map(r=>{
-    const items = r.items.map(i=>`${i.name}×${i.qty}( \$${i.unitPrice} )`).join('，');
-    return `<div>座號 ${r.seat}：$${fmt(r.subtotal)} — ${items}</div>`;
-  }).join('');
+  wrap.replaceChildren();
+  const frag = document.createDocumentFragment();
+  arr.forEach(r => {
+    const div = document.createElement('div');
+    const seat = safeNumber(r.seat);
+    const subtotal = fmt(r.subtotal);
+    const items = (r.items || []).map(i => `${i.name}×${safeNumber(i.qty)}( $${fmt(i.unitPrice)} )`).join('，');
+    div.textContent = `座號 ${seat}：$${subtotal} — ${items}`;
+    frag.appendChild(div);
+  });
+  wrap.appendChild(frag);
 }
 function renderUnpaidPreList(arr){
   const wrap = document.getElementById('unpaidPreList');
   if (!arr.length) { wrap.innerHTML = '<div class="muted">（無）</div>'; return; }
-  wrap.innerHTML = arr.map(r=>{
-    const items = r.items.map(i=>`${i.name}×${i.qty}( \$${i.unitPrice} )`).join('，');
-    return `<div>座號 ${r.seat}：$${fmt(r.subtotal)} — ${items}</div>`;
-  }).join('');
+  wrap.replaceChildren();
+  const frag = document.createDocumentFragment();
+  arr.forEach(r => {
+    const div = document.createElement('div');
+    const seat = safeNumber(r.seat);
+    const subtotal = fmt(r.subtotal);
+    const items = (r.items || []).map(i => `${i.name}×${safeNumber(i.qty)}( $${fmt(i.unitPrice)} )`).join('，');
+    div.textContent = `座號 ${seat}：$${subtotal} — ${items}`;
+    frag.appendChild(div);
+  });
+  wrap.appendChild(frag);
 }
 async function renderUnpaidOrders(){
   if (!isAdmin()) return;
@@ -1586,7 +1796,7 @@ async function renderUnpaidOrders(){
     state.unpaidOrders = data.list || [];
     renderUnpaidOrdersList(state.unpaidOrders);
   }catch(e){
-    document.getElementById('unpaidOrdersList').innerHTML = `<div class="muted">讀取失敗：${e.message}</div>`;
+    document.getElementById('unpaidOrdersList').innerHTML = `<div class="muted">讀取失敗：${safeText(e.message)}</div>`;
   }
 }
 async function renderUnpaidPreorders(){
@@ -1598,7 +1808,7 @@ async function renderUnpaidPreorders(){
     state.unpaidPreorders = data.list || [];
     renderUnpaidPreList(state.unpaidPreorders);
   }catch(e){
-    document.getElementById('unpaidPreList').innerHTML = `<div class="muted">讀取失敗：${e.message}</div>`;
+    document.getElementById('unpaidPreList').innerHTML = `<div class="muted">讀取失敗：${safeText(e.message)}</div>`;
   }
 }
 
@@ -1677,16 +1887,21 @@ function drawPreDatesChips(){
   const wrap = document.getElementById('preDatesWrap');
   const arr = state.pre.settings.dates || [];
   if (!arr.length) { wrap.innerHTML = '<div class="muted small">（尚未加入）</div>'; return; }
-  wrap.innerHTML = arr.map(d=>`
-    <span class="pill pre-date-chip" data-date="${d}" title="點擊移除">${d} ✕</span>
-  `).join(' ');
-  wrap.querySelectorAll('.pre-date-chip').forEach(ch=>{
-    ch.addEventListener('click', ()=>{
-      const d = ch.dataset.date;
+  wrap.replaceChildren();
+  const frag = document.createDocumentFragment();
+  arr.forEach(d => {
+    const chip = document.createElement('span');
+    chip.className = 'pill pre-date-chip';
+    chip.dataset.date = d;
+    chip.title = '點擊移除';
+    chip.textContent = `${d} ✕`;
+    chip.addEventListener('click', ()=>{
       state.pre.settings.dates = state.pre.settings.dates.filter(x=>x!==d);
       drawPreDatesChips();
     });
+    frag.appendChild(chip);
   });
+  wrap.appendChild(frag);
 }
 
 // 讀寫預訂

@@ -13,6 +13,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 
 const app = express();
+app.disable('x-powered-by');
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
 
@@ -78,8 +79,11 @@ if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024);
-const allowedImageTypes = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp']);
+const MAX_UPLOAD_ENV = Number(process.env.MAX_UPLOAD_BYTES);
+const MAX_UPLOAD_BYTES = Number.isFinite(MAX_UPLOAD_ENV) && MAX_UPLOAD_ENV > 0
+  ? MAX_UPLOAD_ENV
+  : 2 * 1024 * 1024;
+const allowedImageTypes = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'].map(t => t.toLowerCase()));
 
 const uploadStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
@@ -98,7 +102,8 @@ const imageUpload = multer({
   storage: uploadStorage,
   limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (_req, file, cb) => {
-    if (allowedImageTypes.has(file.mimetype)) return cb(null, true);
+    const type = (file.mimetype || '').toLowerCase();
+    if (allowedImageTypes.has(type)) return cb(null, true);
     cb(new Error('僅接受 PNG/JPG/GIF/WebP 圖片')); // handled in route
   },
 }).single('image');
@@ -106,8 +111,73 @@ const imageUpload = multer({
 /* =========================
    Security / Middleware
    ========================= */
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+
+function enforcePlainObjectBody(req, res, next) {
+  const method = (req.method || 'GET').toUpperCase();
+  if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return next();
+  if (req.body === undefined || req.body === null) return next();
+  if (typeof req.body === 'object' && !Array.isArray(req.body)) return next();
+  return res.status(400).json({ message: 'invalid payload type' });
+}
+app.use(enforcePlainObjectBody);
+
+const globalLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 200,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+});
+app.use(globalLimiter);
+
+function getBody(req) {
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return {};
+  return req.body;
+}
+
+const USERNAME_MAX_LEN = 64;
+const PASSWORD_MAX_LEN = 256;
+
+function normalizeUsernameInput(value = '') {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/\u3000/g, ' ')
+    .replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFF10 + 48))
+    .trim();
+}
+
+function normalizePasswordInput(value = '') {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\u3000/g, ' ').trim();
+}
+
+const loginLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { message: 'too many login attempts, please try again shortly' },
+});
+
+function normalizeTimeString(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return /^([01]\d|2[0-3]):([0-5]\d)$/.test(trimmed) ? trimmed : fallback;
+}
+
+function normalizeOpenDays(value) {
+  if (!Array.isArray(value)) return ['1', '2', '3', '4', '5'];
+  const cleaned = value
+    .map(v => String(v).trim())
+    .filter(v => /^([0-6])$/.test(v));
+  return cleaned.length ? cleaned : ['1', '2', '3', '4', '5'];
+}
 
 // CORS（單一乾淨版本，含預檢）
 const corsOptions = {
@@ -127,9 +197,6 @@ app.options('*', cors(corsOptions));
 // logging
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
 app.use(morgan('dev'));
-
-// rate limit
-app.use(rateLimit({ windowMs: 60_000, max: 200 }));
 
 app.use('/uploads', express.static(UPLOAD_DIR, {
   setHeaders(res) {
@@ -478,9 +545,14 @@ app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
 });
 
 // Auth
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body || {};
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const body = getBody(req);
+  const username = normalizeUsernameInput(body.username);
+  const password = normalizePasswordInput(body.password);
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
+  if (username.length > USERNAME_MAX_LEN || password.length > PASSWORD_MAX_LEN) {
+    return res.status(400).json({ message: 'username/password too long' });
+  }
 
   const u = await one('select * from users where username=$1', [username]);
   if (!u) return res.status(401).json({ message: 'invalid credentials' });
@@ -513,10 +585,12 @@ app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
   });
 });
 app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
-  const { openDays, openStart, openEnd } = req.body || {};
-  const days = Array.isArray(openDays) ? openDays : ['1','2','3','4','5'];
-  await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, openStart || '07:00', openEnd || '12:00']);
-  await logAction(req.user, 'settings.openWindow', { openDays: days, openStart, openEnd }, req);
+  const body = getBody(req);
+  const days = normalizeOpenDays(body.openDays);
+  const start = normalizeTimeString(body.openStart, '07:00');
+  const end = normalizeTimeString(body.openEnd, '12:00');
+  await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, start, end]);
+  await logAction(req.user, 'settings.openWindow', { openDays: days, openStart: start, openEnd: end }, req);
   res.json({ ok: true });
 });
 
@@ -553,16 +627,23 @@ app.get('/api/menus', auth(false), async (req, res) => {
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
 app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
-  const { name, note } = req.body || {};
-  if (!name) return res.status(400).json({ message: 'name required' });
-  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note ?? null]);
+  const body = getBody(req);
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 128) return res.status(400).json({ message: 'name required' });
+  const noteRaw = typeof body.note === 'string' ? body.note.trim() : '';
+  const note = noteRaw ? noteRaw.slice(0, 2000) : null;
+  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note]);
   await logAction(req.user, 'menu.create', { id: row.id, name, note }, req);
   res.json({ id: row.id, name: row.name, note: row.note || '', items: [] });
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
-  await q('update menus set name=$1, note=$2 where id=$3', [req.body?.name, req.body?.note ?? null, id]);
-  await logAction(req.user, 'menu.update', { id, name: req.body?.name, note: req.body?.note }, req);
+  const body = getBody(req);
+  const name = typeof body.name === 'string' ? body.name.trim() : null;
+  const noteRaw = typeof body.note === 'string' ? body.note.trim() : null;
+  const note = noteRaw ? noteRaw.slice(0, 2000) : null;
+  await q('update menus set name=$1, note=$2 where id=$3', [name ?? null, note, id]);
+  await logAction(req.user, 'menu.update', { id, name, note }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
@@ -578,14 +659,17 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
 });
 app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const menuId = Number(req.params.id);
-  const { name, price, imageUrl } = req.body || {};
-  if (!name || price == null) return res.status(400).json({ message: 'name/price required' });
+  const body = getBody(req);
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const price = Number(body.price);
+  const imageUrlRaw = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
+  if (!name || name.length > 128 || Number.isNaN(price)) return res.status(400).json({ message: 'name/price required' });
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
     'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
-    [menuId, Number(max?.c || 0) + 1, name, Number(price), imageUrl ? String(imageUrl) : null]
+    [menuId, Number(max?.c || 0) + 1, name, price, imageUrlRaw ? imageUrlRaw : null]
   );
-  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl }, req);
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl: imageUrlRaw }, req);
   res.json({
     id: row.id,
     code: row.code,
@@ -596,9 +680,13 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
 });
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const { name, price, imageUrl } = req.body || {};
-  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name, Number(price), imageUrl ? String(imageUrl) : null, itemId]);
-  await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl }, req);
+  const body = getBody(req);
+  const name = typeof body.name === 'string' ? body.name.trim() : null;
+  const price = Number(body.price);
+  const imageUrlRaw = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
+  if (Number.isNaN(price)) return res.status(400).json({ message: 'price required' });
+  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name ?? null, price, imageUrlRaw ? imageUrlRaw : null, itemId]);
+  await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl: imageUrlRaw }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
@@ -617,7 +705,8 @@ app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => 
   res.json({ ok: true });
 });
 app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
-  const { menuId } = req.body || {};
+  const body = getBody(req);
+  const menuId = body.menuId == null ? null : Number(body.menuId);
   await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
   await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
@@ -646,7 +735,9 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
   if (req.user.role !== 'admin' && !(await isOpenNow())) {
     return res.status(403).json({ message: 'not in open window' });
   }
-  const { items = [], internalOnly = false } = req.body || {};
+  const body = getBody(req);
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  const internalOnly = !!body.internalOnly;
   await tx(async (c) => {
     const o = await t_one(c, 'select * from orders where seat=$1', [seat]) || await t_one(
       c,
@@ -654,8 +745,21 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
        values ($1,false,false,false,now(),now()) returning *`,
       [seat]
     );
-    let finalItems = items;
-    let flag = !!internalOnly;
+    const sanitizedItems = rawItems
+      .map(it => {
+        const name = typeof it.name === 'string' ? it.name.trim().slice(0, 100) : '';
+        const price = Number(it.unitPrice);
+        const qtyRaw = Number(it.qty);
+        const qty = Number.isFinite(qtyRaw) ? Math.max(1, Math.floor(qtyRaw)) : NaN;
+        return {
+          name,
+          unitPrice: Number.isFinite(price) ? Math.round(price) : NaN,
+          qty,
+        };
+      })
+      .filter(it => it.name && Number.isFinite(it.unitPrice) && Number.isFinite(it.qty));
+    let finalItems = sanitizedItems;
+    let flag = internalOnly;
     if (internalOnly) finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
     const submitted = finalItems.length > 0;
 
@@ -670,17 +774,18 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
       );
     }
   });
-  await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: (items || []).length }, req);
+  await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: rawItems.length }, req);
   res.json({ ok: true });
 });
 // 訂單「已付款」切換（admin）
 app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
-  const { paid } = req.body || {};
+  const body = getBody(req);
+  const paid = !!body.paid;
   const o = await ensureOrder(seat);
-  await q('update orders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
-  await logAction(req.user, 'order.paid', { seat, paid: !!paid }, req);
+  await q('update orders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
+  await logAction(req.user, 'order.paid', { seat, paid }, req);
   res.json({ ok: true });
 });
 app.delete('/api/orders/today', auth(), requireAdmin, async (req, res) => {
@@ -757,9 +862,11 @@ app.get('/api/settings/preorder', auth(), async (req, res) => {
   res.json({ enabled: !!s?.enabled, dates: s?.dates || [] });
 });
 app.put('/api/settings/preorder', auth(), requireAdmin, async (req, res) => {
-  const { enabled=false, dates=[] } = req.body || {};
-  await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [!!enabled, Array.isArray(dates)? dates : []]);
-  await logAction(req.user, 'settings.preorder', { enabled: !!enabled, dates }, req);
+  const body = getBody(req);
+  const enabled = !!body.enabled;
+  const dates = Array.isArray(body.dates) ? body.dates.filter(d => typeof d === 'string') : [];
+  await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [enabled, dates]);
+  await logAction(req.user, 'settings.preorder', { enabled, dates }, req);
   res.json({ ok: true });
 });
 
@@ -828,11 +935,26 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
       if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
     }
 
-    const { items = [], internalOnly = false } = req.body || {};
+    const body = getBody(req);
+    const rawItems = Array.isArray(body.items) ? body.items : [];
+    const internalOnly = !!body.internalOnly;
     await tx(async (c)=>{
       const o = await ensurePreorder(date, seat, c);
-      let finalItems = items;
-      let flag = !!internalOnly;
+      const sanitizedItems = rawItems
+        .map(it => {
+          const name = typeof it.name === 'string' ? it.name.trim().slice(0, 100) : '';
+          const price = Number(it.unitPrice);
+          const qtyRaw = Number(it.qty);
+          const qty = Number.isFinite(qtyRaw) ? Math.max(1, Math.floor(qtyRaw)) : NaN;
+          return {
+            name,
+            unitPrice: Number.isFinite(price) ? Math.round(price) : NaN,
+            qty,
+          };
+        })
+        .filter(it => it.name && Number.isFinite(it.unitPrice) && Number.isFinite(it.qty));
+      let finalItems = sanitizedItems;
+      let flag = internalOnly;
       if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
       const submitted = finalItems.length > 0;
 
@@ -848,7 +970,7 @@ app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
       }
     });
 
-    await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: (items||[]).length }, req);
+    await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: rawItems.length }, req);
     res.json({ ok: true });
   }catch(e){
     res.status(500).json({ message:String(e.message||e) });
@@ -861,9 +983,10 @@ app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res
     const date = toDateOrNull(req.params.date);
     if (!date) return res.status(400).json({ message:'bad date' });
     const o = await ensurePreorder(date, seat);
-    const { paid } = req.body || {};
-    await q('update preorders set paid=$1, updated_at=now() where id=$2', [!!paid, o.id]);
-    await logAction(req.user, 'preorder.paid', { date, seat, paid: !!paid }, req);
+    const body = getBody(req);
+    const paid = !!body.paid;
+    await q('update preorders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
+    await logAction(req.user, 'preorder.paid', { date, seat, paid }, req);
     res.json({ ok:true });
   }catch(e){
     res.status(500).json({ message:String(e.message||e) });
@@ -913,9 +1036,12 @@ app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
    Users
    ========================= */
 app.post('/api/users', auth(), requireAdmin, async (req, res) => {
-  const { username, password, role } = req.body || {};
-  if (!username || !password) return res.status(400).json({ message: 'username/password required' });
-  const r = (role === 'admin' || role === 'user') ? role : 'user';
+  const body = getBody(req);
+  const username = normalizeUsernameInput(body.username);
+  const password = normalizePasswordInput(body.password);
+  const role = body.role === 'admin' ? 'admin' : 'user';
+  if (!username || username.length > USERNAME_MAX_LEN) return res.status(400).json({ message: 'bad username' });
+  if (!password || password.length < 6 || password.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: 'bad password' });
   const exist = await one('select 1 from users where username=$1', [username]);
   if (exist) return res.status(409).json({ message: 'username already exists' });
   const hash = await bcrypt.hash(password, 10);
@@ -923,9 +1049,9 @@ app.post('/api/users', auth(), requireAdmin, async (req, res) => {
     `insert into users(username, password_hash, role, status, created_at, updated_at)
      values ($1,$2,$3,'active',now(),now())
      returning id, username, role, status`,
-    [username, hash, r]
+    [username, hash, role]
   );
-  await logAction(req.user, 'user.create', { id: row.id, username, role: r }, req);
+  await logAction(req.user, 'user.create', { id: row.id, username, role }, req);
   res.json(row);
 });
 app.get('/api/users', auth(), requireAdmin, async (req, res) => {
@@ -958,8 +1084,11 @@ app.put('/api/users/:id/password', auth(), async (req, res) => {
   const targetId = Number(req.params.id);
   if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
 
-  const { oldPassword, newPassword } = req.body || {};
+  const body = getBody(req);
+  const oldPassword = typeof body.oldPassword === 'string' ? body.oldPassword : '';
+  const newPassword = normalizePasswordInput(body.newPassword);
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ message: 'newPassword too short' });
+  if (newPassword.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: 'newPassword too long' });
 
   const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
@@ -982,7 +1111,8 @@ app.put('/api/users/:id/password', auth(), async (req, res) => {
 app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
-  const { status } = req.body || {};
+  const body = getBody(req);
+  const status = body.status;
   if (!['active', 'disabled'].includes(status)) return res.status(400).json({ message: 'bad status' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的狀態' });
 
@@ -996,7 +1126,8 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
 app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
-  const { role } = req.body || {};
+  const body = getBody(req);
+  const role = body.role;
   if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: 'bad role' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的角色' });
 
@@ -1030,7 +1161,8 @@ app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
-  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : [];
+  const body = getBody(req);
+  const ids = Array.isArray(body.ids) ? body.ids.map(Number) : [];
   if (!ids.length) return res.status(400).json({ message: 'ids required' });
   if (ids.some(id => !Number.isInteger(id))) return res.status(400).json({ message: 'bad user id in list' });
   if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
