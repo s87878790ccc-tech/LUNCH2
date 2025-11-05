@@ -23,6 +23,7 @@ const loginUser = document.getElementById('loginUser');
 const loginPass = document.getElementById('loginPass');
 const loginBtn  = document.getElementById('loginBtn');
 const loginMsg  = document.getElementById('loginMsg');
+const loginLoading = document.getElementById('loginLoading');
 const whoami = document.getElementById('whoami');
 const logoutBtn = document.getElementById('logoutBtn');
 const apiBaseHint = document.getElementById('apiBaseHint');
@@ -283,6 +284,7 @@ function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
 function showLogin() {
+  setLoginLoading(false);
   loginLayer.classList.remove('hidden');
   loginLayer.style.display = 'flex';
   loginLayer.style.pointerEvents = 'auto';
@@ -296,6 +298,13 @@ function showApp() {
   app.classList.remove('hidden');
   app.style.filter = 'none';
 }
+function setLoginLoading(isLoading){
+  if (!loginLoading) return;
+  loginLoading.classList.toggle('hidden', !isLoading);
+  [loginUser, loginPass, loginBtn].forEach((el)=>{
+    if (el) el.disabled = !!isLoading;
+  });
+}
 initLoginLayerStyles();
 
 /* =========================
@@ -303,6 +312,7 @@ initLoginLayerStyles();
    ========================= */
 loginBtn.onclick = async () => {
   loginMsg.textContent = '';
+  setLoginLoading(true);
   try {
     const username = normalizeUsername(loginUser.value.trim());
     const password = normalizePassword(loginPass.value);
@@ -323,6 +333,8 @@ loginBtn.onclick = async () => {
     showApp();
   } catch (e) {
     loginMsg.textContent = '登入失敗：' + e.message;
+  } finally {
+    setLoginLoading(false);
   }
 };
 logoutBtn.onclick = () => {
