@@ -19,11 +19,15 @@ const DATABASE_URL = process.env.DATABASE_URL;
 
 function ensureJwtSecret() {
   const secret = process.env.JWT_SECRET ? String(process.env.JWT_SECRET) : '';
-  if (!secret || secret.length < 16 || secret === 'change_me') {
-    console.error('Missing or insecure JWT_SECRET (must be set and at least 16 characters).');
-    process.exit(1);
+  if (secret && secret !== 'change_me') {
+    if (secret.length < 16) {
+      console.warn('[security] JWT_SECRET is shorter than the recommended minimum of 16 characters.');
+    }
+    return secret;
   }
-  return secret;
+  const generated = randomString(48);
+  console.warn('[security] JWT_SECRET not set or using placeholder; generated ephemeral value for this process. Set JWT_SECRET to persist.');
+  return generated;
 }
 
 function randomString(length, alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789') {
@@ -294,7 +298,14 @@ async function ensureOrdersExtraColumns() {
 
 async function ensureMenuExtraColumns() {
   await pool.query(`alter table if exists menus add column if not exists note text`);
-  await pool.query(`alter table if exists menu_items add column if not exists image_url text`);
+  await pool.query(`alter table if exists menus add column if not exists image_url text`);
+  await pool.query(`alter table if exists menus add column if not exists image_path text`);
+  await pool.query(`
+    update menus
+    set image_path = nullif(split_part(split_part(image_url, '/uploads/', 2), '?', 1), '')
+    where image_path is null
+      and coalesce(image_url, '') like '%/uploads/%'
+  `);
 }
 
 async function ensurePreorderSchema() {
@@ -457,6 +468,38 @@ function getPublicBaseUrl(req) {
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${proto}://${host}`;
 }
+function sanitizeImageFilename(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(trimmed)) {
+    const err = new Error('invalid image reference');
+    err.code = 'INVALID_IMAGE';
+    throw err;
+  }
+  const resolved = path.resolve(UPLOAD_DIR, trimmed);
+  if (!resolved.startsWith(UPLOAD_DIR)) {
+    const err = new Error('invalid image reference');
+    err.code = 'INVALID_IMAGE';
+    throw err;
+  }
+  if (!fs.existsSync(resolved)) {
+    const err = new Error('image not found');
+    err.code = 'IMAGE_NOT_FOUND';
+    throw err;
+  }
+  return trimmed;
+}
+function buildMenuImageMeta(req, row) {
+  const filename = row?.image_path ? String(row.image_path).trim() : '';
+  if (filename) {
+    const safeName = encodeURIComponent(filename);
+    const url = `${getPublicBaseUrl(req)}/uploads/${safeName}`;
+    return { imageUrl: url, imageFilename: filename };
+  }
+  const fallback = row?.image_url ? String(row.image_url).trim() : '';
+  return { imageUrl: fallback, imageFilename: '' };
+}
 async function logAction(user, action, details, req) {
   await q(
     `insert into audit_logs(user_id, action, details, ip, ua, ts)
@@ -533,9 +576,9 @@ app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
     if (!req.file) return res.status(400).json({ message: '請選擇圖片檔' });
     const fileName = req.file.filename;
     try {
-      const url = `${getPublicBaseUrl(req)}/uploads/${fileName}`;
+      const url = `${getPublicBaseUrl(req)}/uploads/${encodeURIComponent(fileName)}`;
       await logAction(req.user, 'upload.image', { filename: fileName, size: req.file.size }, req);
-      res.json({ url });
+      res.json({ url, filename: fileName });
     } catch (e) {
       console.error('Failed to log upload', e);
       fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
@@ -610,20 +653,24 @@ app.get('/api/menus', auth(false), async (req, res) => {
   const menus = await q('select * from menus order by id asc');
   const items = await q('select * from menu_items order by menu_id asc, code asc');
   const setting = await one('select active_menu_id from settings where id=1');
-  const grouped = menus.map(m => ({
-    id: m.id,
-    name: m.name,
-    note: m.note || '',
-    items: items
-      .filter(x => x.menu_id === m.id)
-      .map(x => ({
-        id: x.id,
-        code: x.code,
-        name: x.name,
-        price: x.price,
-        imageUrl: x.image_url || '',
-      }))
-  }));
+  const grouped = menus.map(m => {
+    const meta = buildMenuImageMeta(req, m);
+    return {
+      id: m.id,
+      name: m.name,
+      note: m.note || '',
+      imageUrl: meta.imageUrl,
+      imageFilename: meta.imageFilename,
+      items: items
+        .filter(x => x.menu_id === m.id)
+        .map(x => ({
+          id: x.id,
+          code: x.code,
+          name: x.name,
+          price: x.price,
+        }))
+    };
+  });
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
 });
 app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
@@ -632,18 +679,57 @@ app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
   if (!name || name.length > 128) return res.status(400).json({ message: 'name required' });
   const noteRaw = typeof body.note === 'string' ? body.note.trim() : '';
   const note = noteRaw ? noteRaw.slice(0, 2000) : null;
-  const row = await one('insert into menus(name, note) values ($1,$2) returning id, name, note', [name, note]);
-  await logAction(req.user, 'menu.create', { id: row.id, name, note }, req);
-  res.json({ id: row.id, name: row.name, note: row.note || '', items: [] });
+  let imageFilename = null;
+  if (typeof body.imageFilename === 'string') {
+    try {
+      imageFilename = sanitizeImageFilename(body.imageFilename);
+    } catch (err) {
+      const message = err.code === 'IMAGE_NOT_FOUND'
+        ? '圖片檔案不存在，請重新上傳'
+        : '圖片檔案格式不正確';
+      return res.status(400).json({ message });
+    }
+  }
+  const row = await one(
+    'insert into menus(name, note, image_path, image_url) values ($1,$2,$3,null) returning id, name, note, image_path, image_url',
+    [name, note, imageFilename]
+  );
+  const meta = buildMenuImageMeta(req, row);
+  await logAction(req.user, 'menu.create', { id: row.id, name, note, imageFilename }, req);
+  res.json({ id: row.id, name: row.name, note: row.note || '', imageUrl: meta.imageUrl, imageFilename: meta.imageFilename, items: [] });
 });
 app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const body = getBody(req);
-  const name = typeof body.name === 'string' ? body.name.trim() : null;
-  const noteRaw = typeof body.note === 'string' ? body.note.trim() : null;
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (!name || name.length > 128) return res.status(400).json({ message: 'name required' });
+  const noteRaw = typeof body.note === 'string' ? body.note.trim() : '';
   const note = noteRaw ? noteRaw.slice(0, 2000) : null;
-  await q('update menus set name=$1, note=$2 where id=$3', [name ?? null, note, id]);
-  await logAction(req.user, 'menu.update', { id, name, note }, req);
+  const hasImageField = Object.prototype.hasOwnProperty.call(body, 'imageFilename');
+  let imageFilename = null;
+  if (hasImageField) {
+    try {
+      imageFilename = sanitizeImageFilename(body.imageFilename);
+    } catch (err) {
+      const message = err.code === 'IMAGE_NOT_FOUND'
+        ? '圖片檔案不存在，請重新上傳'
+        : '圖片檔案格式不正確';
+      return res.status(400).json({ message });
+    }
+  }
+  const setParts = ['name=$1', 'note=$2'];
+  const params = [name, note];
+  if (hasImageField) {
+    params.push(imageFilename);
+    setParts.push(`image_path=$${params.length}`);
+    params.push(null);
+    setParts.push(`image_url=$${params.length}`);
+  }
+  params.push(id);
+  await q(`update menus set ${setParts.join(', ')} where id=$${params.length}`, params);
+  const details = { id, name, note };
+  if (hasImageField) details.imageFilename = imageFilename;
+  await logAction(req.user, 'menu.update', details, req);
   res.json({ ok: true });
 });
 app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
@@ -662,20 +748,18 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const price = Number(body.price);
-  const imageUrlRaw = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
   if (!name || name.length > 128 || Number.isNaN(price)) return res.status(400).json({ message: 'name/price required' });
   const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
   const row = await one(
-    'insert into menu_items(menu_id, code, name, price, image_url) values ($1,$2,$3,$4,$5) returning id, code, name, price, image_url',
-    [menuId, Number(max?.c || 0) + 1, name, price, imageUrlRaw ? imageUrlRaw : null]
+    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
+    [menuId, Number(max?.c || 0) + 1, name, price]
   );
-  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price, imageUrl: imageUrlRaw }, req);
+  await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
   res.json({
     id: row.id,
     code: row.code,
     name: row.name,
     price: row.price,
-    imageUrl: row.image_url || '',
   });
 });
 app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
@@ -683,10 +767,9 @@ app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : null;
   const price = Number(body.price);
-  const imageUrlRaw = typeof body.imageUrl === 'string' ? body.imageUrl.trim() : '';
   if (Number.isNaN(price)) return res.status(400).json({ message: 'price required' });
-  await q('update menu_items set name=$1, price=$2, image_url=$3 where id=$4', [name ?? null, price, imageUrlRaw ? imageUrlRaw : null, itemId]);
-  await logAction(req.user, 'menu.item.update', { itemId, name, price, imageUrl: imageUrlRaw }, req);
+  await q('update menu_items set name=$1, price=$2 where id=$3', [name ?? null, price, itemId]);
+  await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
   res.json({ ok: true });
 });
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {

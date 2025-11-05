@@ -236,26 +236,30 @@
 
         <textarea id="menuNote" class="menu-note-input mt8" placeholder="菜單備註（顯示給所有使用者）"></textarea>
 
+        <div class="menu-cover-editor mt8">
+          <div class="menu-image-label">菜單圖片</div>
+          <div class="menu-image-upload">
+            <div class="menu-image-upload-row">
+              <input id="menuImage" type="file" accept="image/*" />
+              <button type="button" id="menuImageClear" class="ghost small hidden">移除</button>
+            </div>
+            <div id="menuImagePreview" class="menu-image-preview">
+              <div class="menu-thumb placeholder">無圖片</div>
+            </div>
+            <div id="menuImageStatus" class="small muted menu-image-status"></div>
+          </div>
+        </div>
+
         <div class="hr"></div>
 
         <div class="row">
           <input id="itemName" placeholder="品名" />
           <input id="itemPrice" type="number" placeholder="價格" class="w140" />
-          <div class="flex1 menu-image-upload">
-            <div class="menu-image-upload-row">
-              <input id="itemImage" type="file" accept="image/*" />
-              <button type="button" id="itemImageClear" class="ghost small hidden">移除</button>
-            </div>
-            <div id="itemImagePreview" class="menu-image-preview">
-              <div class="menu-thumb placeholder">無圖片</div>
-            </div>
-            <div id="itemImageStatus" class="small muted menu-image-status"></div>
-          </div>
           <button id="addItem">新增項目</button>
         </div>
 
         <table id="menuTable" class="mt8">
-          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th>圖片</th><th></th></tr></thead>
+          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
           <tbody></tbody>
         </table>
       </div>

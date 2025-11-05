@@ -74,12 +74,12 @@ const renameMenu = document.getElementById('renameMenu');
 const dupMenu = document.getElementById('dupMenu');
 const delMenu = document.getElementById('delMenu');
 const menuNote = document.getElementById('menuNote');
+const menuImage = document.getElementById('menuImage');
+const menuImageClear = document.getElementById('menuImageClear');
+const menuImagePreview = document.getElementById('menuImagePreview');
+const menuImageStatus = document.getElementById('menuImageStatus');
 const itemName = document.getElementById('itemName');
 const itemPrice = document.getElementById('itemPrice');
-const itemImage = document.getElementById('itemImage');
-const itemImageClear = document.getElementById('itemImageClear');
-const itemImagePreview = document.getElementById('itemImagePreview');
-const itemImageStatus = document.getElementById('itemImageStatus');
 const addItem = document.getElementById('addItem');
 const menuTableBody = document.querySelector('#menuTable tbody');
 
@@ -167,88 +167,75 @@ function buildImageThumb(url='', alt=''){
   return `<button type="button" class="menu-thumb-btn" data-url="${safeUrl}" data-alt="${safeAlt}" title="點擊放大">` +
     `<img src="${safeUrl}" alt="${safeAlt}" class="menu-thumb" loading="lazy"/></button>`;
 }
+function normalizeMenu(menu = {}) {
+  const items = Array.isArray(menu.items)
+    ? menu.items.map(it => ({ id: it.id, code: it.code, name: it.name, price: it.price }))
+    : [];
+  return {
+    ...menu,
+    note: typeof menu.note === 'string' ? menu.note : '',
+    imageUrl: typeof menu.imageUrl === 'string' ? menu.imageUrl : '',
+    imageFilename: typeof menu.imageFilename === 'string' ? menu.imageFilename : '',
+    items,
+  };
+}
 
-function refreshNewItemImageUI(){
-  const nameHint = itemName?.value?.trim() || '';
-  if (itemImagePreview) itemImagePreview.innerHTML = buildImageThumb(newItemImageUrl, nameHint);
-  if (itemImageClear) {
-    const shouldHide = !newItemImageUrl;
-    itemImageClear.classList.toggle('hidden', shouldHide);
-    itemImageClear.disabled = shouldHide || itemImage?.disabled;
+function updateMenuImagePreview(url='', name=''){
+  if (menuImagePreview) menuImagePreview.innerHTML = buildImageThumb(url, name);
+  if (menuImageClear) {
+    const shouldHide = !url;
+    menuImageClear.classList.toggle('hidden', shouldHide);
+    menuImageClear.disabled = shouldHide || menuImage?.disabled;
   }
 }
 
-async function handleNewItemImageChange(){
-  if (!itemImage || itemImage.disabled) return;
-  const file = itemImage.files?.[0];
+async function handleMenuImageChange(){
+  if (!menuImage || menuImage.disabled) return;
+  const file = menuImage.files?.[0];
   if (!file) {
-    newItemImageUrl = '';
-    refreshNewItemImageUI();
-    if (itemImageStatus) itemImageStatus.textContent = '';
+    if (menuImageStatus) menuImageStatus.textContent = '';
     return;
   }
-  if (itemImageStatus) itemImageStatus.textContent = '上傳中...';
+  const menuId = state.activeMenuId;
+  const menu = state.menus.find(x => x.id === menuId);
+  if (!menu) { menuImage.value = ''; return; }
+  if (menuImageStatus) menuImageStatus.textContent = '上傳中...';
   try {
-    const url = await uploadImageFile(file);
-    newItemImageUrl = url;
-    refreshNewItemImageUI();
-    if (itemImageStatus) {
-      itemImageStatus.textContent = '上傳完成';
-      setTimeout(() => {
-        if (itemImageStatus.textContent === '上傳完成') itemImageStatus.textContent = '';
-      }, 2000);
+    const { url, filename } = await uploadImageFile(file);
+    await saveMenuDetails(menu.id, { name: menu.name || '', note: menu.note || '', imageFilename: filename, imageUrl: url });
+    updateMenuImagePreview(url, menu.name || '');
+    if (menuImageStatus) {
+      menuImageStatus.textContent = '已更新圖片';
+      setTimeout(()=>{ if (menuImageStatus.textContent === '已更新圖片') menuImageStatus.textContent=''; }, 2000);
     }
+    renderActiveMenu();
   } catch (err) {
-    newItemImageUrl = '';
-    refreshNewItemImageUI();
-    if (itemImageStatus) itemImageStatus.textContent = '上傳失敗：' + err.message;
+    console.error(err);
+    alert('上傳失敗：' + err.message);
+    if (menuImageStatus) menuImageStatus.textContent = '';
   } finally {
-    itemImage.value = '';
+    menuImage.value = '';
+    renderMenuPage();
   }
 }
 
-function clearNewItemImage(){
-  newItemImageUrl = '';
-  if (itemImage) itemImage.value = '';
-  refreshNewItemImageUI();
-  if (itemImageStatus) {
-    itemImageStatus.textContent = '已移除圖片';
-    setTimeout(() => {
-      if (itemImageStatus.textContent === '已移除圖片') itemImageStatus.textContent = '';
-    }, 2000);
-  }
-}
-
-async function handleMenuItemImageUpload(input){
-  if (!input || input.disabled) return;
-  const file = input.files?.[0];
-  const tr = input.closest('tr');
-  if (!file || !tr) return;
-  const statusEl = tr.querySelector('.menu-image-status');
-  if (statusEl) statusEl.textContent = '上傳中...';
+async function clearMenuImage(e){
+  if (e) e.preventDefault();
+  const menuId = state.activeMenuId;
+  const menu = state.menus.find(x => x.id === menuId);
+  if (!menu) return;
   try {
-    const url = await uploadImageFile(file);
-    const imageInput = tr.querySelector('.imageEdit');
-    if (imageInput) {
-      imageInput.value = url;
-      const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
-      const previewEl = tr.querySelector('.menu-image-preview');
-      if (previewEl) previewEl.innerHTML = buildImageThumb(url, name);
-      const clearBtn = tr.querySelector('.clearImage');
-      if (clearBtn) {
-        clearBtn.disabled = false;
-        clearBtn.classList.remove('hidden');
-      }
-      imageInput.dispatchEvent(new Event('change', { bubbles: true }));
+    await saveMenuDetails(menu.id, { name: menu.name || '', note: menu.note || '', imageFilename: '', imageUrl: '' });
+    updateMenuImagePreview('', menu.name || '');
+    if (menuImageStatus) {
+      menuImageStatus.textContent = '已移除圖片';
+      setTimeout(()=>{ if (menuImageStatus.textContent === '已移除圖片') menuImageStatus.textContent=''; }, 2000);
     }
-    if (statusEl) {
-      statusEl.textContent = '上傳完成';
-      setTimeout(()=>{ if (statusEl.textContent === '上傳完成') statusEl.textContent=''; }, 2000);
-    }
+    if (menuImage) menuImage.value = '';
+    renderActiveMenu();
+    renderMenuPage();
   } catch (err) {
-    if (statusEl) statusEl.textContent = '上傳失敗：' + err.message;
-  } finally {
-    input.value = '';
+    alert('移除圖片失敗：' + err.message);
   }
 }
 
@@ -437,8 +424,8 @@ async function uploadImageFile(file){
     const msg = data?.message || raw || `${res.status} ${res.statusText}`;
     throw new Error(msg);
   }
-  if (!data?.url) throw new Error('未取得上傳結果');
-  return data.url;
+  if (!data?.url || !data?.filename) throw new Error('未取得上傳結果');
+  return { url: data.url, filename: data.filename };
 }
 
 /* =========================
@@ -463,8 +450,6 @@ const state = {
   unpaidOrders: [],
   unpaidPreorders: [],
 };
-
-let newItemImageUrl = '';
 
 function isAdmin(){ return state.me?.role === 'admin'; }
 async function safeRenderAdminReports(){
@@ -776,37 +761,70 @@ tabAllSeats?.addEventListener('click', ()=>{
    ========================= */
 async function loadMenus(){
   const data = await api('/menus');
-  state.menus = data.menus || [];
-  state.activeMenuId = data.activeMenuId ?? (state.menus[0]?.id ?? null);
+  const prevActive = state.activeMenuId;
+  state.menus = (data.menus || []).map(normalizeMenu);
+  const serverActive = data.activeMenuId ?? null;
+  const keep = prevActive && state.menus.some(m => m.id === prevActive) ? prevActive : null;
+  state.activeMenuId = keep ?? serverActive ?? (state.menus[0]?.id ?? null);
 }
 async function setActiveMenu(menuId){
   await api('/settings/active-menu', { method:'PUT', body: JSON.stringify({ menuId }) });
   state.activeMenuId = menuId;
 }
-async function createMenu(name, note=''){
-  const m = await api('/menus', { method:'POST', body: JSON.stringify({ name, note })});
-  state.menus.push(m);
+async function createMenu(name, note='', imageFilename=''){
+  const payload = { name, note };
+  if (typeof imageFilename === 'string' && imageFilename.trim()) {
+    payload.imageFilename = imageFilename.trim();
+  }
+  const m = await api('/menus', { method:'POST', body: JSON.stringify(payload) });
+  const normalized = normalizeMenu(m);
+  state.menus.push(normalized);
+  state.activeMenuId = normalized.id;
 }
-async function renameMenuReq(id, name, note=''){
-  await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify({ name, note })});
+async function saveMenuDetails(id, { name, note='', imageFilename, imageUrl }){
+  const cleanName = typeof name === 'string' ? name.trim() : '';
+  const noteRaw = typeof note === 'string' ? note : '';
+  const cleanNote = noteRaw ? noteRaw.slice(0, 2000) : '';
+  const payload = { name: cleanName, note: cleanNote };
+  let imageFieldSent = false;
+  let cleanFilename = '';
+  if (typeof imageFilename === 'string') {
+    cleanFilename = imageFilename.trim();
+    payload.imageFilename = cleanFilename;
+    imageFieldSent = true;
+  }
+  await api(`/menus/${id}`, { method:'PUT', body: JSON.stringify(payload) });
   const m = state.menus.find(x=>x.id===id);
-  if (m) { m.name = name; m.note = note; }
+  if (m) {
+    m.name = cleanName;
+    m.note = cleanNote;
+    if (imageFieldSent) {
+      m.imageFilename = cleanFilename;
+      if (cleanFilename) {
+        if (typeof imageUrl === 'string' && imageUrl) {
+          m.imageUrl = imageUrl;
+        }
+      } else {
+        m.imageUrl = '';
+      }
+    }
+  }
 }
 async function deleteMenuReq(id){
   await api(`/menus/${id}`, { method:'DELETE' });
   state.menus = state.menus.filter(x=>x.id!==id);
   if (state.activeMenuId===id) state.activeMenuId = state.menus[0]?.id ?? null;
 }
-async function addMenuItemReq(menuId, name, price, imageUrl=''){
-  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price, imageUrl })});
+async function addMenuItemReq(menuId, name, price){
+  const it = await api(`/menus/${menuId}/items`, { method:'POST', body: JSON.stringify({ name, price })});
   const m = state.menus.find(x=>x.id===menuId);
   if (m) m.items.push(it);
 }
-async function updateMenuItemReq(itemId, name, price, imageUrl=''){
-  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price, imageUrl })});
+async function updateMenuItemReq(itemId, name, price){
+  await api(`/menu-items/${itemId}`, { method:'PUT', body: JSON.stringify({ name, price })});
   for (const m of state.menus) {
     const it = m.items.find(i=>i.id===itemId);
-    if (it) { it.name=name; it.price=Number(price); it.imageUrl=imageUrl; break; }
+    if (it) { it.name=name; it.price=Number(price); break; }
   }
 }
 async function deleteMenuItemReq(itemId){
@@ -845,24 +863,23 @@ function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
 
 function buildMenuPreview(menu, { compact=false } = {}){
   if (!menu) return '<div class="muted small">(尚未選擇菜單)</div>';
+  const safeName = menu?.name || '';
+  const parts = [];
+  parts.push(`<div class="menu-preview-cover">${buildImageThumb(menu.imageUrl || '', safeName)}</div>`);
   const items = Array.isArray(menu.items) ? menu.items : [];
-  if (!items.length) return '<div class="muted small">(此菜單沒有項目)</div>';
-  const listClass = compact ? 'menu-preview-list compact' : 'menu-preview-list';
-  const body = items.map(it => {
-    const safeName = escapeHtml(it.name || '');
-    const safeCode = escapeHtml(String(it.code ?? ''));
-    const codeLabel = safeCode ? `#${safeCode} ` : '';
-    const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
-    return `
-      <div class="menu-preview-item">
-        ${imgHtml}
-        <div class="menu-preview-text">
-          <div class="menu-preview-name">${codeLabel}${safeName}</div>
-          <div class="menu-preview-price">$${fmt(it.price)}</div>
-        </div>
-      </div>`;
-  }).join('');
-  return `<div class="${listClass}">${body}</div>`;
+  if (items.length) {
+    const rows = items.map(it => {
+      const safeCode = escapeHtml(String(it.code ?? ''));
+      const safeItemName = escapeHtml(it.name || '');
+      return `<tr><td class="code">${safeCode ? `#${safeCode}` : ''}</td><td>${safeItemName}</td><td class="price">$${fmt(it.price)}</td></tr>`;
+    }).join('');
+    const head = compact ? '' : '<thead><tr><th class="code">代號</th><th>品名</th><th class="price">價格</th></tr></thead>';
+    parts.push(`<table class="menu-preview-table">${head}<tbody>${rows}</tbody></table>`);
+  } else {
+    parts.push('<div class="muted small">(此菜單沒有項目)</div>');
+  }
+  const cls = compact ? 'menu-preview-host compact' : 'menu-preview-host';
+  return `<div class="${cls}">${parts.join('')}</div>`;
 }
 
 function renderSeats(){
@@ -911,15 +928,15 @@ function renderMenuPage(){
     menuNote.value = m?.note || '';
     menuNote.disabled = !m;
   }
+  if (menuImage) menuImage.disabled = !m;
+  if (menuImageStatus && !m) menuImageStatus.textContent = '';
+  updateMenuImagePreview(m?.imageUrl || '', m?.name || '');
   if (useMenu) useMenu.disabled = !m;
   if (renameMenu) renameMenu.disabled = !m;
   if (dupMenu) dupMenu.disabled = !m;
   if (delMenu) delMenu.disabled = !m;
   if (itemName) itemName.disabled = !m;
   if (itemPrice) itemPrice.disabled = !m;
-  if (itemImage) itemImage.disabled = !m;
-  if (itemImageClear) itemImageClear.disabled = !m || !newItemImageUrl;
-  refreshNewItemImageUI();
   if (addItem) addItem.disabled = !m;
   if (!menuTableBody) return;
   menuTableBody.innerHTML = '';
@@ -928,23 +945,10 @@ function renderMenuPage(){
     const tr = document.createElement('tr');
     const safeName = escapeHtml(it.name || '');
     const safePrice = escapeHtml(String(it.price ?? ''));
-    const hasImage = !!(it.imageUrl && it.imageUrl.trim());
-    const preview = buildImageThumb(it.imageUrl || '', it.name || '');
     tr.innerHTML = `
       <td>${it.code}</td>
       <td><input class="nameEdit" data-id="${it.id}" value="${safeName}" /></td>
       <td><input class="priceEdit w140" data-id="${it.id}" type="number" value="${safePrice}" /></td>
-      <td>
-        <div class="menu-image-editor">
-          <div class="menu-image-preview">${preview}</div>
-          <div class="menu-image-upload-row">
-            <input class="imageUpload" data-id="${it.id}" type="file" accept="image/*" />
-            <button type="button" class="ghost small clearImage ${hasImage ? '' : 'hidden'}" data-id="${it.id}" ${hasImage ? '' : 'disabled'}>移除</button>
-          </div>
-          <div class="menu-image-status small muted"></div>
-          <input class="imageEdit" data-id="${it.id}" type="hidden" value="${escapeHtml(it.imageUrl || '')}" />
-        </div>
-      </td>
       <td><button class="danger delItem" data-id="${it.id}">刪除</button></td>`;
     menuTableBody.appendChild(tr);
   });
@@ -1499,17 +1503,17 @@ renameMenu.addEventListener('click', async ()=>{
   const name = menuNewName.value.trim();
   if (!name) return alert('請輸入新名稱');
   const note = menuNote ? menuNote.value : '';
-  await renameMenuReq(id, name, note);
-  await loadMenus();
-  renderActiveMenu(); renderMenuPage();
+  await saveMenuDetails(id, { name, note });
+  renderActiveMenu();
+  renderMenuPage();
 });
 dupMenu.addEventListener('click', async ()=>{
   const id = Number(menuSelect.value);
   const src = state.menus.find(x=>x.id===id);
   if (!src) return;
-  await createMenu(src.name + '（副本）', src.note || '');
+  await createMenu(src.name + '（副本）', src.note || '', src.imageFilename || '');
   const newMenu = state.menus[state.menus.length-1];
-  for (const it of src.items) await addMenuItemReq(newMenu.id, it.name, it.price, it.imageUrl || '');
+  for (const it of src.items) await addMenuItemReq(newMenu.id, it.name, it.price);
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
   alert('已建立副本');
@@ -1522,10 +1526,8 @@ delMenu.addEventListener('click', async ()=>{
   renderActiveMenu(); renderMenuPage();
 });
 
-itemImage?.addEventListener('change', handleNewItemImageChange);
-itemImageClear?.addEventListener('click', (e)=>{ e.preventDefault(); clearNewItemImage(); });
-itemName?.addEventListener('input', ()=>{ if (newItemImageUrl) refreshNewItemImageUI(); });
-refreshNewItemImageUI();
+menuImage?.addEventListener('change', handleMenuImageChange);
+menuImageClear?.addEventListener('click', clearMenuImage);
 
 addItem.addEventListener('click', async ()=>{
   const mId = Number(menuSelect.value);
@@ -1533,38 +1535,27 @@ addItem.addEventListener('click', async ()=>{
   const price = Number(itemPrice.value||0);
   if (!name) return alert('請輸入品名');
   if (price<0) return alert('價格需 >= 0');
-  const imageUrl = newItemImageUrl || '';
-  await addMenuItemReq(mId, name, price, imageUrl);
+  await addMenuItemReq(mId, name, price);
   itemName.value=''; itemPrice.value='';
-  newItemImageUrl = '';
-  if (itemImage) itemImage.value='';
-  if (itemImageStatus) itemImageStatus.textContent = '';
-  refreshNewItemImageUI();
   await loadMenus();
   renderActiveMenu(); renderMenuPage();
 });
 
 menuTableBody?.addEventListener('change', async (e)=>{
   const t = e.target;
-  if (t.classList.contains('imageUpload')) {
-    await handleMenuItemImageUpload(t);
-    return;
-  }
-  if (!t.classList.contains('nameEdit') && !t.classList.contains('priceEdit') && !t.classList.contains('imageEdit')) return;
+  if (!t.classList.contains('nameEdit') && !t.classList.contains('priceEdit')) return;
   const tr = t.closest('tr');
   if (!tr) return;
   const id = Number(t.dataset.id || tr.querySelector('.nameEdit')?.dataset.id || tr.querySelector('.priceEdit')?.dataset.id);
   if (!id) return;
   const nameInput = tr.querySelector('.nameEdit');
   const priceInput = tr.querySelector('.priceEdit');
-  const imageInput = tr.querySelector('.imageEdit');
   const name = nameInput?.value?.trim() || '';
   const price = Number(priceInput?.value || 0);
   if (!name) { alert('品名不可為空'); renderMenuPage(); return; }
   if (!Number.isFinite(price) || price < 0) { alert('價格需 >= 0'); renderMenuPage(); return; }
-  const imageUrl = imageInput?.value?.trim() || '';
   try{
-    await updateMenuItemReq(id, name, price, imageUrl);
+    await updateMenuItemReq(id, name, price);
     await loadMenus();
     renderActiveMenu();
     renderMenuPage();
@@ -1574,27 +1565,6 @@ menuTableBody?.addEventListener('change', async (e)=>{
   }
 });
 menuTableBody?.addEventListener('click', async (e)=>{
-  const clearBtn = e.target.closest('.clearImage');
-  if (clearBtn) {
-    e.preventDefault();
-    const tr = clearBtn.closest('tr');
-    if (!tr) return;
-    const imageInput = tr.querySelector('.imageEdit');
-    if (!imageInput) return;
-    imageInput.value = '';
-    const name = tr.querySelector('.nameEdit')?.value?.trim() || '';
-    const previewEl = tr.querySelector('.menu-image-preview');
-    if (previewEl) previewEl.innerHTML = buildImageThumb('', name);
-    clearBtn.disabled = true;
-    clearBtn.classList.add('hidden');
-    const statusEl = tr.querySelector('.menu-image-status');
-    if (statusEl) {
-      statusEl.textContent = '已移除圖片';
-      setTimeout(()=>{ if (statusEl.textContent === '已移除圖片') statusEl.textContent=''; }, 2000);
-    }
-    imageInput.dispatchEvent(new Event('change', { bubbles: true }));
-    return;
-  }
   const btn = e.target.closest('.delItem');
   if (!btn) return;
   const id = Number(btn.dataset.id);
