@@ -863,20 +863,31 @@ function fmt(n){ return Number(n||0).toLocaleString('zh-Hant-TW'); }
 
 function buildMenuPreview(menu, { compact=false } = {}){
   if (!menu) return '<div class="muted small">(尚未選擇菜單)</div>';
-  const safeName = menu?.name || '';
   const parts = [];
-  parts.push(`<div class="menu-preview-cover">${buildImageThumb(menu.imageUrl || '', safeName)}</div>`);
+  const safeMenuName = menu?.name || '';
+  if (menu.imageUrl) {
+    parts.push(`<div class="menu-preview-cover">${buildImageThumb(menu.imageUrl, safeMenuName)}</div>`);
+  }
   const items = Array.isArray(menu.items) ? menu.items : [];
-  if (items.length) {
-    const rows = items.map(it => {
-      const safeCode = escapeHtml(String(it.code ?? ''));
-      const safeItemName = escapeHtml(it.name || '');
-      return `<tr><td class="code">${safeCode ? `#${safeCode}` : ''}</td><td>${safeItemName}</td><td class="price">$${fmt(it.price)}</td></tr>`;
-    }).join('');
-    const head = compact ? '' : '<thead><tr><th class="code">代號</th><th>品名</th><th class="price">價格</th></tr></thead>';
-    parts.push(`<table class="menu-preview-table">${head}<tbody>${rows}</tbody></table>`);
-  } else {
+  if (!items.length) {
     parts.push('<div class="muted small">(此菜單沒有項目)</div>');
+  } else {
+    const listClass = compact ? 'menu-preview-list compact' : 'menu-preview-list';
+    const body = items.map(it => {
+      const safeName = escapeHtml(it.name || '');
+      const safeCode = escapeHtml(String(it.code ?? ''));
+      const codeLabel = safeCode ? `#${safeCode} ` : '';
+      const imgHtml = it.imageUrl ? buildImageThumb(it.imageUrl, it.name || '') : '';
+      return `
+      <div class="menu-preview-item">
+        ${imgHtml}
+        <div class="menu-preview-text">
+          <div class="menu-preview-name">${codeLabel}${safeName}</div>
+          <div class="menu-preview-price">$${fmt(it.price)}</div>
+        </div>
+      </div>`;
+    }).join('');
+    parts.push(`<div class="${listClass}">${body}</div>`);
   }
   const cls = compact ? 'menu-preview-host compact' : 'menu-preview-host';
   return `<div class="${cls}">${parts.join('')}</div>`;

@@ -34,20 +34,22 @@ th{color:var(--muted);font-weight:600}
 .menu-note-block{background:#0f1730;border:1px solid #2b3a63;border-radius:12px;padding:8px 12px;color:var(--muted);white-space:pre-wrap}
 .menu-note-block.compact{padding:6px 8px;font-size:12px}
 
-.menu-preview-host{margin-top:8px;display:flex;flex-direction:column;gap:12px}
-.menu-preview-cover{display:flex;justify-content:flex-start}
+.menu-preview-host{margin-top:8px}
+.menu-preview-cover{margin-bottom:8px;display:flex;justify-content:flex-start}
 .menu-preview-cover .menu-thumb{width:180px;height:180px}
 .menu-preview-cover .menu-thumb.placeholder{width:180px;height:180px;font-size:14px}
-.menu-preview-table{width:100%;border-collapse:collapse}
-.menu-preview-table th,.menu-preview-table td{padding:6px 8px;border-bottom:1px solid #24365c}
-.menu-preview-table th{color:var(--muted);font-weight:600;text-align:left}
-.menu-preview-table td.price{text-align:right;width:80px}
-.menu-preview-table td.code{width:60px;color:var(--muted)}
-.menu-preview-host.compact{gap:8px}
+.menu-preview-list{display:flex;flex-wrap:wrap;gap:8px}
+.menu-preview-item{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:12px;background:#0f1730;border:1px solid #2b3a63;min-width:0}
+.menu-preview-text{display:flex;flex-direction:column;gap:2px}
+.menu-preview-name{font-weight:600}
+.menu-preview-price{font-size:12px;color:var(--muted)}
+.menu-preview-host.compact .menu-preview-list{gap:6px}
+.menu-preview-host.compact .menu-preview-item{padding:4px 8px;font-size:12px}
+.menu-preview-host.compact .menu-preview-price{font-size:11px}
 .menu-preview-host.compact .menu-preview-cover .menu-thumb{width:120px;height:120px}
 .menu-preview-host.compact .menu-preview-cover .menu-thumb.placeholder{width:120px;height:120px;font-size:12px}
-.menu-preview-host.compact .menu-preview-table th,
-.menu-preview-host.compact .menu-preview-table td{padding:4px 6px;font-size:12px}
+.menu-preview-host.compact .menu-thumb{width:44px;height:44px}
+.menu-preview-host.compact .menu-thumb.placeholder{width:44px;height:44px;font-size:11px}
 
 .menu-thumb-btn{border:none;background:transparent;padding:0;line-height:0;cursor:pointer}
 .menu-thumb{width:56px;height:56px;border-radius:10px;border:1px solid #2b3a63;object-fit:cover;background:#0f1730}
