@@ -28,6 +28,8 @@ table{width:100%;border-collapse:collapse}
 th,td{border-bottom:1px solid #24365c;padding:8px;text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600}
 
+.users-table{width:100%;}
+
 .menu-note-input{width:100%;min-height:80px;resize:vertical}
 .flex1{flex:1 1 220px}
 
@@ -99,3 +101,15 @@ th{color:var(--muted);font-weight:600}
 
 /* 桌機隱藏 mobile-only 區塊 */
 .mobile-only{display:none}
+
+@media (max-width: 720px){
+  #pageUsers .users-table{border-collapse:separate;border-spacing:0}
+  #pageUsers .users-table thead{display:none}
+  #pageUsers .users-table tbody{display:grid;gap:12px}
+  #pageUsers .users-table tr{display:block;background:rgba(15,23,48,.75);border:1px solid #24365c;border-radius:12px;padding:12px}
+  #pageUsers .users-table tr td{display:flex;flex-direction:column;gap:4px;padding:8px 0;border:none;border-bottom:1px solid #24365c}
+  #pageUsers .users-table tr td:last-child{border-bottom:none;padding-bottom:0}
+  #pageUsers .users-table tr td::before{content:attr(data-label);font-size:12px;color:var(--muted)}
+  #pageUsers .users-table tr td .row{width:100%;justify-content:flex-start}
+  #pageUsers .users-table tr td .row input{flex:1 1 auto;min-width:0}
+}

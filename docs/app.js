@@ -1234,17 +1234,21 @@ async function loadUsers(){
 
       const idTd = document.createElement('td');
       idTd.textContent = String(u.id);
+      idTd.dataset.label = 'ID';
       tr.appendChild(idTd);
 
       const usernameTd = document.createElement('td');
       usernameTd.textContent = u.username;
+      usernameTd.dataset.label = '帳號';
       tr.appendChild(usernameTd);
 
       const roleTd = document.createElement('td');
       roleTd.textContent = u.role;
+      roleTd.dataset.label = '角色';
       tr.appendChild(roleTd);
 
       const actionTd = document.createElement('td');
+      actionTd.dataset.label = '操作';
       const rowDiv = document.createElement('div');
       rowDiv.className = 'row';
       rowDiv.style.gap = '6px';
