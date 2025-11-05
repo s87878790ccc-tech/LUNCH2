@@ -113,15 +113,17 @@
             <span class="small muted">將清空今日所有座號的訂單、內訂與付款狀態。</span>
             <button id="purgeOrdersBtn" class="danger">刪除今日全部訂單</button>
           </div>
-          <table id="orderTable">
-            <thead>
-              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
-            </thead>
-            <tbody></tbody>
-            <tfoot>
-              <tr><th colspan="4" style="text-align:right">小計</th><th id="seatSubtotal">0</th><th></th></tr>
-            </tfoot>
-          </table>
+          <div class="table-scroll">
+            <table id="orderTable">
+              <thead>
+                <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
+              </thead>
+              <tbody></tbody>
+              <tfoot>
+                <tr><th colspan="4" style="text-align:right">小計</th><th id="seatSubtotal">0</th><th></th></tr>
+              </tfoot>
+            </table>
+          </div>
         </div>
 
         <div class="card">
@@ -187,15 +189,17 @@
           <div class="hr"></div>
 
           <h3>本座預訂明細</h3>
-          <table id="preOrderTable">
-            <thead>
-              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
-            </thead>
-            <tbody id="preOrderTbody"></tbody>
-            <tfoot>
-              <tr><th colspan="4" style="text-align:right">小計</th><th id="preSeatSubtotal">0</th><th></th></tr>
-            </tfoot>
-          </table>
+          <div class="table-scroll">
+            <table id="preOrderTable">
+              <thead>
+                <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
+              </thead>
+              <tbody id="preOrderTbody"></tbody>
+              <tfoot>
+                <tr><th colspan="4" style="text-align:right">小計</th><th id="preSeatSubtotal">0</th><th></th></tr>
+              </tfoot>
+            </table>
+          </div>
         </div>
 
         <div class="card only-admin">
@@ -258,10 +262,12 @@
           <button id="addItem">新增項目</button>
         </div>
 
-        <table id="menuTable" class="mt8">
-          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
+        <div class="table-scroll mt8">
+          <table id="menuTable">
+            <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -270,11 +276,13 @@
       <div class="grid">
         <div class="card">
           <h3>品項彙整</h3>
-          <table id="aggTable">
-            <thead><tr><th>品名</th><th>總數</th><th>總金額</th></tr></thead>
-            <tbody></tbody>
-            <tfoot><tr><th colspan="2" style="text-align:right">全班合計</th><th id="classTotal">0</th></tr></tfoot>
-          </table>
+          <div class="table-scroll">
+            <table id="aggTable">
+              <thead><tr><th>品名</th><th>總數</th><th>總金額</th></tr></thead>
+              <tbody></tbody>
+              <tfoot><tr><th colspan="2" style="text-align:right">全班合計</th><th id="classTotal">0</th></tr></tfoot>
+            </table>
+          </div>
         </div>
 
         <div class="card">
@@ -289,10 +297,12 @@
           <button id="loadBySeat" class="ghost">載入/重新整理</button>
         </div>
         <div id="loadBySeatMsg" class="small muted"></div>
-        <table>
-          <thead><tr><th>座號</th><th>狀態</th><th>小計</th><th>明細</th></tr></thead>
-          <tbody id="bySeatTBody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>座號</th><th>狀態</th><th>小計</th><th>明細</th></tr></thead>
+            <tbody id="bySeatTBody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div class="card mt8 only-admin">
@@ -341,12 +351,14 @@
     <section id="pageLogs" class="hidden">
       <div class="card">
         <h3>審計紀錄（最近 500 筆）</h3>
-        <table id="logsTable">
-          <thead>
-            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP</th><th>UA</th></tr>
-          </thead>
-        <tbody></tbody>
-        </table>
+        <div class="table-scroll">
+          <table id="logsTable">
+            <thead>
+              <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP</th><th>UA</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -367,10 +379,12 @@
 
       <div class="card mt8">
         <h3>使用者列表</h3>
-        <table>
-          <thead><tr><th>ID</th><th>帳號</th><th>角色</th><th>重設密碼</th><th>刪除</th></tr></thead>
-          <tbody id="usersTableBody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>ID</th><th>帳號</th><th>角色</th><th>重設密碼</th><th>刪除</th></tr></thead>
+            <tbody id="usersTableBody"></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </div>
