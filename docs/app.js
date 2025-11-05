@@ -283,8 +283,9 @@ document.addEventListener('click', (e)=>{
 function authHeader() {
   return token ? { 'Authorization': 'Bearer ' + token } : {};
 }
-function showLogin() {
-  setLoginLoading(false);
+function showLogin(options = {}) {
+  const { keepLoading = false } = options;
+  setLoginLoading(!!keepLoading);
   loginLayer.classList.remove('hidden');
   loginLayer.style.display = 'flex';
   loginLayer.style.pointerEvents = 'auto';
@@ -306,6 +307,7 @@ function setLoginLoading(isLoading){
   });
 }
 initLoginLayerStyles();
+showLogin({ keepLoading: !!token });
 
 /* =========================
    登入/登出
@@ -1888,6 +1890,7 @@ async function initApp(){
   renderStatic();
   if (!token) return showLogin();
   try{
+    showLogin({ keepLoading: true });
     const me = await api('/auth/me');
     onLoginUser(me.user);
     applyMobileUI();
