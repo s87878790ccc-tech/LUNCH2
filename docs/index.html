@@ -27,12 +27,16 @@
 <body>
   <!-- 登入層 -->
   <div id="loginLayer" class="layer">
-    <div class="card w400">
+    <div class="card w400 login-card">
       <h2>午餐系統V0.11b</h2>
       <input id="loginUser" placeholder="帳號" />
       <input id="loginPass" placeholder="密碼" type="password" />
       <button id="loginBtn" class="primary">登入</button>
       <div id="loginMsg" class="muted small"></div>
+      <div id="loginLoading" class="login-loading hidden" aria-live="polite" aria-busy="true">
+        <div class="login-loading-spinner" role="presentation"></div>
+        <div class="small">登入中，請稍候...</div>
+      </div>
     </div>
   </div>
 
