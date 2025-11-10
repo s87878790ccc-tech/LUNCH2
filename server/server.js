@@ -296,6 +296,22 @@ async function ensureOrdersExtraColumns() {
   await pool.query(`alter table if exists orders add column if not exists paid boolean default false`);
 }
 
+async function ensureOrderItemsExtraColumns() {
+  await pool.query(`alter table if exists order_items add column if not exists updated_at timestamptz default now()`);
+  await pool.query(`alter table if exists order_items alter column updated_at set default now()`);
+  await pool.query(`
+    do $$
+    begin
+      if exists (
+        select 1 from information_schema.tables where table_name = 'order_items'
+      ) then
+        update order_items set updated_at = coalesce(updated_at, now()) where updated_at is null;
+      end if;
+    end
+    $$;
+  `);
+}
+
 async function ensureMenuExtraColumns() {
   await pool.query(`alter table if exists menus add column if not exists note text`);
   await pool.query(`alter table if exists menus add column if not exists image_url text`);
@@ -807,7 +823,13 @@ app.get('/api/orders/:seat', auth(), async (req, res) => {
     submitted: !!o.submitted,
     internalOnly: !!o.internal_only,
     paid: !!o.paid,
-    items: items.map(i => ({ id: i.id, name: i.name, unitPrice: i.unit_price, qty: i.qty })),
+    items: items.map(i => ({
+      id: i.id,
+      name: i.name,
+      unitPrice: i.unit_price,
+      qty: i.qty,
+      updatedAt: i.updated_at ? new Date(i.updated_at).toISOString() : null,
+    })),
   });
 });
 app.put('/api/orders/:seat', auth(), async (req, res) => {
@@ -852,7 +874,7 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
     await c.query('delete from order_items where order_id=$1', [o.id]);
     for (const it of finalItems) {
       await c.query(
-        'insert into order_items(order_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+        'insert into order_items(order_id, name, unit_price, qty, updated_at) values ($1,$2,$3,$4, now())',
         [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
       );
     }
@@ -1284,6 +1306,7 @@ app.get('/', (req, res) => {
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
+    await ensureOrderItemsExtraColumns();
     await ensureMenuExtraColumns();
     await ensurePreorderSchema();
     await seed();

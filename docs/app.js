@@ -160,6 +160,28 @@ function safeNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+const taiwanTimeFormatter = new Intl.DateTimeFormat('zh-TW', {
+  timeZone: 'Asia/Taipei',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+function formatTaiwanTime(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '';
+  const formatted = taiwanTimeFormatter.format(d);
+  return formatted
+    .replace(/[\u200E\u200F]/g, '')
+    .replace(/\//g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function buildImageThumb(url='', alt=''){
   const safeUrl = escapeHtml(url || '');
   const safeAlt = escapeHtml(alt || '');
@@ -840,7 +862,7 @@ async function getOrder(seat){
 async function saveOrder(seat, order){
   try{
     await api(`/orders/${seat}`, { method:'PUT', body: JSON.stringify(order) });
-    state.ordersCache.set(seat, order);
+    state.ordersCache.delete(seat);
   }catch(e){
     if (String(e.message).includes('not in open window')) {
       if (closedBanner) closedBanner.classList.remove('hidden');
@@ -996,7 +1018,16 @@ async function renderSeatOrder(){
     tr.appendChild(idxTd);
 
     const nameTd = document.createElement('td');
-    nameTd.textContent = it.name;
+    const nameDiv = document.createElement('div');
+    nameDiv.textContent = it.name;
+    nameTd.appendChild(nameDiv);
+    const updatedLabel = formatTaiwanTime(it.updatedAt);
+    if (updatedLabel) {
+      const noteDiv = document.createElement('div');
+      noteDiv.className = 'small muted item-note-time';
+      noteDiv.textContent = `備註修改時間：${updatedLabel}`;
+      nameTd.appendChild(noteDiv);
+    }
     tr.appendChild(nameTd);
 
     const priceTd = document.createElement('td');
