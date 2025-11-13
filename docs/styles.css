@@ -29,6 +29,14 @@ table{width:100%;border-collapse:collapse}
 th,td{border-bottom:1px solid #24365c;padding:8px;text-align:left;vertical-align:top}
 th{color:var(--muted);font-weight:600}
 
+.log-filter-row{margin-bottom:12px;align-items:flex-end}
+.log-filter-label{display:flex;flex-direction:column;gap:4px;font-weight:600}
+.log-filter-label select{min-width:180px}
+.log-message{font-size:14px;line-height:1.5}
+.log-details{margin-top:6px}
+.log-details summary{cursor:pointer;color:var(--muted);font-size:12px}
+.log-details pre{margin:4px 0 0;background:#0f1730;border:1px solid #223055;border-radius:8px;padding:8px;max-height:240px;overflow:auto;font-size:12px}
+
 .users-table{width:100%;}
 
 .menu-note-input{width:100%;min-height:80px;resize:vertical}
