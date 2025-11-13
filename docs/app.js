@@ -88,6 +88,9 @@ const classTotalEl = document.getElementById('classTotal');
 const missingList = document.getElementById('missingList');
 
 const logsTableBody = document.querySelector('#logsTable tbody');
+const logCategoryFilter = document.getElementById('logCategoryFilter');
+const logCategoryHint = document.getElementById('logCategoryHint');
+let logsCache = null;
 
 const newUserName = document.getElementById('newUserName');
 const newUserPass = document.getElementById('newUserPass');
@@ -764,7 +767,7 @@ function switchTab(which){
     if (isAdmin() && !state.owLoaded) loadOpenWindowSettings();
     if (isAdmin()) { renderPreSettingsUI(); }
   }
-  if (which==='logs') { renderLogs(); }
+  if (which==='logs') { renderLogs(true); }
   if (which==='users') { loadUsers(); }
   if (which==='preorders') { renderPreorder(); }
 }
@@ -1114,61 +1117,573 @@ async function renderMissing(){
 /* =========================
    Logs
    ========================= */
-async function renderLogs(){
-  logsTableBody.innerHTML = '<tr><td colspan="7">載入中…</td></tr>';
-  try{
-    const data = await getLogs();
-    logsTableBody.replaceChildren();
+const LOG_CATEGORY_OPTIONS = [
+  { value: 'all', label: '全部分類' },
+  { value: 'login', label: '登入紀錄' },
+  { value: 'order-update', label: '訂單更新' },
+  { value: 'order', label: '訂單與付款' },
+  { value: 'preorder', label: '預訂便當' },
+  { value: 'menu', label: '菜單管理' },
+  { value: 'settings', label: '系統設定' },
+  { value: 'upload', label: '檔案 / 圖片' },
+  { value: 'user', label: '使用者管理' },
+  { value: 'other', label: '其他' },
+];
+const LOG_CATEGORY_LABELS = Object.fromEntries(LOG_CATEGORY_OPTIONS.map(opt => [opt.value, opt.label]));
+
+const WEEKDAY_NAMES = {
+  0: '週日',
+  1: '週一',
+  2: '週二',
+  3: '週三',
+  4: '週四',
+  5: '週五',
+  6: '週六',
+};
+
+const LOG_DETAIL_KEY_LABELS = {
+  seat: '座號',
+  itemsCount: '品項數',
+  internalOnly: '內訂',
+  menuId: '菜單ID',
+  itemId: '品項ID',
+  name: '名稱',
+  price: '單價',
+  paid: '已付款',
+  deletedItems: '刪除筆數',
+  resetOrders: '已重置座號',
+  enabled: '啟用狀態',
+  dates: '日期',
+  targetId: '目標ID',
+  username: '帳號',
+  role: '角色',
+  status: '狀態',
+  from: '原角色',
+  to: '新角色',
+  ids: 'ID',
+  openDays: '開放日',
+  openStart: '開始時間',
+  openEnd: '結束時間',
+  filename: '檔案',
+  size: '大小',
+  date: '日期',
+};
+
+function ensureObject(value){
+  return value && typeof value === 'object' ? value : {};
+}
+
+function joinParts(parts, separator='；'){
+  return parts
+    .map(part => typeof part === 'string' ? part.trim() : part)
+    .filter(part => part && String(part).trim())
+    .join(separator);
+}
+
+function formatBytes(bytes){
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function boolFrom(value){
+  if (value === true || value === 'true' || value === '1' || value === 1) return true;
+  if (value === false || value === 'false' || value === '0' || value === 0) return false;
+  return null;
+}
+
+function boolText(value, { yes='是', no='否' }={}){
+  const result = boolFrom(value);
+  if (result === null) return '';
+  return result ? yes : no;
+}
+
+function formatWeekdays(days){
+  if (!Array.isArray(days) || !days.length) return '';
+  return days.map(d => WEEKDAY_NAMES[d] ?? String(d)).join('、');
+}
+
+function formatList(list, { limit=5, separator='、', unit='筆' }={}){
+  if (!Array.isArray(list) || !list.length) return '';
+  const preview = list.slice(0, limit).join(separator);
+  if (list.length > limit){
+    return `${preview}${separator}…（共 ${list.length}${unit}）`;
+  }
+  return preview;
+}
+
+function translateDetailKey(key){
+  return LOG_DETAIL_KEY_LABELS[key] || key;
+}
+
+function formatDetailValue(value){
+  if (Array.isArray(value)) return value.map(v => formatDetailValue(v)).join('、');
+  if (value && typeof value === 'object'){
+    try { return JSON.stringify(value); }
+    catch { return '[物件]'; }
+  }
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return value == null ? '' : String(value);
+}
+
+function parseLogDetails(details){
+  if (details == null) return { parsed: null, rawText: '' };
+  if (typeof details === 'string'){
+    const trimmed = details.trim();
+    if (!trimmed) return { parsed: null, rawText: '' };
+    try {
+      const parsed = JSON.parse(trimmed);
+      return { parsed, rawText: JSON.stringify(parsed, null, 2) };
+    } catch {
+      return { parsed: null, rawText: details };
+    }
+  }
+  if (typeof details === 'object'){
+    try {
+      return { parsed: details, rawText: JSON.stringify(details, null, 2) };
+    } catch {
+      return { parsed: details, rawText: '' };
+    }
+  }
+  return { parsed: null, rawText: String(details) };
+}
+
+function fallbackActionLabel(action){
+  if (!action) return '其他事件';
+  return action.replace(/\./g, '／');
+}
+
+const LOG_ACTION_DEFS = {
+  login: {
+    category: 'login',
+    label: '登入系統',
+    message(details){
+      const data = ensureObject(details);
+      const username = data.username || data.name || data.user;
+      return username ? `帳號：${username}` : '帳號資訊未提供';
+    },
+  },
+  'upload.image': {
+    category: 'upload',
+    label: '上傳圖片',
+    message(details){
+      const data = ensureObject(details);
+      const filename = data.filename || data.name;
+      const sizeText = formatBytes(data.size);
+      return joinParts([
+        filename ? `檔案：${filename}` : '',
+        sizeText ? `大小：${sizeText}` : '',
+      ]);
+    },
+  },
+  'settings.openWindow': {
+    category: 'settings',
+    label: '更新開放時段',
+    message(details){
+      const data = ensureObject(details);
+      const days = formatWeekdays(data.openDays);
+      const timeRange = data.openStart && data.openEnd
+        ? `時段：${data.openStart} - ${data.openEnd}`
+        : '';
+      return joinParts([
+        days ? `開放日：${days}` : '',
+        timeRange,
+      ]);
+    },
+  },
+  'settings.activeMenu': {
+    category: 'settings',
+    label: '切換菜單',
+    message(details){
+      const data = ensureObject(details);
+      return data.menuId != null ? `切換至菜單 #${data.menuId}` : '';
+    },
+  },
+  'settings.preorder': {
+    category: 'settings',
+    label: '更新預訂設定',
+    message(details){
+      const data = ensureObject(details);
+      const enabledText = boolText(data.enabled);
+      const dates = Array.isArray(data.dates) && data.dates.length
+        ? `開放日期：${data.dates.join('、')}`
+        : '';
+      return joinParts([
+        enabledText ? `啟用：${enabledText}` : '',
+        dates,
+      ]);
+    },
+  },
+  'menu.create': {
+    category: 'menu',
+    label: '新增菜單',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.id != null ? `ID：${data.id}` : '',
+        data.name ? `名稱「${data.name}」` : '',
+      ]);
+    },
+  },
+  'menu.update': {
+    category: 'menu',
+    label: '更新菜單',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.id != null) parts.push(`菜單 #${data.id}`);
+      if ('name' in data) parts.push(data.name ? `名稱改為「${data.name}」` : '清除名稱');
+      if ('note' in data) parts.push(data.note ? '更新備註' : '清除備註');
+      if ('imageFilename' in data) parts.push(data.imageFilename ? `更新圖片：${data.imageFilename}` : '移除圖片');
+      return joinParts(parts);
+    },
+  },
+  'menu.delete': {
+    category: 'menu',
+    label: '刪除菜單',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.id != null ? `菜單 #${data.id}` : '',
+        data.name ? `名稱「${data.name}」` : '',
+      ]);
+    },
+  },
+  'menu.item.create': {
+    category: 'menu',
+    label: '新增菜色',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.menuId != null) parts.push(`菜單 #${data.menuId}`);
+      if (data.name) parts.push(`名稱「${data.name}」`);
+      if (data.itemId != null) parts.push(`品項ID：${data.itemId}`);
+      if (data.price != null && Number.isFinite(Number(data.price))) parts.push(`單價 ${fmt(Number(data.price))} 元`);
+      return joinParts(parts);
+    },
+  },
+  'menu.item.update': {
+    category: 'menu',
+    label: '更新菜色',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.itemId != null) parts.push(`品項 #${data.itemId}`);
+      if ('name' in data && data.name) parts.push(`名稱改為「${data.name}」`);
+      if ('price' in data && Number.isFinite(Number(data.price))) parts.push(`單價 ${fmt(Number(data.price))} 元`);
+      return joinParts(parts);
+    },
+  },
+  'menu.item.delete': {
+    category: 'menu',
+    label: '刪除菜色',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.itemId != null ? `品項 #${data.itemId}` : '',
+        data.name ? `名稱「${data.name}」` : '',
+      ]);
+    },
+  },
+  'order.update': {
+    category: 'order-update',
+    label: '更新訂單',
+    message(details){
+      const data = ensureObject(details);
+      const itemsCount = Number(data.itemsCount);
+      const parts = [];
+      if (data.seat != null) parts.push(`座號 ${data.seat}`);
+      if (Number.isFinite(itemsCount)) parts.push(`品項 ${fmt(itemsCount)} 項`);
+      const internal = boolText(data.internalOnly);
+      if (internal) parts.push(`內訂：${internal}`);
+      return joinParts(parts);
+    },
+  },
+  'order.paid': {
+    category: 'order',
+    label: '更新付款狀態',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.seat != null) parts.push(`座號 ${data.seat}`);
+      const paidText = boolText(data.paid);
+      if (paidText) parts.push(`付款：${paidText}`);
+      return joinParts(parts);
+    },
+  },
+  'orders.purgeToday': {
+    category: 'order',
+    label: '刪除今日訂單',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (Number.isFinite(Number(data.deletedItems))) parts.push(`刪除 ${fmt(Number(data.deletedItems))} 筆項目`);
+      const reset = formatList(data.resetOrders, { limit: 5, unit: '筆' });
+      if (reset) parts.push(`重置座號：${reset}`);
+      return joinParts(parts);
+    },
+  },
+  'preorder.update': {
+    category: 'preorder',
+    label: '更新預訂訂單',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.date) parts.push(`日期 ${data.date}`);
+      if (data.seat != null) parts.push(`座號 ${data.seat}`);
+      if (Number.isFinite(Number(data.itemsCount))) parts.push(`品項 ${fmt(Number(data.itemsCount))} 項`);
+      const internal = boolText(data.internalOnly);
+      if (internal) parts.push(`內訂：${internal}`);
+      return joinParts(parts);
+    },
+  },
+  'preorder.paid': {
+    category: 'preorder',
+    label: '更新預訂付款',
+    message(details){
+      const data = ensureObject(details);
+      const parts = [];
+      if (data.date) parts.push(`日期 ${data.date}`);
+      if (data.seat != null) parts.push(`座號 ${data.seat}`);
+      const paidText = boolText(data.paid);
+      if (paidText) parts.push(`付款：${paidText}`);
+      return joinParts(parts);
+    },
+  },
+  'user.create': {
+    category: 'user',
+    label: '新增使用者',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.username ? `帳號：${data.username}` : '',
+        data.role ? `角色：${data.role}` : '',
+        data.id != null ? `ID：${data.id}` : '',
+      ]);
+    },
+  },
+  'user.changePassword': {
+    category: 'user',
+    label: '重設使用者密碼',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.targetId != null ? `目標ID：${data.targetId}` : '',
+        data.by ? `觸發來源：${data.by}` : '',
+      ]);
+    },
+  },
+  'user.status': {
+    category: 'user',
+    label: '調整使用者狀態',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.targetId != null ? `目標ID：${data.targetId}` : '',
+        data.status ? `狀態：${data.status}` : '',
+      ]);
+    },
+  },
+  'user.role': {
+    category: 'user',
+    label: '調整使用者角色',
+    message(details){
+      const data = ensureObject(details);
+      const from = data.from ? `原角色：${data.from}` : '';
+      const to = data.to ? `新角色：${data.to}` : '';
+      return joinParts([
+        data.targetId != null ? `目標ID：${data.targetId}` : '',
+        from,
+        to,
+      ]);
+    },
+  },
+  'user.delete': {
+    category: 'user',
+    label: '刪除使用者',
+    message(details){
+      const data = ensureObject(details);
+      return joinParts([
+        data.targetId != null ? `目標ID：${data.targetId}` : '',
+        data.username ? `帳號：${data.username}` : '',
+      ]);
+    },
+  },
+  'user.bulkDelete': {
+    category: 'user',
+    label: '批次刪除使用者',
+    message(details){
+      const data = ensureObject(details);
+      const idsText = formatList(data.ids, { limit: 6, unit: '位' });
+      if (idsText) return `使用者：${idsText}`;
+      if (Array.isArray(data.ids)) return `共刪除 ${fmt(data.ids.length)} 位使用者`;
+      return '';
+    },
+  },
+};
+
+if (logCategoryFilter){
+  logCategoryFilter.replaceChildren();
+  LOG_CATEGORY_OPTIONS.forEach(opt => {
+    const option = document.createElement('option');
+    option.value = opt.value;
+    option.textContent = opt.label;
+    logCategoryFilter.appendChild(option);
+  });
+  logCategoryFilter.value = LOG_CATEGORY_OPTIONS[0]?.value || 'all';
+}
+
+function describeLogEntry(entry){
+  const { parsed, rawText } = parseLogDetails(entry.details);
+  const def = LOG_ACTION_DEFS[entry.action] || null;
+  const details = parsed ?? null;
+  const categoryKey = def?.category || 'other';
+  const categoryLabel = LOG_CATEGORY_LABELS[categoryKey] || LOG_CATEGORY_LABELS.other;
+  let label = def
+    ? (typeof def.label === 'function' ? def.label(details, entry) : (def.label || fallbackActionLabel(entry.action)))
+    : fallbackActionLabel(entry.action);
+  if (!label) label = fallbackActionLabel(entry.action);
+
+  let message = '';
+  if (def){
+    const rawMessage = typeof def.message === 'function' ? def.message(details, entry) : def.message;
+    if (Array.isArray(rawMessage)) message = joinParts(rawMessage);
+    else if (rawMessage) message = String(rawMessage);
+  }
+  if (!message){
+    if (details && typeof details === 'object'){
+      if (Array.isArray(details)){
+        message = details.map(item => formatDetailValue(item)).join('、');
+      } else {
+        const pairs = Object.entries(details).map(([key, value]) => `${translateDetailKey(key)}：${formatDetailValue(value)}`);
+        message = joinParts(pairs);
+      }
+    } else if (rawText){
+      message = rawText.replace(/\s+/g, ' ').trim();
+      if (message.length > 120) message = `${message.slice(0, 117)}…`;
+    }
+  }
+  if (!message) message = '（無詳細說明）';
+
+  return {
+    category: categoryKey,
+    categoryLabel,
+    label,
+    message,
+    rawDetailsText: rawText,
+    details,
+  };
+}
+
+async function renderLogs(forceReload=false){
+  if (!logsTableBody) return;
+  if (forceReload || !Array.isArray(logsCache)){
+    logsTableBody.innerHTML = '<tr><td colspan="8">載入中…</td></tr>';
+    if (logCategoryHint) logCategoryHint.textContent = '載入中…';
+    try{
+      const data = await getLogs();
+      const logs = Array.isArray(data.logs) ? data.logs : [];
+      logsCache = logs.map(entry => ({ entry, desc: describeLogEntry(entry) }));
+    }catch(e){
+      logsCache = [];
+      logsTableBody.innerHTML = `<tr><td colspan="8">讀取失敗：${safeText(e.message)}</td></tr>`;
+      if (logCategoryHint) logCategoryHint.textContent = '讀取失敗，請稍後再試';
+      console.error(e);
+      return;
+    }
+  }
+
+  const totalCount = Array.isArray(logsCache) ? logsCache.length : 0;
+  const categoryValue = logCategoryFilter ? logCategoryFilter.value : 'all';
+  const rows = Array.isArray(logsCache)
+    ? logsCache.filter(row => categoryValue === 'all' || row.desc.category === categoryValue)
+    : [];
+
+  logsTableBody.replaceChildren();
+  if (!rows.length){
+    const tr = document.createElement('tr');
+    const td = document.createElement('td');
+    td.colSpan = 8;
+    td.textContent = totalCount ? '此分類目前沒有紀錄。' : '目前沒有任何審計紀錄。';
+    tr.appendChild(td);
+    logsTableBody.appendChild(tr);
+  } else {
     const frag = document.createDocumentFragment();
-    const logs = Array.isArray(data.logs) ? data.logs : [];
-    logs.forEach(l => {
+    rows.forEach(({ entry, desc }) => {
       const tr = document.createElement('tr');
 
       const idTd = document.createElement('td');
-      idTd.textContent = l.id == null ? '' : String(l.id);
+      idTd.textContent = entry.id == null ? '' : String(entry.id);
       tr.appendChild(idTd);
 
-      const ts = l.ts ? new Date(l.ts) : null;
       const tsTd = document.createElement('td');
-      tsTd.textContent = ts ? ts.toLocaleString('zh-TW',{hour12:false}) : '';
+      tsTd.textContent = formatTaiwanTime(entry.ts);
       tr.appendChild(tsTd);
 
+      const categoryTd = document.createElement('td');
+      categoryTd.textContent = desc.categoryLabel;
+      tr.appendChild(categoryTd);
+
+      const labelTd = document.createElement('td');
+      labelTd.textContent = desc.label;
+      tr.appendChild(labelTd);
+
+      const messageTd = document.createElement('td');
+      const messageDiv = document.createElement('div');
+      messageDiv.className = 'log-message';
+      messageDiv.textContent = desc.message || '（無詳細說明）';
+      messageTd.appendChild(messageDiv);
+      if (desc.rawDetailsText){
+        const detailsEl = document.createElement('details');
+        detailsEl.className = 'log-details';
+        const summary = document.createElement('summary');
+        summary.textContent = '檢視原始資料';
+        const pre = document.createElement('pre');
+        pre.textContent = desc.rawDetailsText;
+        detailsEl.appendChild(summary);
+        detailsEl.appendChild(pre);
+        messageTd.appendChild(detailsEl);
+      }
+      tr.appendChild(messageTd);
+
       const userTd = document.createElement('td');
-      userTd.textContent = l.user_id == null ? '' : String(l.user_id);
+      userTd.textContent = entry.user_id == null ? '' : `#${entry.user_id}`;
       tr.appendChild(userTd);
 
-      const actionTd = document.createElement('td');
-      actionTd.textContent = l.action || '';
-      tr.appendChild(actionTd);
-
-      const detailsTd = document.createElement('td');
-      const pre = document.createElement('pre');
-      pre.style.whiteSpace = 'pre-wrap';
-      pre.style.margin = '0';
-      let details = l.details;
-      try {
-        if (details) details = JSON.stringify(JSON.parse(details), null, 2);
-      } catch {}
-      pre.textContent = details || '';
-      detailsTd.appendChild(pre);
-      tr.appendChild(detailsTd);
-
       const ipTd = document.createElement('td');
-      ipTd.textContent = l.ip || '';
+      ipTd.textContent = entry.ip || '';
       tr.appendChild(ipTd);
 
       const uaTd = document.createElement('td');
       uaTd.className = 'small muted';
-      uaTd.textContent = (l.ua || '').slice(0,80);
+      const ua = entry.ua || '';
+      uaTd.textContent = ua.length > 80 ? `${ua.slice(0, 77)}…` : ua;
       tr.appendChild(uaTd);
 
       frag.appendChild(tr);
     });
     logsTableBody.appendChild(frag);
-  }catch(e){
-    logsTableBody.innerHTML = `<tr><td colspan="7">讀取失敗：${safeText(e.message)}</td></tr>`;
+  }
+
+  if (logCategoryHint){
+    if (!totalCount){
+      logCategoryHint.textContent = '目前沒有任何審計紀錄';
+    } else {
+      const label = LOG_CATEGORY_LABELS[categoryValue] || LOG_CATEGORY_LABELS.other;
+      logCategoryHint.textContent = categoryValue === 'all'
+        ? `顯示 ${rows.length} 筆，共 ${totalCount} 筆`
+        : `${label}：顯示 ${rows.length} 筆（全部共 ${totalCount} 筆）`;
+    }
   }
 }
+
+logCategoryFilter?.addEventListener('change', () => {
+  renderLogs(false);
+});
+
 async function getLogs(){ return api('/logs'); }
 
 /* =========================

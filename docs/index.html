@@ -52,7 +52,7 @@
         <button id="tabPreorder" class="tab hidden">預訂</button>
         <button id="tabMenus" class="tab">菜單</button>
         <button id="tabReports" class="tab">後台</button>
-        <button id="tabLogs" class="tab hidden">Logs</button>
+        <button id="tabLogs" class="tab hidden">紀錄</button>
         <button id="tabUsers" class="tab hidden">使用者</button>
         <!-- 僅 admin 顯示，一鍵捲到「全部座號」 -->
         <button id="tabAllSeats" class="tab hidden">全座號</button>
@@ -341,9 +341,15 @@
     <section id="pageLogs" class="hidden">
       <div class="card">
         <h3>審計紀錄（最近 500 筆）</h3>
+        <div class="row log-filter-row">
+          <label class="log-filter-label">分類
+            <select id="logCategoryFilter"></select>
+          </label>
+          <span id="logCategoryHint" class="small muted"></span>
+        </div>
         <table id="logsTable">
           <thead>
-            <tr><th>ID</th><th>時間</th><th>UserID</th><th>動作</th><th>細節</th><th>IP</th><th>UA</th></tr>
+            <tr><th>ID</th><th>時間</th><th>分類</th><th>事件</th><th>說明</th><th>使用者</th><th>IP</th><th>裝置</th></tr>
           </thead>
         <tbody></tbody>
         </table>
