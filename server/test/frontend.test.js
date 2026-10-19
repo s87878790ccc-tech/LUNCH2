@@ -32,6 +32,7 @@ async function client(
     manualLocked = false,
     username = null,
     users = null,
+    framed = false,
   } = {},
 ) {
   const errors = [],
@@ -48,6 +49,7 @@ async function client(
   t.after(() => dom.window.close());
   const w = dom.window,
     d = w.document;
+  if (framed) dom.reconfigure({ windowTop: {} });
   w.structuredClone = structuredClone;
   w.alert = (message) => alerts.push(message);
   w.confirm = () => true;
@@ -674,6 +676,14 @@ test('students have no overview payment controls', async t => {
   const c = await client(t, { role: 'user', orderItems: [lunchItem] });
   assert.ok(c.d.getElementById('adminAllSeats').classList.contains('hidden'));
   assert.equal(c.d.querySelectorAll('.payment-control input').length, 0);
+});
+
+test('pentest: embedded pages expose no login or administrator controls', async t => {
+  const c = await client(t, { loggedIn: false, framed: true });
+  assert.equal(c.d.getElementById('loginForm'), null);
+  assert.equal(c.d.getElementById('app'), null);
+  assert.match(c.d.body.textContent, /獨立分頁/);
+  assert.equal(c.calls.length, 0);
 });
 
 async function openUsers(c) {

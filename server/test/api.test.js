@@ -452,6 +452,59 @@ test("new account and password changes reject short passwords without replacing 
   await as(request(app).get('/api/auth/me'), user).expect(200);
 });
 
+test('pentest: a student cannot distinguish another existing user from a missing user through password reset', async () => {
+  const statuses = [];
+  for (const id of [3, 999999]) {
+    const response = await as(request(app).put(`/api/users/${id}/password`), user).send({ newPassword: 'isolated-pentest-long-password' });
+    statuses.push(response.status);
+  }
+  assert.deepEqual(statuses, [403, 403]);
+});
+
+test('pentest: an administrator revoked after middleware cannot finish creating an account', async () => {
+  await pool.query("update users set role='admin' where id=3");
+  const token3 = token(3);
+  const query = pool.query;
+  let revoked = false;
+  pool.query = async (sql, args) => {
+    const result = await query(sql, args);
+    if (!revoked && sql.startsWith('select id, username, role, status, password_hash, auth_version from users') && args[0] === 3) {
+      revoked = true;
+      await query("update users set role='user',auth_version=auth_version+1 where id=3");
+    }
+    return result;
+  };
+  try {
+    const result = await as(request(app).post('/api/users'), token3).send({ username: 'revoked-admin-canary', password: 'isolated-pentest-long-password' });
+    assert.ok([401, 403].includes(result.status), `revoked administrator returned ${result.status}`);
+    assert.equal(db.public.one("select count(*) n from users where username='revoked-admin-canary'").n, 0);
+  } finally { pool.query = query; }
+});
+
+test('pentest: a delayed self password change cannot overwrite a newer administrator reset', { timeout: 5000 }, async () => {
+  const originalHash = bcrypt.hash;
+  let entered, release;
+  const enteredGate = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const stalePassword = 'isolated-delayed-self-password';
+  bcrypt.hash = async (password, ...args) => {
+    const hash = await originalHash(password, ...args);
+    if (password === stalePassword) { entered(); await gate; }
+    return hash;
+  };
+  let delayed;
+  try {
+    delayed = as(request(app).put('/api/users/2/password'), user).send({ oldPassword: 'test-password', newPassword: stalePassword }).then(result => result);
+    await enteredGate;
+    await as(request(app).put('/api/users/2/password')).send({ newPassword: 'isolated-new-admin-reset-password' }).expect(200);
+    release();
+    const result = await delayed;
+    assert.ok([401, 409].includes(result.status), `outdated credential write returned ${result.status}`);
+    const current = db.public.one('select password_hash from users where id=2');
+    assert.ok(await bcrypt.compare('isolated-new-admin-reset-password', current.password_hash));
+  } finally { release(); bcrypt.hash = originalHash; if (delayed) await delayed; }
+});
+
 const readOrder = async (route = '/api/orders/2') => (await as(request(app).get(route)).expect(200)).body;
 const markPaid = (route, order, paid = true) => as(request(app).put(route + '/paid')).send({ ...order, paid });
 
@@ -522,13 +575,16 @@ test('duplicate, parallel and numeric-alias creations cannot produce duplicate s
 });
 
 test('a failed account insert does not leave an account or a success response', async () => {
-  const original = pool.query, originalLog = console.error;
-  pool.query = (sql, args) => /^insert into users/i.test(sql.trim()) ? Promise.reject(Object.assign(new Error('fixture'), { code: 'DB_TEST' })) : original(sql, args);
+  const connect = pool.connect, originalLog = console.error;
+  pool.connect = async () => {
+    const client = await connect();
+    return { release: () => client.release(), query: (sql, args) => /^insert into users/i.test(sql.trim()) ? Promise.reject(Object.assign(new Error('fixture'), { code: 'DB_TEST' })) : client.query(sql, args) };
+  };
   console.error = () => {};
   try {
     await as(request(app).post('/api/users')).send({ username: 'fail-canary', password: 'abcdef' }).expect(500);
     assert.equal(db.public.one("select count(*) as n from users where username='fail-canary'").n, 0);
-  } finally { pool.query = original; console.error = originalLog; }
+  } finally { pool.connect = connect; console.error = originalLog; }
 });
 
 test('user pagination, search, filters and no-store responses cover more than one page', async () => {

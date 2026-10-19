@@ -2812,6 +2812,17 @@ setInterval(() => {
 
 // 自動登入驗證（✅ /auth/me 現在統一回傳 { id, username, role }）
 (async function bootstrap(){
+  if (window.self !== window.top) {
+    // GitHub Pages cannot set frame-ancestors/X-Frame-Options for this project.
+    // Refuse to expose interactive controls inside any embedding document.
+    const guard = document.createElement('main'); guard.className = 'card w400';
+    const title = document.createElement('h1'); title.textContent = '請在獨立分頁開啟午餐系統';
+    const message = document.createElement('p'); message.textContent = '為避免其他網頁誘導點擊，嵌入畫面不提供登入或管理操作。';
+    const link = document.createElement('a'); link.href = new URL(location.pathname, location.origin).href;
+    link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = '在獨立分頁開啟系統';
+    guard.append(title, message, link); document.body.replaceChildren(guard);
+    return;
+  }
   renderStatic();
   if (!token) return showLogin();
   try{
