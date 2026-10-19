@@ -3,17 +3,14 @@ const { test, expect } = require('@playwright/test');
 
 test('pentest: a hostile cross-origin frame cannot expose the login or ordering interface', async ({ page }) => {
   const calls = [];
-  // Both origins are loopback, with distinct hostnames. This models two public
-  // origins without Chrome's unrelated public-to-local network restriction.
-  // The hostile document and every external request are synthetic/intercepted.
+  // Two actual loopback servers use distinct ports/origins, preserving Chrome's
+  // local-network protections while isolating the cross-origin frame behavior.
   await page.route('**/*', async route => {
     const url = new URL(route.request().url());
-    if (url.origin === 'http://127.0.0.1:4173') return route.continue();
-    if (url.origin === 'http://localhost:4173')
-      return route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Isolated frame test</title><iframe title="embedded lunch" src="http://127.0.0.1:4173/" width="380" height="800"></iframe>' });
+    if (['http://127.0.0.1:4173', 'http://127.0.0.1:4174'].includes(url.origin)) return route.continue();
     calls.push(url.origin); return route.abort();
   });
-  await page.goto('http://localhost:4173/');
+  await page.goto('http://127.0.0.1:4174/');
   const frame = page.frameLocator('iframe');
   await expect(frame.getByRole('heading', { name: '請在獨立分頁開啟午餐系統' })).toBeVisible();
   await expect(frame.locator('#loginForm')).toHaveCount(0);
