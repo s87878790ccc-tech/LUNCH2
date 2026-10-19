@@ -49,3 +49,9 @@ python3 scripts/scan-secrets.py
 ```
 
 自動化使用隔離記憶體資料庫、JSDOM、CI 本機 PostgreSQL 及攔截外部 API 的 Chromium，不更改正式訂單或帳號。正式環境檢查限於已授權的低量讀取、未登入拒絕存取、CORS／標頭與資料庫權限盤點，不執行密碼猜測、負載攻擊、刪除或真實付款操作。實體裝置及供應商帳號的 MFA／復原機制不在這組自動測試範圍內。本輪重現、修補及限制見 `SECURITY_TESTING.md`。
+
+### Persistent authentication limits and protected UI entry
+
+Normal `node server.js` startup uses PostgreSQL-backed login, password-change and upload counters. Apply the additive `persistent_security_limits` migration before deployment. HMAC keys contain no raw account/IP; namespaces and minute windows are independent. PostgreSQL atomic increments are shared across processes/restarts; store failure rejects the operation (503). General API admission remains an in-memory, per-process limiter. Expired security counters are pruned in bounded batches; no business records are pruned. Limit thresholds are unchanged. Repeated denials produce bounded structured security log events; external alert delivery and account MFA require separate configuration.
+
+The existing UI is also served at <https://lunch2.onrender.com/> from the generated `server/public` package (verified byte-for-byte against `docs` in CI; update with `npm run assets`) with HTTP CSP (`frame-ancestors 'none'`), X-Frame-Options DENY and an explicit three-file allowlist. The original GitHub Pages URL remains compatible with its application frame guard; use the Render entry for HTTP-level framing protection. API CSP remains distinct. Changing origin requires signing in again because tokens are tab/origin scoped.

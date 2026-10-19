@@ -13,7 +13,15 @@ http.createServer((req, res) => {
 
 // A real second loopback origin is needed for frame tests. A fulfilled virtual
 // public origin can trigger Chrome's local-network checks before loading the app.
-http.createServer((_req, res) => {
+http.createServer((req, res) => {
   res.setHeader('Content-Type', 'text/html');
-  res.end('<!doctype html><title>Isolated frame test</title><iframe title="embedded lunch" src="http://127.0.0.1:4173/" width="380" height="800"></iframe>');
+  const port = req.url === '/secure' ? 4175 : 4173;
+  res.end(`<!doctype html><title>Isolated frame test</title><iframe title="embedded lunch" src="http://127.0.0.1:${port}/" width="380" height="800"></iframe>`);
 }).listen(4174, '127.0.0.1');
+
+// The actual Express UI handler and headers, without start()/seed()/DB access.
+process.env.DATABASE_URL = 'postgres://isolated:isolated@127.0.0.1:1/lunch_test';
+process.env.JWT_SECRET = 'isolated-ui-header-test-secret';
+process.env.ADMIN_DEFAULT_PASS = 'isolated-ui-admin';
+process.env.SEAT_DEFAULT_PASS = 'isolated-ui-seat';
+require('../server').app.listen(4175, '127.0.0.1');

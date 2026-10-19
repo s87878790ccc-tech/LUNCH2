@@ -37,3 +37,18 @@ test('pentest: a hostile cross-origin frame cannot expose the login or ordering 
   await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
   expect(calls).toEqual([]);
 });
+
+
+test('maintenance: actual Express CSP allows existing ordering UI and blocks cross-origin framing', async ({ page, request }) => {
+  const response = await request.get('http://127.0.0.1:4175/');
+  expect(response.headers()['content-security-policy']).toContain("frame-ancestors 'none'");
+  expect(response.headers()['x-frame-options']).toBe('DENY');
+  await fixture(page, 'http://127.0.0.1:4175');
+  await expect(page.locator('#allSeatsGrid .seat-card')).toHaveCount(36);
+  const errors = [];
+  page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
+  await page.unroute('**/*');
+  await page.goto('http://127.0.0.1:4174/secure');
+  await expect.poll(() => errors.join(' ')).toMatch(/frame-ancestors|X-Frame-Options|refused to frame/i);
+  await expect(page.frameLocator('iframe').locator('#loginForm')).toHaveCount(0);
+});

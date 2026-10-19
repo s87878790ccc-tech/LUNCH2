@@ -52,6 +52,45 @@ test('real PostgreSQL payment migration, locking and rollback', { skip: !databas
   const item = { name: '測試便當', unitPrice: 95, qty: 2 };
   await real.query('insert into orders(seat,submitted,paid,created_at,updated_at) values(2,true,true,now(),now())');
   await real.query("insert into order_items(order_id,name,unit_price,qty) values(1,'測試便當',95,2)");
+  await t.test('shared PostgreSQL rate counters survive adapter restart, serialize increments, isolate windows and deny public grants', async () => {
+    const { PostgresRateStore, pruneRateLimits } = require('../rate-store');
+    await real.query("do $$ begin if not exists(select from pg_roles where rolname='anon') then create role anon; end if; if not exists(select from pg_roles where rolname='authenticated') then create role authenticated; end if; end $$;");
+    await real.query(fs.readFileSync(path.join(__dirname, '../../supabase/migrations/20261019235020_persistent_security_limits.sql'), 'utf8'));
+    let now = 60000;
+    const adapter = () => {
+      const store = new PostgresRateStore(real.query.bind(real), 'isolated-test', 'synthetic-only-secret', () => now);
+      store.init({ windowMs: 60000 }); return store;
+    };
+    const first = adapter(), key = first.key('synthetic-user@example.invalid');
+    assert.ok(!key.includes('synthetic-user'));
+    const results = await Promise.all(Array.from({ length: 20 }, () => first.increment(key)));
+    assert.deepEqual(results.map(r => r.totalHits).sort((a,b) => a-b), Array.from({ length:20 }, (_,i) => i+1));
+    const second = adapter();
+    assert.equal((await second.increment(second.key('synthetic-user@example.invalid'))).totalHits, 21);
+    now += 60000;
+    const nextKey = second.key('synthetic-user@example.invalid');
+    assert.equal((await second.increment(nextKey)).totalHits, 1);
+    await first.decrement(key); // delayed success from the previous window
+    assert.equal((await second.increment(nextKey)).totalHits, 2);
+    const access = (await real.query("select has_schema_privilege('anon','lunch_security','usage') a, has_table_privilege('authenticated','lunch_security.rate_limits','select') b, relrowsecurity from pg_class where oid='lunch_security.rate_limits'::regclass")).rows[0];
+    assert.deepEqual(access, { a:false, b:false, relrowsecurity:true });
+    const express = require('express'), rateLimit = require('express-rate-limit');
+    const instance = () => {
+      const store = adapter(), api = express();
+      api.use(rateLimit({ windowMs:60000, limit:2, store, keyGenerator:() => store.key('isolated-http-counter'), standardHeaders:'draft-7', legacyHeaders:false }));
+      api.get('/', (_req,res) => res.json({ ok:true }));
+      return api;
+    };
+    const api1 = instance(), api2 = instance();
+    await request(api1).get('/').expect(200);
+    await request(api2).get('/').expect(200);
+    const limited = await request(instance()).get('/').expect(429);
+    assert.ok(Number(limited.headers['retry-after']) > 0);
+    now += 60000;
+    await request(api1).get('/').expect(200);
+    await pruneRateLimits(real.query.bind(real));
+    assert.equal((await real.query('select count(*)::int n from lunch_security.rate_limits')).rows[0].n, 0);
+  });
   const migration = fs.readFileSync(path.join(__dirname, '../../supabase/migrations/20261019125241_quick_payment_context.sql'), 'utf8');
 
   await t.test('the additive migration preserves IDs, items, payment, RLS and is repeatable', async () => {

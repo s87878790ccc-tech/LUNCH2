@@ -11,3 +11,8 @@ for (const asset of ['app.js', 'styles.css']) {
 }
 fs.writeFileSync(file, html);
 console.log('Frontend asset versions updated.');
+
+// Render's service root is server/: publish only the three vetted UI assets.
+const packaged = path.join(__dirname, '../public');
+fs.mkdirSync(packaged, { recursive:true });
+for (const asset of ['index.html', 'app.js', 'styles.css']) fs.copyFileSync(path.join(docs, asset), path.join(packaged, asset));
