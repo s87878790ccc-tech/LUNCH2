@@ -20,7 +20,7 @@
 
 | API | 用途 |
 | --- | --- |
-| `GET /api/orders` | 管理員讀目前日期、批次與全部 36 座號 |
+| `GET /api/orders` | 管理員讀目前日期、批次與全部座號（原 1～36 與新增的有效數字帳號） |
 | `GET /api/orders/:seat` | 讀自己的座號，管理員可讀其他座號 |
 | `PUT /api/orders/:seat/paid` | 管理員更新目前訂單付款，請求含 `paid, orderId, version, date, batch` |
 | `PUT /api/preorders/:date/:seat/paid` | 管理員更新指定日期預訂付款，版本必須相符 |

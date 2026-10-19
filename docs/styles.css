@@ -936,3 +936,18 @@ details > summary {
     transition: none !important;
   }
 }
+#pageUsers .user-create-row, #pageUsers .user-filters, #pageUsers .user-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+#pageUsers input, #pageUsers select { min-width: 0; max-width: 100%; }
+#pageUsers .user-actions input { flex: 1 1 170px; }
+#pageUsers .user-created { outline: 2px solid #16845e; outline-offset: -2px; }
+#pageUsers td, #pageUsers p { overflow-wrap: anywhere; }
+#createUserStatus, #usersLoadStatus { min-height: 1.4em; }
+@media (max-width: 600px) {
+  #pageUsers .user-create-row > input, #pageUsers .user-filters > input { flex: 1 1 100%; width: 100%; }
+  #pageUsers button, #pageUsers select, #pageUsers input { min-height: 44px; }
+}

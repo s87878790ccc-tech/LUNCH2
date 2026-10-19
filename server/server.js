@@ -14,6 +14,7 @@ const multer = require('multer');
 const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
 const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
 const { currentContext, orderJSON, joinedOrders, assertReference, contentChanged, updatePayment } = require('./payments');
+const { MAX_SEAT, passwordError, seatNumber, seatsFromUsers } = require('./users');
 
 // Express 4 does not forward rejected async handlers to its error middleware.
 const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -213,7 +214,7 @@ app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(enforcePlainObjectBody);
 app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
-for (const [key, max] of [['seat', 36], ['id', 2_147_483_647], ['itemId', 2_147_483_647]]) {
+for (const [key, max] of [['seat', MAX_SEAT], ['id', 2_147_483_647], ['itemId', 2_147_483_647]]) {
   app.param(key, (_req, _res, next, value) => next(
     integer(value, 1, max) ? undefined : badRequest(`無效的 ${key}`)
   ));
@@ -578,9 +579,16 @@ async function orderContext(client = null) {
 function userCanAccessSeat(user, seat) {
   if (!user) return false;
   if (user.role === 'admin') return true;
-  const n = Number(user.username);
-  return Number.isInteger(n) && n === seat;
+  return seatNumber(user.username) === seat;
 }
+
+async function getSeats() {
+  return seatsFromUsers(await q('select username from users'));
+}
+
+app.get('/api/seats', auth(), asyncRoute(async (_req, res) => {
+  res.json({ seats: await getSeats() });
+}));
 
 /* =========================
    時區設定（24h）
@@ -903,15 +911,15 @@ async function validateManualLock(user, client, items, previousItems) {
   }
 }
 // Orders
-// A single read replaces 36 per-seat HTTP requests in the admin overview.
+// One order snapshot covers the roster, including newly created numeric seats.
 app.get('/api/orders', auth(), requireAdmin, asyncRoute(async (_req, res) => {
   const context = await orderContext();
   const rows = await q(`select o.*, i.id as line_id, i.name as line_name, i.unit_price as line_price, i.qty as line_qty, i.updated_at as line_updated_at
     from orders o left join order_items i on i.order_id=o.id
-    where o.order_date=$1 and o.order_batch=$2 and o.seat between 1 and 36 order by o.seat, i.id`, [context.date, context.batch]);
+    where o.order_date=$1 and o.order_batch=$2 order by o.seat, i.id`, [context.date, context.batch]);
   const bySeat = joinedOrders(rows);
-  res.json({ ...context, orders: Array.from({ length: 36 }, (_, i) => {
-    const seat = i + 1;
+  const seats = [...new Set([...(await getSeats()), ...bySeat.keys()])].sort((a, b) => a - b);
+  res.json({ ...context, orders: seats.map(seat => {
     const record = bySeat.get(seat);
     return orderJSON(record?.order, record?.items || [], seat, context);
   }) });
@@ -1010,8 +1018,7 @@ app.get('/api/reports/missing', auth(), requireAdmin, asyncRoute(async (req, res
   const context = await orderContext();
   const rows = await q('select seat, submitted from orders where order_date=$1 and order_batch=$2', [context.date, context.batch]);
   const submittedSet = new Set(rows.filter(r => r.submitted).map(r => r.seat));
-  const missing = [];
-  for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
+  const missing = (await getSeats()).filter(seat => !submittedSet.has(seat));
   res.json({ missing });
 }));
 // 未付款清單只計入目前日期／批次。
@@ -1200,12 +1207,15 @@ app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const username = normalizeUsernameInput(body.username);
   const password = normalizePasswordInput(body.password);
-  const role = body.role === 'admin' ? 'admin' : 'user';
-  if (!username || username.length > USERNAME_MAX_LEN) return res.status(400).json({ message: 'bad username' });
-  if (!password || password.length < 12 || password.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: '新密碼至少需要 12 碼' });
-  if (Buffer.byteLength(password, 'utf8') > 72) throw badRequest('密碼不可超過 72 個 UTF-8 位元組');
-  const exist = await one('select 1 from users where username=$1', [username]);
-  if (exist) return res.status(409).json({ message: 'username already exists' });
+  const role = body.role === undefined ? 'user' : body.role;
+  if (!['admin', 'user'].includes(role)) throw badRequest('角色必須為一般使用者或管理員');
+  if (!username || username.length > USERNAME_MAX_LEN) throw badRequest('帳號需為 1～64 個字元');
+  // Reject numeric aliases such as 01, 1e0 and 0x1: they must not create a
+  // second account capable of accessing another seat's orders.
+  if (Number.isFinite(Number(username)) && seatNumber(username) === null)
+    throw badRequest('座號帳號請使用 1～2147483647 的整數，不可含前導零或其他數字格式');
+  const error = passwordError(password, role);
+  if (error) throw badRequest(error);
   const hash = await bcrypt.hash(password, 10);
   const row = await one(
     `insert into users(username, password_hash, role, status, created_at, updated_at)
@@ -1213,6 +1223,7 @@ app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
      returning id, username, role, status`,
     [username, hash, role]
   );
+  if (!row) return res.status(409).json({ message: '此帳號已存在，請在使用者清單中查詢' });
   await logAction(req.user, 'user.create', { id: row.id, username, role }, req);
   res.json(row);
 }));
@@ -1222,17 +1233,23 @@ app.get('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
   const page = req.query.page === undefined ? 1 : req.query.page;
   const pageSize = req.query.pageSize === undefined ? 20 : req.query.pageSize;
+  const afterId = req.query.afterId;
   if (!integer(page, 1, 1_000_000) || !integer(pageSize, 5, 100)) throw badRequest('無效的分頁參數');
+  if (afterId !== undefined && !integer(afterId, 0, 2_147_483_647)) throw badRequest('無效的清單游標');
 
   const clauses = [];
   const params = [];
   if (qkw) { params.push(`%${qkw}%`); clauses.push(`username ilike $${params.length}`); }
   if (role === 'admin' || role === 'user') { params.push(role); clauses.push(`role=$${params.length}`); }
   if (status === 'active' || status === 'disabled') { params.push(status); clauses.push(`status=$${params.length}`); }
-  const where = clauses.length ? 'where ' + clauses.join(' and ') : '';
+  let where = clauses.length ? 'where ' + clauses.join(' and ') : '';
 
   const totalRow = await one(`select count(*)::int as c from users ${where}`, params);
-  params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
+  if (afterId !== undefined) {
+    params.push(Number(afterId)); clauses.push(`id>$${params.length}`);
+    where = 'where ' + clauses.join(' and ');
+  }
+  params.push(Number(pageSize), afterId === undefined ? (Number(page) - 1) * Number(pageSize) : 0);
   const rows = await q(
     `select id, username, role, status, created_at, updated_at, last_login_at
      from users
@@ -1250,15 +1267,15 @@ app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   const body = getBody(req);
   const oldPassword = normalizePasswordInput(body.oldPassword);
   const newPassword = normalizePasswordInput(body.newPassword);
-  if (!newPassword || newPassword.length < 12) return res.status(400).json({ message: '新密碼至少需要 12 碼' });
-  if (newPassword.length > PASSWORD_MAX_LEN || Buffer.byteLength(newPassword, 'utf8') > 72) return res.status(400).json({ message: '新密碼不可超過 72 個 UTF-8 位元組' });
-
   const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
 
   const isAdmin = req.user && req.user.role === 'admin';
   const isSelf = req.user && req.user.uid === targetId;
   if (!isAdmin && !isSelf) return res.status(403).json({ message: 'forbidden' });
+
+  const error = passwordError(newPassword, u.role);
+  if (error) throw badRequest(error);
 
   if (!isAdmin) {
     if (!oldPassword) return res.status(400).json({ message: 'oldPassword required' });
@@ -1366,7 +1383,7 @@ app.use((err, _req, res, next) => {
   if (err.message === 'Not allowed by CORS') return res.status(403).json({ message: '此來源不允許存取' });
   if (err.type === 'entity.parse.failed') return res.status(400).json({ message: 'JSON 格式不正確' });
   if (err.type === 'entity.too.large') return res.status(413).json({ message: '請求內容過大' });
-  if (err.code === '23505') return res.status(409).json({ message: '資料已存在，請重新載入後再試' });
+  if (err.code === '23505') return res.status(409).json({ message: err.constraint === 'users_username_key' ? '此帳號已存在，請在使用者清單中查詢' : '資料已存在，請重新載入後再試' });
   if (err.code === '23503') return res.status(409).json({ message: '資料仍被使用或參照不存在，請重新載入後再試' });
   const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
   if (status === 500) console.error('Request failed:', err.code || 'UNKNOWN');

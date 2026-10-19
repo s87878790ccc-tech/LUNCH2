@@ -148,7 +148,7 @@ test("an invalid update cannot erase a previously valid order", async () => {
 test("invalid IDs, seats, dates and pagination produce JSON validation errors", async () => {
   for (const route of [
     "/api/orders/0",
-    "/api/orders/37",
+    "/api/orders/2147483648",
     "/api/orders/NaN",
     "/api/preorders/2026-02-31/2",
     "/api/preorders/2026-13-01/unpaid",
@@ -447,13 +447,102 @@ test("failed login attempts are throttled without affecting normal successful lo
 });
 
 test("new account and password changes reject short passwords without replacing existing credentials", async () => {
-  await as(request(app).post('/api/users')).send({ username: 'new-local-user', password: 'short-local', role: 'user' }).expect(400);
-  await as(request(app).put('/api/users/2/password')).send({ newPassword: 'short-local' }).expect(400);
+  await as(request(app).post('/api/users')).send({ username: 'new-local-user', password: 'short', role: 'user' }).expect(400);
+  await as(request(app).put('/api/users/2/password')).send({ newPassword: 'short' }).expect(400);
   await as(request(app).get('/api/auth/me'), user).expect(200);
 });
 
 const readOrder = async (route = '/api/orders/2') => (await as(request(app).get(route)).expect(200)).body;
 const markPaid = (route, order, paid = true) => as(request(app).put(route + '/paid')).send({ ...order, paid });
+
+test('ordinary account passwords accept six through thirteen characters; five is rejected', async () => {
+  const before = db.public.one('select count(*) as n from users').n;
+  const rejected = await as(request(app).post('/api/users')).send({ username: 'pw5', password: 'abcde' }).expect(400);
+  assert.match(rejected.body.message, /6 個字元/);
+  for (let length = 6; length <= 13; length++) {
+    const username = `pw${length}`, password = 'x'.repeat(length);
+    const created = await as(request(app).post('/api/users')).send({ username, password, role: 'user' }).expect(200);
+    assert.equal(created.body.status, 'active');
+    assert.equal('password_hash' in created.body, false);
+    const login = await request(app).post('/api/auth/login').send({ username, password }).expect(200);
+    assert.equal(login.body.user.id, created.body.id);
+    const list = await as(request(app).get('/api/users?pageSize=100')).expect(200);
+    assert.ok(list.body.users.some(u => u.id === created.body.id));
+  }
+  assert.equal(db.public.one('select count(*) as n from users').n, before + 8);
+});
+
+test('password resets and self changes use the target role policy and revoke old sessions', async () => {
+  const failed = await as(request(app).put('/api/users/2/password')).send({ newPassword: '12345' }).expect(400);
+  assert.match(failed.body.message, /6 個字元/);
+  for (const newPassword of ['123456', '1234567', '12345678', '123456789', '1234567890', '12345678901', '123456789012', '1234567890123']) {
+    await as(request(app).put('/api/users/2/password')).send({ newPassword }).expect(200);
+    await request(app).post('/api/auth/login').send({ username: '2', password: newPassword }).expect(200);
+  }
+  const login = await request(app).post('/api/auth/login').send({ username: '2', password: '1234567890123' }).expect(200);
+  await as(request(app).put('/api/users/2/password'), login.body.token).send({ oldPassword: '1234567890123', newPassword: 'abcdef' }).expect(200);
+  await as(request(app).get('/api/auth/me'), login.body.token).expect(401);
+  await request(app).post('/api/auth/login').send({ username: '2', password: 'abcdef' }).expect(200);
+  await as(request(app).put('/api/users/1/password')).send({ newPassword: '123456' }).expect(400);
+  await as(request(app).post('/api/users')).send({ username: 'new-admin', password: '123456', role: 'admin' }).expect(400);
+  await as(request(app).post('/api/users')).send({ username: 'new-admin', password: '123456789012', role: 'admin' }).expect(200);
+});
+
+test('numeric seats beyond 36 join ordering, preorders, reports and payment without changing old orders', async () => {
+  const created = await as(request(app).post('/api/users')).send({ username: '３７', password: 'abcdef' }).expect(200);
+  assert.equal(created.body.username, '37');
+  const login = await request(app).post('/api/auth/login').send({ username: '37', password: 'abcdef' }).expect(200);
+  const seats = await as(request(app).get('/api/seats'), login.body.token).expect(200);
+  assert.ok(seats.body.seats.includes(37));
+  const first = await as(request(app).get('/api/orders/37'), login.body.token).expect(200);
+  assert.equal(first.body.orderId, null);
+  await as(request(app).put('/api/orders/37'), login.body.token).send({ ...first.body, items: [item] }).expect(200);
+  await as(request(app).put('/api/orders/2'), login.body.token).send({ items: [item] }).expect(403);
+  const overview = await as(request(app).get('/api/orders')).expect(200);
+  assert.equal(overview.body.orders.length, 37);
+  const order = overview.body.orders.find(o => o.seat === 37);
+  await markPaid('/api/orders/37', order).expect(200);
+  await as(request(app).put('/api/orders/37/paid'), login.body.token).send({ ...order, paid: true }).expect(403);
+  const missing = await as(request(app).get('/api/reports/missing')).expect(200);
+  assert.equal(missing.body.missing.includes(37), false);
+  const pre = await as(request(app).get('/api/preorders/2026-10-20/37'), login.body.token).expect(200);
+  await as(request(app).put('/api/preorders/2026-10-20/37'), login.body.token).send({ ...pre.body, items: [item] }).expect(200);
+  assert.equal(db.public.one('select count(*) as n from orders where seat=2').n, 0);
+});
+
+test('duplicate, parallel and numeric-alias creations cannot produce duplicate seat accounts', async () => {
+  const body = { username: '38', password: 'abcdef', role: 'user' };
+  const responses = await Promise.all([as(request(app).post('/api/users')).send(body), as(request(app).post('/api/users')).send(body)]);
+  assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
+  assert.equal(db.public.one("select count(*) as n from users where username='38'").n, 1);
+  for (const username of ['02', '2.0', '2e0', '0x2', '0', '2147483648'])
+    await as(request(app).post('/api/users')).send({ username, password: 'abcdef' }).expect(400);
+  await as(request(app).post('/api/users')).send({ username: '２', password: 'abcdef' }).expect(409);
+  await as(request(app).post('/api/users')).send({ username: 'bad-role', password: 'abcdef', role: 'owner' }).expect(400);
+});
+
+test('a failed account insert does not leave an account or a success response', async () => {
+  const original = pool.query, originalLog = console.error;
+  pool.query = (sql, args) => /^insert into users/i.test(sql.trim()) ? Promise.reject(Object.assign(new Error('fixture'), { code: 'DB_TEST' })) : original(sql, args);
+  console.error = () => {};
+  try {
+    await as(request(app).post('/api/users')).send({ username: 'fail-canary', password: 'abcdef' }).expect(500);
+    assert.equal(db.public.one("select count(*) as n from users where username='fail-canary'").n, 0);
+  } finally { pool.query = original; console.error = originalLog; }
+});
+
+test('user pagination, search, filters and no-store responses cover more than one page', async () => {
+  for (let n = 0; n < 105; n++) await pool.query('insert into users(username,password_hash,role,status) values($1,$2,$3,$4)', [`page-${n}`, fixtureHash, 'user', n % 2 ? 'active' : 'disabled']);
+  const first = await as(request(app).get('/api/users?page=1&pageSize=100')).expect(200);
+  const second = await as(request(app).get('/api/users?page=2&pageSize=100')).expect(200);
+  assert.equal(first.body.total, 109);
+  assert.equal(new Set([...first.body.users, ...second.body.users].map(u => u.id)).size, 109);
+  assert.equal(first.headers['cache-control'], 'no-store');
+  const filtered = await as(request(app).get('/api/users?q=page-&role=user&status=disabled&pageSize=100')).expect(200);
+  assert.equal(filtered.body.total, 53);
+  assert.ok(filtered.body.users.every(u => u.status === 'disabled' && u.role === 'user'));
+  assert.equal(JSON.stringify(filtered.body).includes('password_hash'), false);
+});
 
 test('payment markers persist per order, can be reversed, and record the real administrator', async () => {
   for (const seat of [2, 3]) await as(request(app).put(`/api/orders/${seat}`)).send({ items: [item] }).expect(200);
