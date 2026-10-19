@@ -36,6 +36,8 @@
 3. 確認 Render live、`/api/health` 正常、前端檔案與發布版本一致、RLS／存取權限與原資料保留。
 4. 管理員重新整理頁面即可使用，不需要額外設定。
 
+前端資源以內容雜湊作版本參數，避免新版 HTML 搭配舊 JavaScript／CSS。修改 `app.js` 或 `styles.css` 後，執行 `cd server && npm run assets` 並一併提交 `docs/index.html`；`npm run check` 會拒絕過期版本。
+
 舊版本後端不理解多批次，開始使用新日期／批次後不可直接回退至舊版本；應以修正版向前部署，避免舊查詢把歷史批次混在一起。
 
 ## 驗證
