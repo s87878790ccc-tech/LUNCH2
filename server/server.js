@@ -5,13 +5,14 @@ const crypto = require('crypto');
 const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const sharp = require('sharp');
 const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
+const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
 
 // Express 4 does not forward rejected async handlers to its error middleware.
 const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -20,6 +21,7 @@ const app = express();
 app.disable('x-powered-by');
 const PORT = process.env.PORT || 10000;
 const DATABASE_URL = process.env.DATABASE_URL;
+const PUBLIC_BASE_URL = 'https://lunch2.onrender.com';
 
 function ensureJwtSecret() {
   const secret = process.env.JWT_SECRET ? String(process.env.JWT_SECRET) : '';
@@ -94,34 +96,24 @@ const MAX_UPLOAD_BYTES = Number.isFinite(MAX_UPLOAD_ENV) && MAX_UPLOAD_ENV > 0
   : 2 * 1024 * 1024;
 const allowedImageTypes = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'].map(t => t.toLowerCase()));
 
-const uploadStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
-  filename: (_req, file, cb) => {
-    const ext = (path.extname(file.originalname || '') || '').toLowerCase();
-    const safeExt = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? ext : '';
-    const randomPart = typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : crypto.randomBytes(16).toString('hex');
-    const name = `${Date.now()}-${randomPart}${safeExt}`;
-    cb(null, name);
-  },
-});
-
 const imageUpload = multer({
-  storage: uploadStorage,
-  limits: { fileSize: MAX_UPLOAD_BYTES },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: Math.min(MAX_UPLOAD_BYTES, 5 * 1024 * 1024), files: 1, fields: 0, parts: 1 },
   fileFilter: (_req, file, cb) => {
     const type = (file.mimetype || '').toLowerCase();
     if (allowedImageTypes.has(type)) return cb(null, true);
     cb(new Error('僅接受 PNG/JPG/GIF/WebP 圖片')); // handled in route
   },
 }).single('image');
+let processingImage = false;
 
 /* =========================
    Security / Middleware
    ========================= */
 app.use(helmet({
-  contentSecurityPolicy: false,
+  contentSecurityPolicy: { useDefaults: false, directives: {
+    defaultSrc: ["'none'"], baseUri: ["'none'"], formAction: ["'none'"], frameAncestors: ["'none'"], sandbox: [],
+  } },
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
@@ -172,6 +164,19 @@ const loginLimiter = rateLimit({
   keyGenerator: req => `${req.ip}:${normalizeUsernameInput(getBody(req).username)}`,
   skipSuccessfulRequests: true,
 });
+const loginIpLimiter = rateLimit({
+  windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: 'too many login attempts, please try again shortly' },
+});
+const loginAccountLimiter = rateLimit({
+  windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  keyGenerator: req => crypto.createHash('sha256').update(normalizeUsernameInput(getBody(req).username)).digest('hex'),
+  message: { message: 'too many login attempts, please try again shortly' },
+});
+const uploadLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
+const dummyPasswordHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10);
 
 function normalizeTimeString(value, fallback) {
   if (typeof value !== 'string') return fallback;
@@ -194,17 +199,17 @@ const corsOptions = {
     if (ALLOW_ORIGINS.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
-  credentials: true,
+  credentials: false,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   optionsSuccessStatus: 204,
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+app.use('/api', globalLimiter);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(enforcePlainObjectBody);
-app.use('/api', globalLimiter);
 app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 for (const [key, max] of [['seat', 36], ['id', 2_147_483_647], ['itemId', 2_147_483_647]]) {
@@ -215,10 +220,16 @@ for (const [key, max] of [['seat', 36], ['id', 2_147_483_647], ['itemId', 2_147_
 app.param('date', (_req, _res, next, value) => next(validDate(value) ? undefined : badRequest('日期格式不正確')));
 
 // logging
-app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
-app.use(morgan('dev'));
+morgan.token('safe-url', req => req.path);
+const accessFormat = ':method :safe-url :status :response-time ms';
+app.use(morgan(accessFormat, { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a', mode: 0o600 }) }));
+app.use(morgan(accessFormat));
 
-app.use('/uploads', express.static(UPLOAD_DIR, {
+app.use('/uploads', (req, res, next) => {
+  if (!/^\/[A-Za-z0-9][A-Za-z0-9_-]*\.(?:jpe?g|png|gif|webp)$/i.test(req.path)) return res.status(404).end();
+  next();
+}, express.static(UPLOAD_DIR, {
+  dotfiles: 'deny', index: false, redirect: false,
   setHeaders(res) {
     res.set('Cache-Control', 'public, max-age=31536000, immutable');
   },
@@ -231,17 +242,15 @@ if (!DATABASE_URL) {
   console.error('Missing DATABASE_URL in env');
   process.exit(1);
 }
-let pgUrl;
+let databaseConfig;
 try {
-  pgUrl = new URL(DATABASE_URL);
-  if (pgUrl.searchParams.has('sslmode')) pgUrl.searchParams.delete('sslmode');
+  databaseConfig = databaseConnectionConfig(DATABASE_URL, process.env.DATABASE_CA_CERT || '');
 } catch (e) {
-  console.error('Bad DATABASE_URL:', e);
+  console.error('Bad DATABASE_URL configuration');
   process.exit(1);
 }
 const pool = new Pool({
-  connectionString: pgUrl.toString(),
-  ssl: { require: true, rejectUnauthorized: false },
+  ...databaseConfig,
   keepAlive: true,
   max: 10,
   idleTimeoutMillis: 30_000,
@@ -269,6 +278,9 @@ async function t_q(c, sql, params = []) { const { rows } = await c.query(sql, pa
 /* =========================
    Schema 升級（不破壞既有資料）
    ========================= */
+async function ensureUsersSecuritySchema() {
+  await pool.query('alter table users add column if not exists auth_version integer not null default 0');
+}
 async function ensureAuditLogsSchema() {
   await pool.query(`
     create table if not exists audit_logs(
@@ -297,7 +309,8 @@ async function ensureSettingsSchema() {
     alter table if exists settings
       add column if not exists open_days integer[] default '{1,2,3,4,5}',
       add column if not exists open_start text default '07:00',
-      add column if not exists open_end   text default '12:00'
+      add column if not exists open_end   text default '12:00',
+      add column if not exists manual_locked boolean not null default false
   `);
   await pool.query(`insert into settings(id) values(1) on conflict (id) do nothing`);
   await pool.query(`
@@ -478,7 +491,7 @@ async function seed() {
    Auth helpers
    ========================= */
 function sign(user) {
-  return jwt.sign({ uid: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+  return issueToken(user, JWT_SECRET);
 }
 function auth(required = true) {
   return asyncRoute(async (req, res, next) => {
@@ -486,12 +499,12 @@ function auth(required = true) {
     const t = h.startsWith('Bearer ') ? h.slice(7) : null;
     if (!t) return required ? res.status(401).json({ message: 'no token' }) : next();
     try {
-      req.user = jwt.verify(t, JWT_SECRET, { algorithms: ['HS256'] });
+      req.user = verifyToken(t, JWT_SECRET);
     } catch {
       return res.status(401).json({ message: 'invalid token' });
     }
-    const current = await one('select id, username, role, status from users where id=$1', [req.user.uid]);
-    if (!current || current.status !== 'active') return res.status(401).json({ message: '登入已失效，請重新登入' });
+    const current = await one('select id, username, role, status, password_hash, auth_version from users where id=$1', [req.user.uid]);
+    if (!current || current.status !== 'active' || !sessionMatches(req.user, current, JWT_SECRET)) return res.status(401).json({ message: '登入已失效，請重新登入' });
     req.user = { uid: current.id, username: current.username, role: current.role };
     next();
   });
@@ -500,10 +513,8 @@ function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
   next();
 }
-function getPublicBaseUrl(req) {
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0];
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  return `${proto}://${host}`;
+function getPublicBaseUrl() {
+  return PUBLIC_BASE_URL;
 }
 function sanitizeImageFilename(value) {
   if (value === undefined || value === null) return null;
@@ -546,7 +557,7 @@ async function logAction(user, action, details, req) {
     );
   } catch (err) {
     // A failed audit insert must not report a committed order as failed and invite a duplicate retry.
-    console.error('Audit log write failed:', action, err.message);
+    console.error('Audit log write failed:', action, err.code || 'UNKNOWN');
   }
 }
 
@@ -600,7 +611,7 @@ async function isOpenNow() {
 /* =========================
    Routes
    ========================= */
-app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
+app.post('/api/uploads/images', auth(), requireAdmin, uploadLimiter, (req, res) => {
   imageUpload(req, res, async (err) => {
     if (err) {
       const maxMb = Math.round((MAX_UPLOAD_BYTES / (1024 * 1024)) * 10) / 10;
@@ -609,35 +620,49 @@ app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
       return res.status(400).json({ message });
     }
     if (!req.file) return res.status(400).json({ message: '請選擇圖片檔' });
-    const fileName = req.file.filename;
+    if (processingImage) return res.status(429).json({ message: '圖片處理中，請稍後重試' });
+    processingImage = true;
+    const fileName = `${Date.now()}-${crypto.randomUUID()}.webp`;
+    let created = false;
     try {
+      let encoded;
+      try {
+        const image = sharp(req.file.buffer, { limitInputPixels: 16_000_000, failOn: 'warning', animated: false });
+        const metadata = await image.metadata();
+        if (!['jpeg', 'png', 'gif', 'webp'].includes(metadata.format)) throw new Error('unsupported image');
+        encoded = await image.rotate().webp({ quality: 85 }).toBuffer();
+        if (encoded.length > 5 * 1024 * 1024) throw new Error('image too large');
+      } catch {
+        return res.status(400).json({ message: '圖片內容無效、尺寸過大或格式不支援' });
+      }
+      await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), encoded, { flag: 'wx', mode: 0o600 });
+      created = true;
       const url = `${getPublicBaseUrl(req)}/uploads/${encodeURIComponent(fileName)}`;
-      await logAction(req.user, 'upload.image', { filename: fileName, size: req.file.size }, req);
+      await logAction(req.user, 'upload.image', { filename: fileName, size: encoded.length }, req);
       res.json({ url, filename: fileName });
     } catch (e) {
-      console.error('Failed to log upload', e);
-      fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
+      console.error('Image upload failed:', e.code || 'UNKNOWN');
+      if (created) fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
       res.status(500).json({ message: '上傳失敗' });
+    } finally {
+      processingImage = false;
     }
   });
 });
 
 // Auth
-app.post('/api/auth/login', loginLimiter, asyncRoute(async (req, res) => {
+app.post('/api/auth/login', loginIpLimiter, loginAccountLimiter, loginLimiter, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const username = normalizeUsernameInput(body.username);
   const password = normalizePasswordInput(body.password);
   if (!username || !password) return res.status(400).json({ message: 'username/password required' });
-  if (username.length > USERNAME_MAX_LEN || password.length > PASSWORD_MAX_LEN) {
+  if (username.length > USERNAME_MAX_LEN || password.length > PASSWORD_MAX_LEN || Buffer.byteLength(password, 'utf8') > 72) {
     return res.status(400).json({ message: 'username/password too long' });
   }
 
   const u = await one('select * from users where username=$1', [username]);
-  if (!u) return res.status(401).json({ message: 'invalid credentials' });
-  if (u.status !== 'active') return res.status(403).json({ message: 'account disabled' });
-
-  const ok = await bcrypt.compare(password, u.password_hash);
-  if (!ok) return res.status(401).json({ message: 'invalid credentials' });
+  const ok = await bcrypt.compare(password, u?.password_hash || dummyPasswordHash);
+  if (!u || u.status !== 'active' || !ok) return res.status(401).json({ message: 'invalid credentials' });
 
   await q('update users set last_login_at=now(), updated_at=now() where id=$1', [u.id]);
 
@@ -651,6 +676,11 @@ app.post('/api/auth/login', loginLimiter, asyncRoute(async (req, res) => {
 app.get('/api/auth/me', auth(), asyncRoute(async (req, res) => {
   const u = req.user;
   res.json({ user: { id: u.uid, username: u.username, role: u.role } });
+}));
+app.post('/api/auth/logout', auth(), asyncRoute(async (req, res) => {
+  await q('update users set auth_version=auth_version+1 where id=$1', [req.user.uid]);
+  await logAction(req.user, 'logout', { allDevices: true }, req);
+  res.json({ ok: true });
 }));
 
 // Settings（admin）
@@ -686,7 +716,7 @@ app.get('/api/open-status', asyncRoute(async (req, res) => {
 }));
 
 // Menus
-app.get('/api/menus', auth(false), asyncRoute(async (req, res) => {
+app.get('/api/menus', auth(), asyncRoute(async (req, res) => {
   const [menus, items, setting] = await Promise.all([
     q('select * from menus order by id asc'),
     q('select * from menu_items order by menu_id asc, code asc'),
@@ -837,6 +867,33 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, asyncRoute(async (req
   res.json({ ok: true });
 }));
 
+app.get('/api/settings/manual-order', auth(), asyncRoute(async (_req, res) => {
+  const setting = await one('select manual_locked from settings where id=1');
+  res.json({ locked: setting?.manual_locked !== false });
+}));
+app.put('/api/settings/manual-order', auth(), requireAdmin, asyncRoute(async (req, res) => {
+  const body = getBody(req);
+  if (typeof body.locked !== 'boolean') throw badRequest('locked 必須為布林值');
+  await q('update settings set manual_locked=$1 where id=1', [body.locked]);
+  await logAction(req.user, 'settings.manualOrderLock', { locked: body.locked }, req);
+  res.json({ locked: body.locked });
+}));
+
+// Manual ordering is intentional. The administrator can lock it while keeping
+// ordinary catalogue ordering available. Preserve existing manual lines exactly.
+async function validateManualLock(user, client, items, previousItems) {
+  if (user.role === 'admin') return;
+  const setting = await t_one(client, 'select manual_locked from settings where id=1 for share');
+  if (setting?.manual_locked === false) return;
+  const menuItems = await t_q(client, 'select mi.name, mi.price from menu_items mi join settings s on s.active_menu_id=mi.menu_id where s.id=1');
+  const isCatalog = item => item.name === '內訂' && item.unitPrice === 0 && item.qty === 1 ||
+    menuItems.some(menuItem => menuItem.name === item.name && menuItem.price === item.unitPrice);
+  const manualLines = rows => rows.filter(row => !isCatalog(row))
+    .map(row => JSON.stringify([row.name, row.unitPrice, row.qty])).sort();
+  if (JSON.stringify(manualLines(items)) !== JSON.stringify(manualLines(previousItems))) {
+    throw Object.assign(new Error('管理員已鎖定手動餐點，請聯絡管理員修改'), { status: 403 });
+  }
+}
 // Orders
 // A single read replaces 36 per-seat HTTP requests in the admin overview.
 app.get('/api/orders', auth(), requireAdmin, asyncRoute(async (_req, res) => {
@@ -894,6 +951,8 @@ app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const internalOnly = booleanField(body, 'internalOnly');
   await tx(async (c) => {
     const o = await ensureOrder(seat, c);
+    const previous = await t_q(c, 'select name, unit_price, qty from order_items where order_id=$1', [o.id]);
+    await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
@@ -1097,6 +1156,8 @@ app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   const internalOnly = booleanField(body, 'internalOnly');
   await tx(async (c)=>{
     const o = await ensurePreorder(date, seat, c);
+    const previous = await t_q(c, 'select name, unit_price, qty from preorder_items where preorder_id=$1', [o.id]);
+    await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
@@ -1138,7 +1199,7 @@ app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const password = normalizePasswordInput(body.password);
   const role = body.role === 'admin' ? 'admin' : 'user';
   if (!username || username.length > USERNAME_MAX_LEN) return res.status(400).json({ message: 'bad username' });
-  if (!password || password.length < 6 || password.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: 'bad password' });
+  if (!password || password.length < 12 || password.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: '新密碼至少需要 12 碼' });
   if (Buffer.byteLength(password, 'utf8') > 72) throw badRequest('密碼不可超過 72 個 UTF-8 位元組');
   const exist = await one('select 1 from users where username=$1', [username]);
   if (exist) return res.status(409).json({ message: 'username already exists' });
@@ -1186,7 +1247,7 @@ app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   const body = getBody(req);
   const oldPassword = normalizePasswordInput(body.oldPassword);
   const newPassword = normalizePasswordInput(body.newPassword);
-  if (!newPassword || newPassword.length < 6) return res.status(400).json({ message: 'newPassword too short' });
+  if (!newPassword || newPassword.length < 12) return res.status(400).json({ message: '新密碼至少需要 12 碼' });
   if (newPassword.length > PASSWORD_MAX_LEN || Buffer.byteLength(newPassword, 'utf8') > 72) return res.status(400).json({ message: '新密碼不可超過 72 個 UTF-8 位元組' });
 
   const u = await one('select * from users where id=$1', [targetId]);
@@ -1203,7 +1264,7 @@ app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
-  await q('update users set password_hash=$1, updated_at=now() where id=$2', [hash, targetId]);
+  await q('update users set password_hash=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [hash, targetId]);
   await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
   res.json({ ok: true });
 }));
@@ -1218,7 +1279,7 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, asyncRoute(async (req, 
   const u = await one('select * from users where id=$1', [id]);
   if (!u) return res.status(404).json({ message: 'user not found' });
 
-  await q('update users set status=$1, updated_at=now() where id=$2', [status, id]);
+  await q('update users set status=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [status, id]);
   await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
 }));
@@ -1238,7 +1299,7 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, asyncRoute(async (req, re
     if (a.c <= 1) return res.status(400).json({ message: '系統至少需要一位管理員' });
   }
 
-  await q('update users set role=$1, updated_at=now() where id=$2', [role, id]);
+  await q('update users set role=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [role, id]);
   await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
   res.json({ ok: true });
 }));
@@ -1305,7 +1366,7 @@ app.use((err, _req, res, next) => {
   if (err.code === '23505') return res.status(409).json({ message: '資料已存在，請重新載入後再試' });
   if (err.code === '23503') return res.status(409).json({ message: '資料仍被使用或參照不存在，請重新載入後再試' });
   const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
-  if (status === 500) console.error('Request failed:', err);
+  if (status === 500) console.error('Request failed:', err.code || 'UNKNOWN');
   res.status(status).json({ message: status === 500 ? '系統暫時無法處理，請稍後再試' : err.message });
 });
 
@@ -1315,6 +1376,7 @@ app.use((err, _req, res, next) => {
 async function start() {
   try {
     await one('select now()');          // test DB
+    await ensureUsersSecuritySchema();
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
     await ensureSettingsSchema();
     await ensureOrdersExtraColumns();
@@ -1325,7 +1387,7 @@ async function start() {
     console.log('[tz check]', zonedNowInfo());
     return app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
-    console.error('Startup error:', e);
+    console.error('Startup error:', e.code || 'UNKNOWN');
     process.exit(1);
   }
 

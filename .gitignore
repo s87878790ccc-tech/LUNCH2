@@ -1,0 +1,17 @@
+node_modules/
+.env
+.env.*
+!.env.example
+logs/
+uploads/
+coverage/
+*.log
+*.db
+*.sqlite*
+*.dump
+*.sql.gz
+*.pem
+*.key
+credentials.*
+passwords.*
+security-*-scan.json

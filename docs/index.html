@@ -7,6 +7,8 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <meta name="theme-color" content="#0b1020" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src https://lunch2.onrender.com; img-src 'self' https://lunch2.onrender.com; base-uri 'none'; object-src 'none'; form-action 'none'; upgrade-insecure-requests" />
+    <meta name="referrer" content="no-referrer" />
     <meta name="description" content="班級午餐訂餐、預訂及付款管理系統" />
     <title>班級午餐訂單系統</title>
     <link rel="stylesheet" href="styles.css" />
@@ -17,7 +19,7 @@
       <form id="loginForm" class="card w400 login-card">
         <div class="login-brand" aria-hidden="true">🍱</div>
         <h1>班級午餐系統</h1>
-        <p class="muted">登入後，即可查看菜單與管理午餐訂單。</p>
+        <p class="muted">登入後，即可查看菜單與管理午餐訂單。登入僅保留在此分頁。</p>
         <label for="loginUser">帳號</label>
         <input
           id="loginUser"
@@ -64,7 +66,7 @@
         </div>
         <div class="account">
           <span id="whoami" class="pill"></span>
-          <button id="logoutBtn">登出</button>
+          <button id="logoutBtn" title="登出會結束此帳號所有裝置的登入">登出</button>
         </div>
         <nav class="right" aria-label="主要功能">
           <button id="tabOrders" class="tab active">訂單</button>
@@ -142,8 +144,9 @@
               <div id="menuView" class="menu-preview-host compact mt8"></div>
             </details>
 
-            <details>
+            <details id="manualOrderForm">
               <summary><strong>手動新增餐點</strong></summary>
+              <p id="manualOrderHint" class="small muted"></p>
               <div class="row mt8">
                 <input id="manualName" placeholder="品名" aria-label="品名" />
                 <input
@@ -298,8 +301,9 @@
             <div id="preMenuView" class="menu-preview-host compact mt8"></div>
           </details>
 
-          <details>
+          <details id="manualPreorderForm">
             <summary><strong>手動新增餐點</strong></summary>
+            <p id="manualPreorderHint" class="small muted"></p>
             <div class="row mt8">
               <input id="preManualName" placeholder="品名" aria-label="品名" />
               <input
@@ -466,6 +470,11 @@
 
       <!-- 後台頁（彙整＋缺單＋未付款） -->
       <section id="pageReports" class="hidden">
+        <div class="card only-admin hidden">
+          <h3>手動餐點管理</h3>
+          <label><input id="manualOrderLocked" type="checkbox" /> 鎖定手動餐點，僅管理員可修改</label>
+          <p class="small muted">未鎖定時，同學可手動新增餐點；鎖定後，同學仍可從菜單點餐，既有手動品項由管理員調整。</p>
+        </div>
         <div class="grid">
           <div class="card">
             <h3>品項彙整</h3>

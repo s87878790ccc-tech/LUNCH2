@@ -18,6 +18,10 @@
 - 加入 API 逾時、可讀錯誤訊息、頁面重新顯示與每分鐘狀態更新；編輯菜單／後台時暫停背景更新，保留未儲存的輸入。
 - 更新 Express、bcrypt、Multer，納入 `package-lock.json`，方便重現安裝。
 
+## 安全防護
+
+安全邊界、測試方式、手動餐點管理員鎖定、機密保存與部署注意事項請見 [SECURITY.md](SECURITY.md)。手動餐點預設開放；管理員可在後台鎖定，鎖定後保留同學一般菜單點餐功能。
+
 ## 安裝與驗證
 
 使用 Node.js 24.15 以上的 24.x 版本（也支援 22.22.2 以上的 22.x）。
@@ -43,6 +47,7 @@ Root Directory 為 `server`，Build Command 建議使用 `npm ci --omit=dev`，S
 | 變數 | 用途 |
 | --- | --- |
 | `DATABASE_URL` | 既有 PostgreSQL／Supabase Pooler 連線字串 |
+| `DATABASE_CA_CERT` | 選填：Supabase SSL 公開 CA 憑證；系統信任鏈不足時必填，不可關閉憑證驗證 |
 | `JWT_SECRET` | 固定的登入簽章密鑰 |
 | `ADMIN_DEFAULT_USER` / `ADMIN_DEFAULT_PASS` | 初次建立管理員時使用，不會覆寫既有帳號 |
 | `SEAT_DEFAULT_PASS` | 初次建立座號帳號時使用，不會覆寫既有密碼 |
