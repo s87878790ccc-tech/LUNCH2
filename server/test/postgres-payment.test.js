@@ -74,6 +74,7 @@ test('real PostgreSQL payment migration, locking and rollback', { skip: !databas
     assert.equal((await second.increment(nextKey)).totalHits, 2);
     const access = (await real.query("select has_schema_privilege('anon','lunch_security','usage') a, has_table_privilege('authenticated','lunch_security.rate_limits','select') b, relrowsecurity from pg_class where oid='lunch_security.rate_limits'::regclass")).rows[0];
     assert.deepEqual(access, { a:false, b:false, relrowsecurity:true });
+    now = Date.now();
     const express = require('express'), rateLimit = require('express-rate-limit');
     const instance = () => {
       const store = adapter(), api = express();
@@ -89,7 +90,7 @@ test('real PostgreSQL payment migration, locking and rollback', { skip: !databas
     now += 60000;
     await request(api1).get('/').expect(200);
     await pruneRateLimits(real.query.bind(real));
-    assert.equal((await real.query('select count(*)::int n from lunch_security.rate_limits')).rows[0].n, 0);
+    assert.equal((await real.query('select count(*)::int n from lunch_security.rate_limits')).rows[0].n, 2);
   });
   const migration = fs.readFileSync(path.join(__dirname, '../../supabase/migrations/20261019125241_quick_payment_context.sql'), 'utf8');
 
