@@ -515,10 +515,11 @@ function listen(element, type, handler) {
   element?.addEventListener(type, event => {
     if (type === 'submit') event.preventDefault();
     const source = event.target.closest?.('button, input, select') || element;
+    const checked = source.type === 'checkbox' ? source.checked : undefined;
     const lock = type === 'submit' || (type === 'click' && source.tagName === 'BUTTON');
     if (lock && source.dataset.busy) return;
     if (lock) { source.dataset.busy = 'true'; source.setAttribute('aria-busy', 'true'); }
-    runTask(() => handler(event)).finally(() => {
+    runTask(() => handler(event, checked)).finally(() => {
       if (lock) { delete source.dataset.busy; source.removeAttribute('aria-busy'); }
     });
   });
@@ -540,6 +541,9 @@ function resetClientState() {
   logsCache = null;
   pendingFetches.clear();
   allSeatsSnapshot = null;
+  overviewOrders.clear(); overviewContext = null; paymentPending.clear(); paymentUncertain.clear();
+  document.getElementById('paymentSummary').replaceChildren();
+  document.getElementById('paymentContext').textContent = '';
   document.getElementById('preDate').value = '';
   for (const node of [allSeatsGrid, usersTableBody, logsTableBody, aggTableBody, bySeatTBody, orderTableBody, document.querySelector('#preTable tbody')]) node?.replaceChildren();
   for (const id of ['unpaidOrdersList', 'unpaidPreList', 'missingList', 'newUserPass']) {
@@ -569,12 +573,18 @@ function emptyOrder(tbody, message) {
   tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${safeText(message)}</td></tr>`;
 }
 let allSeatsSnapshot = null;
+let overviewContext = null;
+const overviewOrders = new Map();
+const paymentPending = new Map();
+const paymentUncertain = new Set();
+const paymentKey = (seat, date = null) => `${sessionEpoch}:${date || 'today'}:${seat}`;
 async function loadAllOrders(force = false) {
   const revision = dataRevision;
   if (!force && allSeatsSnapshot && Date.now() - allSeatsSnapshot.at < 15_000) return structuredClone(allSeatsSnapshot.orders);
   const data = await api('/orders', { dedupe: !force });
   if (revision !== dataRevision) return loadAllOrders(true);
   allSeatsSnapshot = { at: Date.now(), orders: data.orders || [] };
+  overviewContext = { date: data.date, batch: data.batch };
   for (const order of allSeatsSnapshot.orders) state.ordersCache.set(order.seat, order);
   return structuredClone(allSeatsSnapshot.orders);
 }
@@ -584,6 +594,7 @@ function changeOrder(seat, change, date = null) {
   if (purgingOrders) return Promise.reject(new Error('正在清空訂單，請稍候'));
   const epoch = sessionEpoch;
   const key = `${epoch}:${date || 'today'}:${seat}`;
+  if (paymentPending.has(key)) return Promise.reject(new Error('付款狀態正在儲存，請稍候再編輯此座號。'));
   const previous = orderQueues.get(key) || Promise.resolve();
   const task = previous.catch(() => {}).then(async () => {
     if (epoch !== sessionEpoch) return;
@@ -799,6 +810,111 @@ loadBySeatBtn?.addEventListener('click', loadBySeatReport);
 /* =========================
    Admin：全部座號一覽（卡片）
    ========================= */
+function paymentControlHTML(order, id, className, preorder = false) {
+  const hasOrder = !!order.submitted && order.items?.length > 0;
+  const key = paymentKey(order.seat, preorder ? order.date : null);
+  const pending = paymentPending.has(key), uncertain = paymentUncertain.has(key);
+  const checked = pending ? paymentPending.get(key).paid : hasOrder && order.paid;
+  const status = pending ? '儲存中…' : uncertain ? '未確認，請重新整理' : !hasOrder ? '未訂餐' : order.paid ? '已付款' : '未付款';
+  const audit = order.paymentUpdatedAt ? `最後更新：${new Date(order.paymentUpdatedAt).toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}；帳號 ID ${order.paymentUpdatedBy ?? '歷史紀錄'}` : '';
+  return `<label class="payment-control ${hasOrder && order.paid ? 'is-paid' : ''} ${!hasOrder ? 'is-empty' : ''}" title="${safeText(audit)}">
+    <input type="checkbox" id="${id}" class="${className}" data-seat="${order.seat}" data-order-id="${order.orderId ?? ''}" data-version="${order.version ?? 0}" data-date="${safeText(order.date || '')}" data-batch="${safeText(order.batch || '')}" data-preorder="${preorder}" data-paid="${!!order.paid}"
+      aria-label="${preorder ? safeText(order.date) + ' 預訂 ' : ''}${order.seat} 號已付款" ${checked ? 'checked' : ''} ${!hasOrder || pending || uncertain ? 'disabled' : ''} aria-busy="${pending}">
+    <span class="payment-status" role="status">${status}</span>
+  </label>`;
+}
+
+function renderPaymentSummary() {
+  const rows = [...overviewOrders.values()].filter(o => o.submitted && o.items?.length);
+  const paid = rows.filter(o => o.paid);
+  const total = rows.reduce((sum, o) => sum + calcSubtotal(o.items), 0);
+  const collected = paid.reduce((sum, o) => sum + calcSubtotal(o.items), 0);
+  const values = [['已訂餐', `${rows.length} 位`], ['已付款', `${paid.length} 位`], ['未付款', `${rows.length - paid.length} 位`], ['應收', `NT$ ${fmt(total)}`], ['已收', `NT$ ${fmt(collected)}`], ['未收', `NT$ ${fmt(total - collected)}`]];
+  document.getElementById('paymentSummary').innerHTML = values.map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`).join('');
+  document.getElementById('paymentContext').textContent = overviewContext ? `訂餐日期 ${overviewContext.date} · 批次 ${overviewContext.batch === 'legacy' ? '初始批次' : String(overviewContext.batch).slice(0, 8)} · 每 15 秒同步` : '';
+}
+
+function paymentReference(input) {
+  return { orderId: input.dataset.orderId ? Number(input.dataset.orderId) : null, version: Number(input.dataset.version), date: input.dataset.date, batch: input.dataset.batch || null };
+}
+
+async function paintPaymentOrder(order, preorder) {
+  if (preorder) {
+    state.pre.cache.set(preKey(order.date, order.seat), order);
+    const visible = preorderContext();
+    if (visible.date === order.date && visible.seat === order.seat) await renderPreorder();
+  } else {
+    state.ordersCache.set(order.seat, order);
+    if (!overviewContext || overviewContext.date !== order.date || overviewContext.batch !== order.batch) {
+      allSeatsSnapshot = null;
+      await renderAllSeatsAdmin(true);
+    } else {
+      overviewOrders.set(order.seat, order);
+      const card = document.getElementById(`seat-card-${order.seat}`);
+      if (card) card.outerHTML = seatCardHTML(order);
+      renderPaymentSummary();
+    }
+    if (Number(seatSelect.value) === order.seat) await renderSeatOrder();
+  }
+}
+
+async function changePayment(input, requested = input.checked) {
+  if (!isAdmin()) return;
+  const seat = Number(input.dataset.seat), preorder = input.dataset.preorder === 'true';
+  const key = paymentKey(seat, preorder ? input.dataset.date : null), epoch = sessionEpoch;
+  const previous = input.dataset.paid === 'true', paid = requested, reference = paymentReference(input);
+  if (paymentPending.has(key) || orderQueues.has(key) || purgingOrders || paymentUncertain.has(key)) {
+    input.checked = paymentPending.get(key)?.paid ?? previous;
+    return;
+  }
+  paymentPending.set(key, { paid });
+  refreshAllSeats.disabled = true;
+  for (const control of document.querySelectorAll('.payment-control input')) {
+    if (Number(control.dataset.seat) === seat && control.dataset.preorder === String(preorder) && (!preorder || control.dataset.date === reference.date)) {
+      control.checked = paid; control.disabled = true; control.setAttribute('aria-busy', 'true');
+      control.closest('label').querySelector('.payment-status').textContent = '儲存中…';
+    }
+  }
+  const route = preorder ? `/preorders/${encodeURIComponent(reference.date)}/${seat}` : `/orders/${seat}`;
+  let latest = null, failure = null;
+  try {
+    const result = await api(`${route}/paid`, { method: 'PUT', body: JSON.stringify({ ...reference, paid }), timeoutMs: 15_000 });
+    latest = result.order;
+    if (!latest || latest.seat !== seat || latest.date !== reference.date || (latest.batch ?? null) !== reference.batch) throw new Error('付款回應無法確認，請重新整理。');
+  } catch (error) {
+    failure = error;
+    input.checked = previous;
+    if (epoch === sessionEpoch && token) {
+      state.ordersCache.delete(seat); state.pre.cache.delete(preKey(reference.date, seat)); allSeatsSnapshot = null;
+      try { latest = await api(route, { dedupe: false, timeoutMs: 12_000 }); }
+      catch { paymentUncertain.add(key); }
+    }
+  } finally {
+    paymentPending.delete(key);
+    refreshAllSeats.disabled = paymentPending.size > 0;
+  }
+  if (epoch !== sessionEpoch) {
+    if (failure?.status === 401) loginMsg.textContent = '登入已失效，請重新登入。';
+    return;
+  }
+  if (latest) {
+    paymentUncertain.delete(key);
+    await paintPaymentOrder(latest, preorder);
+  } else {
+    // No authoritative response: retain the previous display and block retries
+    // until a successful reload, rather than silently submitting another write.
+    for (const control of document.querySelectorAll('.payment-control input')) {
+      if (Number(control.dataset.seat) === seat && control.dataset.preorder === String(preorder)) {
+        control.checked = previous; control.disabled = true; control.setAttribute('aria-busy', 'false');
+        control.closest('label').querySelector('.payment-status').textContent = '未確認，請重新整理';
+      }
+    }
+  }
+  if (failure) notify(`${seat} 號：${failure.message}${latest ? '（已載入伺服器最新狀態）' : '（儲存結果未確認）'}`, true);
+  else notify(`${seat} 號${paid ? '已標記已付款' : '已恢復未付款'}`);
+  if (!pageReports.classList.contains('hidden')) await (preorder ? renderUnpaidPreorders() : renderUnpaidOrders());
+}
+
 function seatCardHTML(o){
   const subtotal = calcSubtotal(o.items||[]);
   const done = (o.items && o.items.length>0);
@@ -810,17 +926,17 @@ function seatCardHTML(o){
   <div class="seat-card" id="seat-card-${seatNum}">
     <div class="hdr">
       <strong>座號 ${seatNum}</strong>
-      <span class="badge ${done?'ok':'pending'}">${done?'完成':'未完成'}</span>
+      <span class="badge ${done?'ok':'pending'}">${done?'已訂餐':'未訂餐'}</span>
     </div>
     <div class="items">${detail}</div>
     <div class="row small" style="justify-content:space-between;margin-top:6px">
-      <span>小計：$${subtotal.toLocaleString('zh-Hant-TW')}</span>
+      <span>小計：NT$ ${subtotal.toLocaleString('zh-Hant-TW')}</span>
       ${o.internalOnly ? '<span class="badge pending" title="此座為內訂">內訂</span>' : ''}
-      ${o.paid ? '<span class="badge ok" title="已付款">已付款</span>' : '<span class="badge pending" title="未付款">未付款</span>'}
     </div>
+    ${paymentControlHTML(o, `seat-paid-${seatNum}`, 'seat-paid')}
     <div class="seat-actions">
       <label class="small">
-        <input type="checkbox" class="seat-internal" data-seat="${seatNum}" ${o.internalOnly?'checked':''}/>
+        <input type="checkbox" class="seat-internal" data-seat="${seatNum}" ${o.internalOnly?'checked':''} ${paymentPending.has(paymentKey(o.seat)) ? 'disabled' : ''}/>
         內訂
       </label>
       <button class="seat-edit" data-seat="${seatNum}">編輯</button>
@@ -833,20 +949,42 @@ async function renderSeatCardInto(seat){
   const revision = dataRevision;
   const o = await api(`/orders/${seat}`);
   if (revision !== dataRevision) return renderSeatCardInto(seat);
+  if (overviewContext && (o.date !== overviewContext.date || o.batch !== overviewContext.batch)) {
+    allSeatsSnapshot = null;
+    return renderAllSeatsAdmin(true);
+  }
+  paymentUncertain.delete(paymentKey(seat));
   state.ordersCache.set(seat, o);
+  overviewOrders.set(seat, o);
   const el = document.getElementById(`seat-card-${seat}`);
   if (el) el.outerHTML = seatCardHTML(o);
+  renderPaymentSummary();
 }
-async function renderAllSeatsAdmin(){
+async function renderAllSeatsAdmin(force = false){
   if (!isAdmin() || !adminAllSeats || !allSeatsGrid) return;
-  allSeatsGrid.innerHTML = '<div class="muted">載入中…</div>';
+  if (paymentPending.size) return;
+  if (!overviewOrders.size) allSeatsGrid.innerHTML = '<div class="muted">載入中…</div>';
   let orders;
-  try { orders = await loadAllOrders(); }
-  catch (error) { allSeatsGrid.innerHTML = `<div class="muted">讀取失敗：${safeText(error.message)}</div>`; throw error; }
-  orders.forEach(o => state.ordersCache.set(o.seat, o));
-  allSeatsGrid.innerHTML = orders.map(o => seatCardHTML(o)).join('');
+  try { orders = await loadAllOrders(force); }
+  catch (error) { if (!overviewOrders.size) allSeatsGrid.innerHTML = `<div class="muted">讀取失敗：${safeText(error.message)}</div>`; throw error; }
+  if (!isAdmin() || paymentPending.size) return;
+  const focused = document.activeElement?.id;
+  overviewOrders.clear();
+  orders.forEach(o => { state.ordersCache.set(o.seat, o); overviewOrders.set(o.seat, o); paymentUncertain.delete(paymentKey(o.seat)); });
+  if (allSeatsGrid.querySelectorAll('.seat-card').length !== orders.length) allSeatsGrid.innerHTML = orders.map(seatCardHTML).join('');
+  else for (const o of orders) {
+    const el = document.getElementById(`seat-card-${o.seat}`);
+    const markup = seatCardHTML(o);
+    // Keep untouched controls in place while other administrators are refreshed.
+    if (el && el.dataset.paymentSnapshot !== JSON.stringify(o)) {
+      el.outerHTML = markup;
+      document.getElementById(`seat-card-${o.seat}`).dataset.paymentSnapshot = JSON.stringify(o);
+    }
+  }
+  if (focused) document.getElementById(focused)?.focus({ preventScroll: true });
+  renderPaymentSummary();
 }
-listen(refreshAllSeats, 'click', async () => { allSeatsSnapshot = null; await renderAllSeatsAdmin(); });
+listen(refreshAllSeats, 'click', async () => { allSeatsSnapshot = null; await renderAllSeatsAdmin(true); });
 
 listen(allSeatsGrid, 'click', async event => {
   const button = event.target.closest('button');
@@ -861,8 +999,9 @@ listen(allSeatsGrid, 'click', async event => {
     await changeOrder(seat, order => { order.items = []; order.internalOnly = false; });
   }
 });
-listen(allSeatsGrid, 'change', async event => {
+listen(allSeatsGrid, 'change', async (event, requested) => {
   const input = event.target;
+  if (input.classList.contains('seat-paid')) return changePayment(input, requested);
   if (!input.classList.contains('seat-internal')) return;
   const checked = input.checked;
   await changeOrder(Number(input.dataset.seat), order => {
@@ -996,6 +1135,7 @@ async function getOrder(seat){
   const revision = dataRevision;
   const o = await api(`/orders/${seat}`);
   if (revision !== dataRevision) return getOrder(seat);
+  paymentUncertain.delete(paymentKey(seat));
   state.ordersCache.set(seat, o);
   return structuredClone(o);
 }
@@ -1011,11 +1151,6 @@ async function saveOrder(seat, order){
     }
     throw e;
   }
-}
-async function setOrderPaid(seat, paid){
-  await api(`/orders/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid }) });
-  state.ordersCache.delete(seat);
-  allSeatsSnapshot = null;
 }
 async function getAggregate(){ return api('/reports/aggregate'); }
 async function getMissing(){ return api('/reports/missing'); }
@@ -1240,11 +1375,7 @@ async function renderSeatOrder(){
   const paidCell = document.querySelector('#orderTable tfoot th:last-child');
   if (paidCell) {
     if (isAdmin()) {
-      paidCell.innerHTML = `
-        <label class="small">
-          <input type="checkbox" id="paidCheckbox" ${o.paid?'checked':''}/>
-          已付款（僅 admin）
-        </label>`;
+      paidCell.innerHTML = paymentControlHTML(o, 'paidCheckbox', 'detail-paid');
     } else {
       paidCell.innerHTML = `<span class="small muted">付款狀態：${o.paid ? '已付款' : '未付款'}</span>`;
     }
@@ -2065,15 +2196,16 @@ listen(clearSeat, 'click', async () => {
 });
 listen(purgeOrdersBtn, 'click', async () => {
   if (!isAdmin()) return;
-  if (orderQueues.size) return notify('仍有訂單正在儲存，請稍候再清空全部訂單。', true);
-  if (!confirm('確定要刪除今日全部訂單？此動作無法復原。')) return;
-  if (!confirm('再次確認：真的要刪除今日全部訂單嗎？')) return;
+  if (orderQueues.size || paymentPending.size) return notify('仍有訂單或付款正在儲存，請稍候。', true);
+  if (!confirm('確定開始新一輪訂餐？畫面將清空，舊批次訂單與付款紀錄會保留。')) return;
   purgingOrders = true;
   try {
-    await api('/orders/today', { method: 'DELETE' });
+    const context = overviewContext;
+    if (!context) throw new Error('請先重新整理全部座號，再開始新一輪訂餐。');
+    await api('/orders/today', { method: 'DELETE', body: JSON.stringify({ date: context.date, batch: context.batch }) });
     state.ordersCache.clear(); allSeatsSnapshot = null;
     await Promise.all([renderSeatOrder(), safeRenderAdminReports(), renderAllSeatsAdmin()]);
-    notify('已刪除今日全部訂單');
+    notify('已開始新一輪訂餐，舊批次已保留。');
   } finally { purgingOrders = false; }
 });
 listen(internalOnlyEl, 'change', async () => {
@@ -2140,14 +2272,10 @@ listen(orderTableBody, 'click', async event => {
     order.items.splice(order.items.indexOf(item), 1);
   });
 });
-listen(document.querySelector('#orderTable tfoot'), 'change', async event => {
+listen(document.querySelector('#orderTable tfoot'), 'change', async (event, checked) => {
   const input = event.target;
   if (input.id !== 'paidCheckbox' || !isAdmin()) return;
-  const seat = Number(seatSelect.value), paid = input.checked;
-  try {
-    await setOrderPaid(seat, paid);
-    await Promise.all([renderSeatOrder(), safeRenderAdminReports(), renderSeatCardInto(seat)]);
-  } catch (error) { input.checked = !paid; throw error; }
+  await changePayment(input, checked);
 });
 
 
@@ -2474,15 +2602,12 @@ async function getPreorder(date, seat){
   const revision = dataRevision;
   const o = await api(`/preorders/${encodeURIComponent(date)}/${seat}`);
   if (revision !== dataRevision) return getPreorder(date, seat);
+  paymentUncertain.delete(paymentKey(seat, date));
   state.pre.cache.set(key, o);
   return structuredClone(o);
 }
 async function savePreorder(date, seat, order){
   await api(`/preorders/${encodeURIComponent(date)}/${seat}`, { method:'PUT', body: JSON.stringify(order) });
-  state.pre.cache.delete(preKey(date, seat));
-}
-async function setPreorderPaid(date, seat, paid){
-  await api(`/preorders/${encodeURIComponent(date)}/${seat}/paid`, { method:'PUT', body: JSON.stringify({ paid }) });
   state.pre.cache.delete(preKey(date, seat));
 }
 
@@ -2532,7 +2657,7 @@ async function renderPreorder() {
   labelOrderRows(document.getElementById('preTable'));
   document.getElementById('preSubtotal').textContent = fmt(calcSubtotal(order.items));
   document.getElementById('prePaidCell').innerHTML = isAdmin()
-    ? `<label class="small"><input id="prePaidCheckbox" type="checkbox" ${order.paid ? 'checked' : ''}> 已付款</label>`
+    ? paymentControlHTML(order, 'prePaidCheckbox', 'pre-paid', true)
     : `<span class="small muted">付款狀態：${order.paid ? '已付款' : '未付款'}</span>`;
 }
 function requirePreorderContext() {
@@ -2598,13 +2723,10 @@ async function preOnInternalToggle() {
     order.items = checked ? [{ name: '內訂', unitPrice: 0, qty: 1 }] : [];
   }, date);
 }
-async function preOnPaidToggle(event) {
+async function preOnPaidToggle(event, checked) {
   const input = event.target;
   if (input.id !== 'prePaidCheckbox' || !isAdmin()) return;
-  const { date, seat } = requirePreorderContext();
-  const paid = input.checked;
-  try { await setPreorderPaid(date, seat, paid); await renderPreorder(); }
-  catch (error) { input.checked = !paid; throw error; }
+  await changePayment(input, checked);
 }
 
 
@@ -2663,7 +2785,7 @@ async function initApp(){
 
 let refreshingView = false;
 async function refreshVisibleView() {
-  if (!token || !state.me || document.hidden || refreshingView || orderQueues.size || purgingOrders) return;
+  if (!token || !state.me || document.hidden || refreshingView || orderQueues.size || paymentPending.size || purgingOrders) return;
   if (!pageMenus.classList.contains('hidden') || !pageReports.classList.contains('hidden')) return;
   refreshingView = true;
   const epoch = sessionEpoch;
@@ -2673,12 +2795,15 @@ async function refreshVisibleView() {
     state.ordersCache.clear(); state.pre.cache.clear(); allSeatsSnapshot = null;
     ensurePreorderUI();
     renderActiveMenu();
-    if (!pageOrders.classList.contains('hidden')) await renderSeatOrder();
+    if (!pageOrders.classList.contains('hidden')) { await renderSeatOrder(); if (isAdmin()) await renderAllSeatsAdmin(true); }
     if (!document.getElementById('pagePreorders').classList.contains('hidden')) await renderPreorder();
   } finally { refreshingView = false; }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) runTask(refreshVisibleView); });
 setInterval(() => runTask(refreshVisibleView), 60_000);
+setInterval(() => {
+  if (isAdmin() && token && !document.hidden && !pageOrders.classList.contains('hidden') && !refreshingView && !paymentPending.size && !orderQueues.size && !purgingOrders) runTask(() => renderAllSeatsAdmin(true));
+}, 15_000);
 
 // 自動登入驗證（✅ /auth/me 現在統一回傳 { id, username, role }）
 (async function bootstrap(){

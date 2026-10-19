@@ -53,6 +53,7 @@ async function client(
   w.HTMLElement.prototype.scrollIntoView = () => {};
   const empty = (seat) => ({
     seat,
+    orderId: seat, version: 0, date: '2026-10-19', batch: 'test-batch',
     submitted: false,
     internalOnly: false,
     paid: false,
@@ -65,13 +66,13 @@ async function client(
         ? { id: 1, username: "admin", role }
         : { id: 2, username: "2", role },
     orders: new Map([
-      [1, { ...empty(1), items: structuredClone(orderItems) }],
-      [2, { ...empty(2), items: structuredClone(role === 'user' ? orderItems : []) }],
+      [1, { ...empty(1), submitted: orderItems.length > 0, items: structuredClone(orderItems) }],
+      [2, { ...empty(2), submitted: role === 'user' && orderItems.length > 0, items: structuredClone(role === 'user' ? orderItems : []) }],
     ]),
     preorders: new Map([
       [
         "2026-10-20:2",
-        { ...empty(2), date: "2026-10-20", items: structuredClone(preItems) },
+        { ...empty(2), batch: null, date: "2026-10-20", submitted: preItems.length > 0, items: structuredClone(preItems) },
       ],
     ]),
     menus: [
@@ -91,6 +92,9 @@ async function client(
     activeMenuId: 1,
     preSettings: { enabled, dates: ["2026-10-20"] },
     failWrites: false,
+    failNetwork: false,
+    failReads: false,
+    paymentConflict: false,
     delay: null,
   };
   let nextItem = 100;
@@ -105,6 +109,8 @@ async function client(
       return Response.json({ message: "invalid token" }, { status: 401 });
     }
     if (model.delay) await model.delay(route, method);
+    if (model.failNetwork && method === 'PUT') throw new TypeError('offline fixture');
+    if (model.failReads && method === 'GET') throw new TypeError('offline fixture');
     if (model.failWrites && method === "PUT")
       return Response.json({ message: "測試儲存失敗" }, { status: 500 });
     let data;
@@ -138,6 +144,7 @@ async function client(
       data = { ok: true };
     } else if (route === "/orders")
       data = {
+        date: '2026-10-19', batch: 'test-batch',
         orders: Array.from(
           { length: 36 },
           (_, i) => model.orders.get(i + 1) || empty(i + 1),
@@ -147,7 +154,11 @@ async function client(
       const seat = Number(route.split("/")[2]);
       const order = model.orders.get(seat) || empty(seat);
       if (method === "PUT") {
-        if (route.endsWith("/paid")) order.paid = body.paid;
+        if (route.endsWith("/paid")) {
+          if (model.paymentConflict || body.version !== order.version || body.orderId !== order.orderId || body.batch !== order.batch || body.date !== order.date)
+            return Response.json({ message: '訂單或付款狀態已變更' }, { status: 409 });
+          order.paid = body.paid; order.version++;
+        }
         else
           Object.assign(order, structuredClone(body), {
             items: body.items.map((item) => ({ ...item, id: ++nextItem })),
@@ -155,21 +166,21 @@ async function client(
           });
         model.orders.set(seat, order);
       }
-      data = order;
+      data = route.endsWith('/paid') && method === 'PUT' ? { ok: true, order } : order;
     } else if (/^\/preorders\/[^/]+\/\d+(?:\/paid)?$/.test(route)) {
       const [, , date, rawSeat] = route.split("/"),
         seat = Number(rawSeat),
         key = `${date}:${seat}`;
       const order = model.preorders.get(key) || { ...empty(seat), date };
       if (method === "PUT") {
-        if (route.endsWith("/paid")) order.paid = body.paid;
+        if (route.endsWith("/paid")) { order.paid = body.paid; order.version++; }
         else
           Object.assign(order, structuredClone(body), {
             items: body.items.map((item) => ({ ...item, id: ++nextItem })),
           });
         model.preorders.set(key, order);
       }
-      data = order;
+      data = route.endsWith('/paid') && method === 'PUT' ? { ok: true, order } : order;
     } else if (route === "/reports/aggregate")
       data = { items: [], classTotal: 0 };
     else if (route === "/reports/missing") data = { missing: [] };
@@ -557,4 +568,95 @@ test("changing preorder dates during a slow request keeps the last chosen date o
     c.d.querySelector("#preTable tbody").textContent,
     /二十一日便當/,
   );
+});
+
+const lunchItem = { id: 10, name: '雞腿飯', unitPrice: 95, qty: 2 };
+const paidControl = (c, seat = 1) => c.d.getElementById(`seat-paid-${seat}`);
+const togglePayment = (c, value, seat = 1) => {
+  const input = paidControl(c, seat);
+  input.checked = value;
+  input.dispatchEvent(new c.w.Event('change', { bubbles: true }));
+};
+
+test('overview checkboxes persist payment, reverse it, update totals and survive a new read', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  assert.equal(paidControl(c, 2).disabled, true);
+  assert.match(paidControl(c, 2).closest('label').textContent, /未訂餐/);
+  togglePayment(c, true);
+  await until(() => c.model.orders.get(1).paid && !paidControl(c).disabled);
+  assert.equal(paidControl(c).checked, true);
+  assert.match(c.d.getElementById('paymentSummary').textContent, /NT\$ 190/);
+  assert.equal(c.calls.filter(call => call.route === '/orders/1/paid' && call.method === 'PUT').length, 1);
+  c.click('refreshAllSeats'); await c.idle();
+  assert.equal(paidControl(c).checked, true);
+  togglePayment(c, false);
+  await until(() => !c.model.orders.get(1).paid && !paidControl(c).disabled);
+  assert.equal(paidControl(c).checked, false);
+  assert.match(paidControl(c).closest('label').textContent, /未付款/);
+});
+
+test('a failed payment save rolls back the checkbox and displays the server state', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  c.model.failWrites = true;
+  togglePayment(c, true);
+  await until(() => /已載入伺服器最新狀態/.test(c.d.getElementById('appNotice').textContent));
+  assert.equal(c.model.orders.get(1).paid, false);
+  assert.equal(paidControl(c).checked, false);
+  assert.equal(paidControl(c).disabled, false);
+  assert.ok(c.d.getElementById('appNotice').classList.contains('error'));
+});
+
+test('offline payment results stay blocked until a successful refresh', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  c.model.failNetwork = true; c.model.failReads = true;
+  togglePayment(c, true);
+  await until(() => /儲存結果未確認/.test(c.d.getElementById('appNotice').textContent));
+  assert.equal(paidControl(c).checked, false);
+  assert.equal(paidControl(c).disabled, true);
+  c.model.failNetwork = false; c.model.failReads = false;
+  c.click('refreshAllSeats'); await c.idle();
+  assert.equal(paidControl(c).disabled, false);
+});
+
+test('a lost response after commit is reconciled without sending another payment write', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  const base = c.w.fetch;
+  c.w.fetch = async (url, options = {}) => {
+    const response = await base(url, options);
+    if (url.endsWith('/orders/1/paid') && options.method === 'PUT') throw new TypeError('fixture response lost');
+    return response;
+  };
+  togglePayment(c, true);
+  await until(() => /已載入伺服器最新狀態/.test(c.d.getElementById('appNotice').textContent));
+  assert.equal(paidControl(c).checked, true);
+  assert.equal(c.calls.filter(call => call.route === '/orders/1/paid' && call.method === 'PUT').length, 1);
+});
+
+test('rapid repeated changes send one write and keep other seats independently usable', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  c.model.orders.set(2, { ...c.model.orders.get(1), seat: 2, orderId: 2 });
+  c.click('refreshAllSeats'); await c.idle();
+  c.model.delay = async (route, method) => { if (route.endsWith('/paid') && method === 'PUT') await sleep(60); };
+  togglePayment(c, true);
+  await until(() => paidControl(c).disabled);
+  assert.match(paidControl(c).closest('label').textContent, /儲存中/);
+  togglePayment(c, false);
+  togglePayment(c, true, 2);
+  await until(() => c.model.orders.get(1).paid && c.model.orders.get(2).paid && !paidControl(c).disabled && !paidControl(c, 2).disabled);
+  assert.equal(c.calls.filter(call => call.route === '/orders/1/paid' && call.method === 'PUT').length, 1);
+});
+
+test('a stale administrator sees the current payment state after a conflict', async t => {
+  const c = await client(t, { orderItems: [lunchItem] });
+  c.model.orders.get(1).paid = true; c.model.orders.get(1).version++;
+  togglePayment(c, true);
+  await until(() => /已載入伺服器最新狀態/.test(c.d.getElementById('appNotice').textContent));
+  assert.equal(paidControl(c).checked, true);
+  assert.ok(c.d.getElementById('appNotice').classList.contains('error'));
+});
+
+test('students have no overview payment controls', async t => {
+  const c = await client(t, { role: 'user', orderItems: [lunchItem] });
+  assert.ok(c.d.getElementById('adminAllSeats').classList.contains('hidden'));
+  assert.equal(c.d.querySelectorAll('.payment-control input').length, 0);
 });
