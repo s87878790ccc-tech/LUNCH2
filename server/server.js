@@ -13,6 +13,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
 const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
+const { currentContext, orderJSON, assertReference, contentChanged, updatePayment } = require('./payments');
 
 // Express 4 does not forward rejected async handlers to its error middleware.
 const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -562,15 +563,17 @@ async function logAction(user, action, details, req) {
 }
 
 // helpers
-async function ensureOrder(seat, client = null) {
-  if (!client) return tx(c => ensureOrder(seat, c));
+async function ensureOrder(seat, client, context) {
   // Serialize creation without assuming the legacy orders table has a unique seat index.
   await client.query('select pg_advisory_xact_lock(7201, $1::integer)', [seat]);
-  const existing = await t_one(client, 'select * from orders where seat=$1 for update', [seat]);
+  const existing = await t_one(client, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
   if (existing) return existing;
   return t_one(client,
-    `insert into orders(seat, submitted, internal_only, paid, created_at, updated_at)
-     values ($1,false,false,false,now(),now()) returning *`, [seat]);
+    `insert into orders(seat, order_date, order_batch, submitted, internal_only, paid, created_at, updated_at)
+     values ($1,$2,$3,false,false,false,now(),now()) returning *`, [seat, context.date, context.batch]);
+}
+async function orderContext(client = null) {
+  return client ? currentContext(client, BUSINESS_TZ) : tx(c => currentContext(c, BUSINESS_TZ));
 }
 function userCanAccessSeat(user, seat) {
   if (!user) return false;
@@ -897,23 +900,21 @@ async function validateManualLock(user, client, items, previousItems) {
 // Orders
 // A single read replaces 36 per-seat HTTP requests in the admin overview.
 app.get('/api/orders', auth(), requireAdmin, asyncRoute(async (_req, res) => {
+  const context = await orderContext();
   const [orders, items] = await Promise.all([
-    q('select * from orders where seat between 1 and 36 order by seat'),
-    q('select oi.* from order_items oi join orders o on oi.order_id=o.id where o.seat between 1 and 36 order by oi.id'),
+    q('select * from orders where order_date=$1 and order_batch=$2 and seat between 1 and 36 order by seat', [context.date, context.batch]),
+    q('select oi.* from order_items oi join orders o on oi.order_id=o.id where o.order_date=$1 and o.order_batch=$2 and o.seat between 1 and 36 order by oi.id', [context.date, context.batch]),
   ]);
   const byOrder = new Map();
   for (const item of items) {
     if (!byOrder.has(item.order_id)) byOrder.set(item.order_id, []);
-    byOrder.get(item.order_id).push({
-      id: item.id, name: item.name, unitPrice: item.unit_price, qty: item.qty,
-      updatedAt: item.updated_at ? new Date(item.updated_at).toISOString() : null,
-    });
+    byOrder.get(item.order_id).push(item);
   }
   const bySeat = new Map(orders.map(o => [o.seat, o]));
-  res.json({ orders: Array.from({ length: 36 }, (_, i) => {
+  res.json({ ...context, orders: Array.from({ length: 36 }, (_, i) => {
     const seat = i + 1;
     const o = bySeat.get(seat);
-    return { seat, submitted: !!o?.submitted, internalOnly: !!o?.internal_only, paid: !!o?.paid, items: byOrder.get(o?.id) || [] };
+    return orderJSON(o, byOrder.get(o?.id) || [], seat, context);
   }) });
 }));
 
@@ -921,21 +922,10 @@ app.get('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
-  const o = await one('select * from orders where seat=$1', [seat]);
+  const context = await orderContext();
+  const o = await one('select * from orders where seat=$1 and order_date=$2 and order_batch=$3', [seat, context.date, context.batch]);
   const items = o ? await q('select * from order_items where order_id=$1 order by id asc', [o.id]) : [];
-  res.json({
-    seat,
-    submitted: !!o?.submitted,
-    internalOnly: !!o?.internal_only,
-    paid: !!o?.paid,
-    items: items.map(i => ({
-      id: i.id,
-      name: i.name,
-      unitPrice: i.unit_price,
-      qty: i.qty,
-      updatedAt: i.updated_at ? new Date(i.updated_at).toISOString() : null,
-    })),
-  });
+  res.json(orderJSON(o, items, seat, context));
 }));
 app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
@@ -950,14 +940,19 @@ app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const rawItems = body.items;
   const internalOnly = booleanField(body, 'internalOnly');
   await tx(async (c) => {
-    const o = await ensureOrder(seat, c);
+    const context = await orderContext(c);
+    await c.query('select pg_advisory_xact_lock(7201, $1::integer)', [seat]);
+    const existing = await t_one(c, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
+    assertReference(body, existing, context, false);
+    const o = existing || await ensureOrder(seat, c, context);
     const previous = await t_q(c, 'select name, unit_price, qty from order_items where order_id=$1', [o.id]);
     await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
-    await c.query('update orders set submitted=$1, internal_only=$2, paid=case when $1 then paid else false end, updated_at=now() where id=$3', [
-      submitted, flag, o.id,
+    const changed = contentChanged(o, previous, finalItems, internalOnly);
+    await c.query('update orders set submitted=$1, internal_only=$2, paid=case when $4 then false else paid end, revision=revision+1, payment_updated_at=case when $4 then now() else payment_updated_at end, payment_updated_by=case when $4 then $5 else payment_updated_by end, updated_at=now() where id=$3', [
+      submitted, flag, o.id, changed, req.user.uid,
     ]);
     await c.query('delete from order_items where order_id=$1', [o.id]);
     for (const it of finalItems) {
@@ -975,52 +970,59 @@ app.put('/api/orders/:seat/paid', auth(), requireAdmin, asyncRoute(async (req, r
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   const body = getBody(req);
-  const paid = booleanField(body, 'paid');
-  const o = await ensureOrder(seat);
-  await q('update orders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
-  await logAction(req.user, 'order.paid', { seat, paid }, req);
-  res.json({ ok: true });
+  const order = await tx(async c => {
+    const context = await orderContext(c);
+    const o = await t_one(c, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
+    const items = o ? await t_q(c, 'select * from order_items where order_id=$1 order by id', [o.id]) : [];
+    return updatePayment(c, { order: o, items, context, body, userId: req.user.uid });
+  });
+  await logAction(req.user, 'order.paid', { seat, paid: order.paid, orderId: order.orderId, date: order.date, batch: order.batch, version: order.version }, req);
+  res.json({ ok: true, order });
 }));
 app.delete('/api/orders/today', auth(), requireAdmin, asyncRoute(async (req, res) => {
-  let deletedItems = 0;
-  let resetOrders = 0;
-  await tx(async (c) => {
-    const del = await c.query('delete from order_items');
-    deletedItems = del?.rowCount || 0;
-    const upd = await c.query('update orders set submitted=false, internal_only=false, paid=false, updated_at=now()');
-    resetOrders = upd?.rowCount || 0;
+  const result = await tx(async (c) => {
+    await c.query('select id from settings where id=1 for update');
+    const previous = await orderContext(c);
+    assertReference({ ...getBody(req), orderId: null, version: 0 }, null, previous, false);
+    const next = { date: previous.date, batch: crypto.randomUUID() };
+    await c.query('update settings set order_batch=$1 where id=1', [next.batch]);
+    return { previous, ...next };
   });
-  await logAction(req.user, 'orders.purgeToday', { deletedItems, resetOrders }, req);
-  res.json({ ok: true, deletedItems, resetOrders });
+  await logAction(req.user, 'orders.purgeToday', { ...result, archived: true }, req);
+  res.json({ ok: true, ...result });
 }));
 
 // Reports（僅 admin）
 app.get('/api/reports/aggregate', auth(), requireAdmin, asyncRoute(async (req, res) => {
+  const context = await orderContext();
   const rows = await q(
     `select name, sum(qty)::float8 as "totalQty", sum(unit_price::bigint*qty)::float8 as "totalMoney"
      from order_items oi
      join orders o on oi.order_id=o.id
+     where o.order_date=$1 and o.order_batch=$2
      group by name
-     order by "totalMoney" desc, name asc`
+     order by "totalMoney" desc, name asc`, [context.date, context.batch]
   );
   const total = rows.reduce((s, r) => s + (r.totalMoney || 0), 0);
   res.json({ items: rows, classTotal: total });
 }));
 app.get('/api/reports/missing', auth(), requireAdmin, asyncRoute(async (req, res) => {
-  const rows = await q('select seat, submitted from orders');
+  const context = await orderContext();
+  const rows = await q('select seat, submitted from orders where order_date=$1 and order_batch=$2', [context.date, context.batch]);
   const submittedSet = new Set(rows.filter(r => r.submitted).map(r => r.seat));
   const missing = [];
   for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
   res.json({ missing });
 }));
-// 未付款清單（目前 orders 不分日期）
+// 未付款清單只計入目前日期／批次。
 app.get('/api/reports/unpaid', auth(), requireAdmin, asyncRoute(async (req, res) => {
+  const context = await orderContext();
   const rows = await q(
     `select o.seat, oi.name, oi.unit_price, oi.qty
        from orders o
        left join order_items oi on oi.order_id=o.id
-      where o.paid=false and o.submitted=true
-      order by o.seat asc, oi.id asc`
+      where o.paid=false and o.submitted=true and o.order_date=$1 and o.order_batch=$2
+      order by o.seat asc, oi.id asc`, [context.date, context.batch]
   );
   const map = new Map();
   for (const row of rows) {
@@ -1130,13 +1132,7 @@ app.get('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
 
   const o = await one('select * from preorders where d=$1 and seat=$2', [date, seat]);
   const items = o ? await q('select * from preorder_items where preorder_id=$1 order by id asc', [o.id]) : [];
-  res.json({
-    date, seat,
-    submitted: !!o?.submitted,
-    internalOnly: !!o?.internal_only,
-    paid: !!o?.paid,
-    items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
-  });
+  res.json(orderJSON(o, items, seat, { date }));
 }));
 app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
@@ -1155,14 +1151,18 @@ app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   const rawItems = body.items;
   const internalOnly = booleanField(body, 'internalOnly');
   await tx(async (c)=>{
+    await c.query('select pg_advisory_xact_lock(7202, $1::integer)', [seat]);
+    const existing = await t_one(c, 'select * from preorders where d=$1 and seat=$2 for update', [date, seat]);
+    assertReference(body, existing, { date }, false);
     const o = await ensurePreorder(date, seat, c);
     const previous = await t_q(c, 'select name, unit_price, qty from preorder_items where preorder_id=$1', [o.id]);
     await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
-    await c.query('update preorders set submitted=$1, internal_only=$2, paid=case when $1 then paid else false end, updated_at=now() where id=$3', [
-      submitted, flag, o.id
+    const changed = contentChanged(o, previous, finalItems, internalOnly);
+    await c.query('update preorders set submitted=$1, internal_only=$2, paid=case when $4 then false else paid end, revision=revision+1, payment_updated_at=case when $4 then now() else payment_updated_at end, payment_updated_by=case when $4 then $5 else payment_updated_by end, updated_at=now() where id=$3', [
+      submitted, flag, o.id, changed, req.user.uid
     ]);
     await c.query('delete from preorder_items where preorder_id=$1', [o.id]);
     for (const it of finalItems) {
@@ -1182,11 +1182,13 @@ app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, asyncRoute(asyn
   const date = toDateOrNull(req.params.date);
   if (!date) return res.status(400).json({ message:'bad date' });
   const body = getBody(req);
-  const paid = booleanField(body, 'paid');
-  const o = await ensurePreorder(date, seat);
-  await q('update preorders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
-  await logAction(req.user, 'preorder.paid', { date, seat, paid }, req);
-  res.json({ ok:true });
+  const order = await tx(async c => {
+    const o = await t_one(c, 'select * from preorders where d=$1 and seat=$2 for update', [date, seat]);
+    const items = o ? await t_q(c, 'select * from preorder_items where preorder_id=$1 order by id', [o.id]) : [];
+    return updatePayment(c, { order: o, items, context: { date }, body, userId: req.user.uid, preorder: true });
+  });
+  await logAction(req.user, 'preorder.paid', { date, seat, paid: order.paid, orderId: order.orderId, version: order.version }, req);
+  res.json({ ok:true, order });
 }));
 
 
@@ -1383,6 +1385,9 @@ async function start() {
     await ensureOrderItemsExtraColumns();
     await ensureMenuExtraColumns();
     await ensurePreorderSchema();
+    // The versioned, non-destructive migration must be applied before release.
+    await q('select order_date, order_batch, revision, payment_updated_at, payment_updated_by from orders limit 0');
+    await q('select revision, payment_updated_at, payment_updated_by from preorders limit 0');
     await seed();
     console.log('[tz check]', zonedNowInfo());
     return app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));

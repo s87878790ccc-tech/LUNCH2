@@ -15,3 +15,5 @@ coverage/
 credentials.*
 passwords.*
 security-*-scan.json
+/server/ui-results/
+/server/ui-report/

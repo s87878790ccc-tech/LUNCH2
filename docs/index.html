@@ -192,10 +192,10 @@
               "
             >
               <span class="small muted"
-                >將清空今日所有座號的訂單、內訂與付款狀態。</span
+                >開始新批次，舊訂單與付款紀錄保留於資料庫。</span
               >
               <button id="purgeOrdersBtn" class="danger">
-                刪除今日全部訂單
+                開始新一輪訂餐
               </button>
             </div>
             <div
@@ -250,6 +250,9 @@
             <h3>全部座號（管理員快速檢視 / 操作）</h3>
             <button id="refreshAllSeats" class="ghost">重新整理</button>
           </div>
+          <p id="paymentContext" class="small muted"></p>
+          <div id="paymentSummary" class="payment-summary" aria-label="目前批次付款統計" aria-live="polite"></div>
+          <p class="small muted">勾選即儲存，可取消勾選；未訂餐無法標記。訂單內容變更後需重新確認付款。</p>
           <div id="allSeatsGrid"></div>
         </div>
       </section>

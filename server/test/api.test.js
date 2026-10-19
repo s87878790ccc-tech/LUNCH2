@@ -8,6 +8,7 @@ const sharp = require("sharp");
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { issueToken, TOKEN_ISSUER, TOKEN_AUDIENCE } = require("../security");
+const { businessDate } = require('../payments');
 
 // The app is imported without its startup function; no production database is contacted.
 process.env.DATABASE_URL = "postgres://test:test@127.0.0.1:1/lunch_test";
@@ -30,15 +31,18 @@ before(async () => {
     returns: DataType.integer,
     implementation: () => 0,
   });
+  db.public.registerEquivalentType({ name: 'float8', equivalentTo: DataType.float, isValid: () => true });
   db.public.none(`
     create table users(id serial primary key, username text unique, password_hash text, role text, status text, auth_version integer not null default 0, created_at timestamptz default now(), updated_at timestamptz default now(), last_login_at timestamptz);
-    create table settings(id integer primary key, active_menu_id integer, open_days integer[], open_start text, open_end text, manual_locked boolean not null default false);
+    -- pg-mem cannot cast DATE to TEXT; real PostgreSQL integration tests cover
+    -- that driver conversion, migration and row-lock behavior separately.
+    create table settings(id integer primary key, active_menu_id integer, open_days integer[], open_start text, open_end text, manual_locked boolean not null default false, order_date text not null default '${businessDate()}', order_batch text not null default 'legacy');
     create table menus(id serial primary key, name text, note text, image_url text, image_path text);
     create table menu_items(id serial primary key, menu_id integer references menus(id), code integer, name text, price integer);
-    create table orders(id serial primary key, seat integer unique, submitted boolean default false, internal_only boolean default false, paid boolean default false, created_at timestamptz default now(), updated_at timestamptz default now());
+    create table orders(id serial primary key, seat integer, submitted boolean default false, internal_only boolean default false, paid boolean default false, created_at timestamptz default now(), updated_at timestamptz default now(), order_date text not null default '${businessDate()}', order_batch text not null default 'legacy', revision integer not null default 0, payment_updated_at timestamptz, payment_updated_by integer references users(id), unique(order_date,order_batch,seat));
     create table order_items(id serial primary key, order_id integer references orders(id), name text, unit_price integer, qty integer, updated_at timestamptz default now());
     create table preorder_settings(id integer primary key, enabled boolean, dates text[]);
-    create table preorders(id serial primary key, d date, seat integer, submitted boolean default false, internal_only boolean default false, paid boolean default false, created_at timestamptz default now(), updated_at timestamptz default now(), unique(d,seat));
+    create table preorders(id serial primary key, d date, seat integer, submitted boolean default false, internal_only boolean default false, paid boolean default false, created_at timestamptz default now(), updated_at timestamptz default now(), revision integer not null default 0, payment_updated_at timestamptz, payment_updated_by integer references users(id), unique(d,seat));
     create table preorder_items(id serial primary key, preorder_id integer references preorders(id), name text, unit_price integer, qty integer);
     create table audit_logs(id serial primary key, user_id integer, action text, details jsonb, ip text, ua text, ts timestamptz default now());
     insert into settings(id,active_menu_id,open_days,open_start,open_end) values(1,null,'{0,1,2,3,4,5,6}','00:00','23:59');
@@ -49,7 +53,10 @@ before(async () => {
   `);
   const { Pool } = db.adapters.createPg();
   memoryPool = new Pool();
-  pool.query = memoryPool.query.bind(memoryPool);
+  pool.query = (...args) => memoryPool.query(...args).catch(error => {
+    if (process.env.LUNCH_TEST_DEBUG) console.error(error.message);
+    throw error;
+  });
   pool.connect = memoryPool.connect.bind(memoryPool);
   const hash = await bcrypt.hash("test-password", 4);
   fixtureHash = hash;
@@ -109,7 +116,7 @@ test("saving a valid order and clearing it updates submitted and paid consistent
   assert.equal(res.body.submitted, true);
   assert.equal(res.body.paid, false);
   await as(request(app).put("/api/orders/2/paid"))
-    .send({ paid: true })
+    .send({ ...res.body, paid: true })
     .expect(200);
   await as(request(app).put("/api/orders/2"), user)
     .send({ items: [], internalOnly: false })
@@ -443,4 +450,101 @@ test("new account and password changes reject short passwords without replacing 
   await as(request(app).post('/api/users')).send({ username: 'new-local-user', password: 'short-local', role: 'user' }).expect(400);
   await as(request(app).put('/api/users/2/password')).send({ newPassword: 'short-local' }).expect(400);
   await as(request(app).get('/api/auth/me'), user).expect(200);
+});
+
+const readOrder = async (route = '/api/orders/2') => (await as(request(app).get(route)).expect(200)).body;
+const markPaid = (route, order, paid = true) => as(request(app).put(route + '/paid')).send({ ...order, paid });
+
+test('payment markers persist per order, can be reversed, and record the real administrator', async () => {
+  for (const seat of [2, 3]) await as(request(app).put(`/api/orders/${seat}`)).send({ items: [item] }).expect(200);
+  const before = await readOrder();
+  const saved = await as(request(app).put('/api/orders/2/paid')).send({ ...before, paid: true, paymentUpdatedBy: 999 }).expect(200);
+  assert.equal(saved.body.order.paid, true);
+  assert.equal(saved.body.order.paymentUpdatedBy, 1);
+  assert.ok(saved.body.order.paymentUpdatedAt);
+  assert.equal((await readOrder()).paid, true);
+  assert.equal((await readOrder('/api/orders/3')).paid, false);
+  const second = await markPaid('/api/orders/2', saved.body.order, false).expect(200);
+  assert.equal(second.body.order.paid, false);
+  assert.equal(second.body.order.version, before.version + 2);
+});
+
+test('empty seats cannot create orders through the payment API', async () => {
+  const empty = await readOrder();
+  await markPaid('/api/orders/2', empty).expect(409);
+  await markPaid('/api/preorders/2026-10-20/2', await readOrder('/api/preorders/2026-10-20/2')).expect(409);
+  assert.equal(db.public.one('select count(*) as n from orders').n, 0);
+  assert.equal(db.public.one('select count(*) as n from preorders').n, 0);
+});
+
+test('payment API rejects unauthenticated users, students, stale versions and forged context', async () => {
+  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  const before = await readOrder();
+  await request(app).put('/api/orders/2/paid').send({ ...before, paid: true }).expect(401);
+  await as(request(app).put('/api/orders/2/paid'), user).send({ ...before, paid: true }).expect(403);
+  for (const patch of [{ orderId: 999 }, { date: '2026-01-01' }, { batch: 'foreign-batch' }]) {
+    await markPaid('/api/orders/2', { ...before, ...patch }).expect(409);
+  }
+  for (const patch of [{ version: '0' }, { date: '2026-02-31' }, { paid: 'true' }]) {
+    await as(request(app).put('/api/orders/2/paid')).send({ ...before, paid: true, ...patch }).expect(400);
+  }
+  await markPaid('/api/orders/2', before).expect(200);
+  await markPaid('/api/orders/2', before, false).expect(409);
+  assert.equal((await readOrder()).paid, true);
+});
+
+test('changing order contents invalidates payment; an unchanged save does not', async () => {
+  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  let saved = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
+  await as(request(app).put('/api/orders/2')).send(saved).expect(200);
+  assert.equal((await readOrder()).paid, true);
+  saved = await readOrder();
+  await as(request(app).put('/api/orders/2')).send({ ...saved, items: [{ ...item, qty: 3 }] }).expect(200);
+  saved = await readOrder();
+  assert.equal(saved.paid, false);
+  await markPaid('/api/orders/2', saved).expect(200);
+  saved = await readOrder();
+  await as(request(app).put('/api/orders/2')).send({ ...saved, items: [] }).expect(200);
+  await markPaid('/api/orders/2', await readOrder()).expect(409);
+});
+
+test('a new round preserves prior orders and payments while rejecting old checkbox requests', async () => {
+  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  const paid = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
+  await as(request(app).delete('/api/orders/today')).send({ date: paid.date, batch: paid.batch }).expect(200);
+  const current = await readOrder();
+  assert.equal(current.items.length, 0);
+  assert.equal(current.paid, false);
+  assert.notEqual(current.batch, paid.batch);
+  await as(request(app).put('/api/orders/2')).send({ ...current, items: [item] }).expect(200);
+  await markPaid('/api/orders/2', paid).expect(409);
+  const archived = await pool.query('select paid from orders where id=$1', [paid.orderId]);
+  assert.equal(archived.rows[0].paid, true);
+  assert.equal(db.public.one('select count(*) as n from orders').n, 2);
+  const report = await as(request(app).get('/api/reports/aggregate')).expect(200);
+  assert.equal(report.body.classTotal, 190);
+});
+
+test('a new business date starts a separate batch without inheriting payment', async () => {
+  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  const paid = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
+  await pool.query("update settings set order_date='2000-01-01' where id=1");
+  await pool.query("update orders set order_date='2000-01-01' where id=$1", [paid.orderId]);
+  const current = await readOrder();
+  assert.equal(current.date, businessDate());
+  assert.notEqual(current.batch, paid.batch);
+  assert.equal(current.items.length, 0);
+  await markPaid('/api/orders/2', { ...paid, date: '2000-01-01' }).expect(409);
+  assert.equal((await pool.query('select paid from orders where id=$1', [paid.orderId])).rows[0].paid, true);
+});
+
+test('preorder payment is isolated by date and invalidates after an order edit', async () => {
+  for (const date of ['2026-10-20', '2026-10-21']) await as(request(app).put(`/api/preorders/${date}/2`)).send({ items: [item] }).expect(200);
+  const route = '/api/preorders/2026-10-20/2';
+  const saved = (await markPaid(route, await readOrder(route)).expect(200)).body.order;
+  assert.equal((await readOrder('/api/preorders/2026-10-21/2')).paid, false);
+  await markPaid('/api/preorders/2026-10-21/2', saved).expect(409);
+  await as(request(app).put(route)).send({ ...saved, items: [{ ...item, unitPrice: 100 }] }).expect(200);
+  assert.equal((await readOrder(route)).paid, false);
+  await as(request(app).put(route + '/paid'), user).send({ ...saved, paid: true }).expect(403);
 });
