@@ -121,8 +121,14 @@ const loadBySeatBtn = document.getElementById('loadBySeat');
 const loadBySeatMsg = document.getElementById('loadBySeatMsg');
 
 // ====== 基礎：Auth 狀態與 UI（必須在 bootstrap 之前）======
-function readToken() { try { return localStorage.getItem('jwt') || null; } catch { return null; } }
-function storeToken(value) { try { value ? localStorage.setItem('jwt', value) : localStorage.removeItem('jwt'); } catch { /* Session-only login when storage is unavailable. */ } }
+function readToken() {
+  try { localStorage.removeItem('jwt'); } catch { /* Old persistent sessions are not reused. */ }
+  try { return sessionStorage.getItem('jwt') || null; } catch { return null; }
+}
+function storeToken(value) {
+  try { localStorage.removeItem('jwt'); } catch { /* Storage may be disabled. */ }
+  try { value ? sessionStorage.setItem('jwt', value) : sessionStorage.removeItem('jwt'); } catch { /* In-memory login remains available. */ }
+}
 let token = readToken();
 let sessionEpoch = 0;
 let dataRevision = 0;
@@ -183,7 +189,7 @@ function formatTaiwanTime(value) {
 }
 
 function buildImageThumb(url='', alt=''){
-  try { if (!['https:', 'http:'].includes(new URL(url, location.href).protocol)) url = ''; } catch { url = ''; }
+  url = safeImageUrl(url);
   const safeUrl = escapeHtml(url || '');
   const safeAlt = escapeHtml(alt || '');
   if (!url) return '<div class="menu-thumb placeholder">無圖片</div>';
@@ -263,10 +269,18 @@ async function clearMenuImage(e){
 }
 
 let lightboxReturnFocus = null;
+function safeImageUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const url = new URL(value, location.href);
+    return url.protocol === 'https:' && !url.username && !url.password &&
+      [location.origin, new URL(API_BASE).origin].includes(url.origin) ? url.href : '';
+  } catch { return ''; }
+}
 function showImageLightbox(url, alt=''){
+  url = safeImageUrl(url);
   if (!url) return;
-  try { if (!['https:', 'http:'].includes(new URL(url, location.href).protocol)) return; } catch { return; }
-  if (!imageLightbox) { window.open(url, '_blank'); return; }
+  if (!imageLightbox) { window.open(url, '_blank', 'noopener,noreferrer'); return; }
   const img = imageLightbox.querySelector('img');
   if (img) {
     img.src = url;
@@ -381,9 +395,12 @@ listen(document.getElementById('loginForm'), 'submit', async (event) => {
     setLoginLoading(false);
   }
 });
-logoutBtn.onclick = () => {
-  clearSession();
-  showLogin();
+logoutBtn.onclick = async () => {
+  if (logoutBtn.disabled) return;
+  logoutBtn.disabled = true;
+  try { await api('/auth/logout', { method: 'POST', timeoutMs: 8000 }); }
+  catch { /* Always remove this browser's session if the connection fails. */ }
+  finally { clearSession(); showLogin(); logoutBtn.disabled = false; }
 };
 
 /* =========================
@@ -464,6 +481,7 @@ async function uploadImageFile(file) {
    ========================= */
 const MIN_SEAT=1, MAX_SEAT=36;
 const state = {
+  manualLocked: true,
   me: null,
   menus: [],
   activeMenuId: null,
@@ -508,6 +526,7 @@ function listen(element, type, handler) {
 function resetClientState() {
   sessionEpoch += 1;
   state.me = null;
+  state.manualLocked = true;
   state.menus = [];
   state.activeMenuId = null;
   state.editingMenuId = null;
@@ -1132,16 +1151,18 @@ async function renderSeatOrder(){
   if (internalOnlyEl) internalOnlyEl.checked = !!o.internalOnly;
   const lock = !!o.internalOnly || (!isAdmin() && !isOpenWindow);
 
-  if (internalOnlyEl) internalOnlyEl.disabled = !isAdmin() && !isOpenWindow;
-  clearSeat.disabled = !isAdmin() && !isOpenWindow;
+  const hasLockedManual = o.items.some(manualItemLocked);
+  if (internalOnlyEl) internalOnlyEl.disabled = !isAdmin() && (!isOpenWindow || hasLockedManual);
+  clearSeat.disabled = !isAdmin() && (!isOpenWindow || hasLockedManual);
   // 鎖定新增/輸入區
   codeInput.disabled = lock;
   qtyInput.disabled = lock;
   addByCode.disabled = lock;
-  manualName.disabled = lock;
-  manualPrice.disabled = lock;
-  manualQty.disabled = lock;
-  addManual.disabled = lock;
+  const manualDisabled = lock || (!isAdmin() && state.manualLocked);
+  manualName.disabled = manualDisabled;
+  manualPrice.disabled = manualDisabled;
+  manualQty.disabled = manualDisabled;
+  addManual.disabled = manualDisabled;
 
   let subtotal = 0;
   const frag = document.createDocumentFragment();
@@ -1185,7 +1206,8 @@ async function renderSeatOrder(){
     input.className = 'qtyInput w120';
     input.dataset.idx = String(idx);
     input.dataset.itemId = String(it.id ?? '');
-    if (lock) input.disabled = true;
+    const itemLocked = lock || manualItemLocked(it);
+    if (itemLocked) input.disabled = true;
     qtyTd.appendChild(input);
     tr.appendChild(qtyTd);
 
@@ -1194,7 +1216,7 @@ async function renderSeatOrder(){
     tr.appendChild(subtotalTd);
 
     const actionTd = document.createElement('td');
-    if (!lock) {
+    if (!itemLocked) {
       const btn = document.createElement('button');
       btn.className = 'danger delBtn';
       btn.dataset.idx = String(idx);
@@ -1875,7 +1897,7 @@ async function loadUsers(){
             <h4>變更我的密碼</h4>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <input type="password" id="selfOldPwd" placeholder="舊密碼" />
-              <input type="password" id="selfNewPwd" placeholder="新密碼(>=6)" />
+              <input type="password" id="selfNewPwd" placeholder="新密碼(至少12碼)" />
               <button id="selfChangeBtn">送出</button>
             </div>
           </div>
@@ -1886,7 +1908,7 @@ async function loadUsers(){
     btn.onclick = async ()=>{
       const oldP = document.getElementById('selfOldPwd').value;
       const newP = document.getElementById('selfNewPwd').value;
-      if (!newP || newP.length<6) return alert('新密碼至少 6 碼');
+      if (!newP || newP.length<12) return alert('新密碼至少 12 碼');
 
       // ✅ 兼容 id/uid；仍拿不到則請使用者重新登入（避免 /users/undefined/password）
       const uid = Number(state.me?.id ?? state.me?.uid);
@@ -1894,7 +1916,8 @@ async function loadUsers(){
 
       try{
         await resetPasswordSelf(uid, oldP, newP);
-        alert('已更新');
+        clearSession(); showLogin();
+        loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
       }catch(e){
         alert('失敗：'+e.message);
       }
@@ -1947,7 +1970,7 @@ async function loadUsers(){
 
       const input = document.createElement('input');
       input.type = 'password';
-      input.placeholder = '新密碼(>=6)';
+      input.placeholder = '新密碼(至少12碼)';
       input.id = `reset_${u.id}`;
       rowDiv.appendChild(input);
 
@@ -1982,7 +2005,7 @@ listen(createUserBtn, 'click', async ()=>{
   const username = newUserName.value.trim();
   const password = newUserPass.value;
   const role     = newUserRole.value;
-  if (!username || !password || password.length<6) return alert('請填帳號與密碼(>=6)');
+  if (!username || !password || password.length<12) return alert('請填帳號與密碼(至少12碼)');
   try{
     await createUser(username, password, role);
     newUserName.value=''; newUserPass.value='';
@@ -1998,11 +2021,14 @@ listen(usersTableBody, 'click', async (e)=>{
     const id = Number(t.dataset.id);
     const input = document.getElementById(`reset_${id}`);
     const pwd = input?.value || '';
-    if (!pwd || pwd.length < 6) return alert('新密碼至少 6 碼');
+    if (!pwd || pwd.length < 12) return alert('新密碼至少 12 碼');
     try{
       await resetPasswordAdmin(id, pwd);
       input.value = '';
-      alert('已重設');
+      if (id === Number(state.me?.id)) {
+        clearSession(); showLogin();
+        loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
+      } else alert('已重設');
     }catch(err){
       alert('重設失敗：' + err.message);
     }
@@ -2074,6 +2100,7 @@ listen(addByCode, 'click', async () => {
   codeInput.value = ''; qtyInput.value = '1';
 });
 listen(addManual, 'click', async () => {
+  if (!isAdmin() && state.manualLocked) throw new Error('管理員已鎖定手動餐點');
   if (!guardOpenWindow()) return;
   const seat = Number(seatSelect.value);
   const name = manualName.value.trim();
@@ -2491,13 +2518,15 @@ async function renderPreorder() {
   }
   if (version !== preRenderVersion || epoch !== sessionEpoch) return;
   toggle.checked = !!order.internalOnly;
-  ids.forEach(id => { document.getElementById(id).disabled = !!order.internalOnly; });
+  ids.forEach(id => { document.getElementById(id).disabled = !!order.internalOnly || (!isAdmin() && state.manualLocked && /Manual/.test(id)); });
+  toggle.disabled = !isAdmin() && order.items.some(manualItemLocked);
   tbody.innerHTML = order.items.map((item, index) => {
     const qty = safeNumber(item.qty, 1);
+    const rowLocked = order.internalOnly || manualItemLocked(item);
     const attrs = `data-idx="${index}" data-item-id="${safeText(item.id ?? '')}"`;
     return `<tr><td>${index + 1}</td><td>${safeText(item.name)}</td><td>${fmt(item.unitPrice)}</td>
-      <td><input type="number" inputmode="numeric" min="1" max="999" step="1" value="${qty}" class="preQty" ${attrs} aria-label="${safeText(item.name)} 的數量" ${order.internalOnly ? 'disabled' : ''}></td>
-      <td>${fmt(safeNumber(item.unitPrice) * qty)}</td><td>${order.internalOnly ? '' : `<button class="danger preDel" ${attrs}>刪除</button>`}</td></tr>`;
+      <td><input type="number" inputmode="numeric" min="1" max="999" step="1" value="${qty}" class="preQty" ${attrs} aria-label="${safeText(item.name)} 的數量" ${rowLocked ? 'disabled' : ''}></td>
+      <td>${fmt(safeNumber(item.unitPrice) * qty)}</td><td>${rowLocked ? '' : `<button class="danger preDel" ${attrs}>刪除</button>`}</td></tr>`;
   }).join('');
   if (!order.items.length) emptyOrder(tbody, '尚未加入預訂餐點。');
   labelOrderRows(document.getElementById('preTable'));
@@ -2526,6 +2555,7 @@ async function preAddByCode() {
   document.getElementById('preCodeInput').value = ''; qtyInput.value = '1';
 }
 async function preAddManual() {
+  if (!isAdmin() && state.manualLocked) throw new Error('管理員已鎖定手動餐點');
   const { date, seat } = requirePreorderContext();
   const name = document.getElementById('preManualName').value.trim();
   const priceInput = document.getElementById('preManualPrice'), qtyInput = document.getElementById('preManualQty');
@@ -2586,8 +2616,37 @@ function renderSeatsThenDefault(){
   if (!seatSelect.value) seatSelect.value = '1';
 }
 function renderStatic(){ renderSeatsThenDefault(); }
+function manualItemLocked(item) {
+  if (isAdmin() || !state.manualLocked || item.name === '內訂' && Number(item.unitPrice) === 0 && Number(item.qty) === 1) return false;
+  return !state.menus.find(menu => menu.id === state.activeMenuId)?.items.some(row => row.name === item.name && Number(row.price) === Number(item.unitPrice));
+}
+function renderManualPolicy() {
+  const checkbox = document.getElementById('manualOrderLocked');
+  checkbox.checked = state.manualLocked;
+  const message = state.manualLocked ? '手動餐點已鎖定：僅管理員可新增或修改。' : '手動餐點開放中，可自行輸入品名、單價與數量。';
+  for (const id of ['manualOrderHint', 'manualPreorderHint']) document.getElementById(id).textContent = message;
+}
+async function fetchManualPolicy() {
+  const policy = await api('/settings/manual-order');
+  state.manualLocked = policy.locked !== false;
+  renderManualPolicy();
+}
+listen(document.getElementById('manualOrderLocked'), 'change', async () => {
+  if (!isAdmin()) return;
+  const checkbox = document.getElementById('manualOrderLocked');
+  const locked = checkbox.checked;
+  checkbox.disabled = true;
+  try {
+    const policy = await api('/settings/manual-order', { method: 'PUT', body: JSON.stringify({ locked }) });
+    state.manualLocked = policy.locked;
+    await renderSeatOrder();
+    if (!document.getElementById('pagePreorders').classList.contains('hidden')) await renderPreorder();
+    notify(locked ? '已鎖定手動餐點' : '已開放手動餐點');
+  } finally { checkbox.disabled = false; renderManualPolicy(); }
+});
+
 async function initApp(){
-  await loadMenus();
+  await Promise.all([loadMenus(), fetchManualPolicy()]);
   renderActiveMenu();
   renderMenuPage();
   ensurePreorderUI();          // 確保預訂頁存在
@@ -2609,7 +2668,7 @@ async function refreshVisibleView() {
   refreshingView = true;
   const epoch = sessionEpoch;
   try {
-    await Promise.all([fetchOpenStatus(), fetchPreSettings(), loadMenus()]);
+    await Promise.all([fetchOpenStatus(), fetchPreSettings(), fetchManualPolicy(), loadMenus()]);
     if (epoch !== sessionEpoch) return;
     state.ordersCache.clear(); state.pre.cache.clear(); allSeatsSnapshot = null;
     ensurePreorderUI();

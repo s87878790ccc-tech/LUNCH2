@@ -29,6 +29,7 @@ async function client(
     orderItems = [],
     preItems = [],
     enabled = true,
+    manualLocked = false,
   } = {},
 ) {
   const errors = [],
@@ -58,13 +59,14 @@ async function client(
     items: [],
   });
   const model = {
+    manualLocked,
     user:
       role === "admin"
         ? { id: 1, username: "admin", role }
         : { id: 2, username: "2", role },
     orders: new Map([
       [1, { ...empty(1), items: structuredClone(orderItems) }],
-      [2, empty(2)],
+      [2, { ...empty(2), items: structuredClone(role === 'user' ? orderItems : []) }],
     ]),
     preorders: new Map([
       [
@@ -117,8 +119,15 @@ async function client(
           ? { id: 1, username: "admin", role: "admin" }
           : { id: 2, username: "2", role: "user" };
       data = { user: model.user, token: `token-${model.user.username}` };
-    } else if (route === "/auth/me") data = { user: model.user };
+    } else if (route === "/auth/logout") data = { ok: true };
+    else if (route === "/auth/me") data = { user: model.user };
+    else if (/^\/users\/\d+\/password$/.test(route) && method === "PUT")
+      data = { ok: true };
     else if (route === "/open-status") data = { open: true };
+    else if (route === "/settings/manual-order") {
+      if (method === "PUT") model.manualLocked = body.locked;
+      data = { locked: model.manualLocked };
+    }
     else if (route === "/settings/preorder") {
       if (method === "PUT") model.preSettings = body;
       data = model.preSettings;
@@ -177,7 +186,7 @@ async function client(
       );
     return Response.json(structuredClone(data));
   };
-  if (loggedIn) w.localStorage.setItem("jwt", "initial-token");
+  if (loggedIn) w.sessionStorage.setItem("jwt", "initial-token");
   w.eval(source);
   if (loggedIn)
     await until(
@@ -214,6 +223,10 @@ async function client(
     );
     await idle();
   }
+  async function logout() {
+    click("logoutBtn");
+    await until(() => d.getElementById("app").classList.contains("hidden"), "logout did not clear the screen");
+  }
   return {
     w,
     d,
@@ -226,6 +239,7 @@ async function client(
     click,
     idle,
     login,
+    logout,
   };
 }
 
@@ -375,7 +389,7 @@ test("a new account does not inherit admin visibility, seat cache or disabled pr
   const c = await client(t, {
     orderItems: [{ id: 1, name: "管理員訂單", unitPrice: 100, qty: 1 }],
   });
-  c.click("logoutBtn");
+  await c.logout();
   await c.login("2");
   assert.equal(c.d.getElementById("seatSelect").value, "2");
   assert.equal(c.d.getElementById("seatSelect").disabled, true);
@@ -394,10 +408,10 @@ test("a new account does not inherit admin visibility, seat cache or disabled pr
 test("a 401 from an earlier session cannot log out a newly signed-in account", async (t) => {
   const c = await client(t);
   const pending = c.w.eval('api("/slow")').catch((error) => error.message);
-  c.click("logoutBtn");
+  await c.logout();
   await c.login("2");
   await pending;
-  assert.equal(c.w.localStorage.getItem("jwt"), "token-2");
+  assert.equal(c.w.sessionStorage.getItem("jwt"), "token-2");
   assert.equal(c.d.getElementById("app").classList.contains("hidden"), false);
 });
 
@@ -455,8 +469,72 @@ test("logout removes the old account’s order data from the DOM as well as its 
     orderItems: [{ id: 1, name: "私人訂單內容", unitPrice: 90, qty: 1 }],
   });
   assert.match(c.d.getElementById("app").textContent, /私人訂單內容/);
-  c.click("logoutBtn");
+  await c.logout();
   assert.doesNotMatch(c.d.getElementById("app").textContent, /私人訂單內容/);
+});
+
+test("changing one's password clears the revoked login and returns to the login form", async t => {
+  const c = await client(t, { role: 'user' });
+  c.click('tabUsers');
+  await until(() => c.d.getElementById('selfChangeBtn'));
+  c.set('selfOldPwd', 'fixture-old-password');
+  c.set('selfNewPwd', 'fixture-new-password');
+  c.click('selfChangeBtn');
+  await until(() => c.d.getElementById('app').classList.contains('hidden'));
+  assert.equal(c.w.sessionStorage.getItem('jwt'), null);
+  assert.match(c.d.getElementById('loginMsg').textContent, /密碼已更新/);
+  assert.ok(c.calls.some(call => call.route === '/users/2/password' && call.method === 'PUT'));
+  assert.equal(c.d.getElementById('selfOldPwd'), null);
+});
+
+test("manual ordering remains usable by a student while unlocked", async t => {
+  const c = await client(t, { role: 'user', manualLocked: false });
+  assert.equal(c.d.getElementById('addManual').disabled, false);
+  c.set('manualName', '自行輸入便當'); c.set('manualPrice', 88); c.set('manualQty', 1);
+  c.click('addManual'); await c.idle();
+  assert.match(c.d.querySelector('#orderTable tbody').textContent, /自行輸入便當/);
+});
+
+test("the manual lock protects normal and preorder inputs while keeping catalogue ordering available", async t => {
+  const manual = { id: 1, name: '自行輸入便當', unitPrice: 88, qty: 1 };
+  const c = await client(t, { role: 'user', manualLocked: true, orderItems: [manual], preItems: [manual] });
+  assert.equal(c.d.getElementById('addManual').disabled, true);
+  assert.equal(c.d.getElementById('addByCode').disabled, false);
+  assert.equal(c.d.querySelector('#orderTable .qtyInput').disabled, true);
+  assert.equal(c.d.querySelector('#orderTable .delBtn'), null);
+  c.click('tabPreorders'); await until(() => c.d.querySelector('#preTable .preQty'));
+  assert.equal(c.d.getElementById('preAddManual').disabled, true);
+  assert.equal(c.d.getElementById('preAddByCode').disabled, false);
+  assert.equal(c.d.querySelector('#preTable .preQty').disabled, true);
+  assert.equal(c.d.querySelector('#preTable .preDel'), null);
+});
+
+test("an administrator can change the manual lock and remains able to enter manual items", async t => {
+  const c = await client(t, { manualLocked: false });
+  c.d.getElementById('manualOrderLocked').checked = true;
+  c.change('manualOrderLocked');
+  await until(() => c.model.manualLocked && !c.d.getElementById('manualOrderLocked').disabled);
+  assert.equal(c.d.getElementById('addManual').disabled, false);
+  assert.match(c.d.getElementById('manualOrderHint').textContent, /已鎖定/);
+});
+
+test("session tokens do not remain in persistent storage and logout asks the server to revoke sessions", async t => {
+  const c = await client(t);
+  assert.equal(c.w.localStorage.getItem('jwt'), null);
+  assert.equal(c.w.sessionStorage.getItem('jwt'), 'initial-token');
+  await c.logout();
+  assert.equal(c.w.sessionStorage.getItem('jwt'), null);
+  assert.ok(c.calls.some(call => call.route === '/auth/logout' && call.method === 'POST'));
+});
+
+test("image HTML rejects active URLs, external tracking origins and attribute injection", async t => {
+  const c = await client(t);
+  for (const url of ['javascript:alert(1)', 'data:image/svg+xml,<svg/>', 'https://attacker.invalid/a.png', 'http://lunch2.onrender.com/a.png', '']) {
+    assert.doesNotMatch(c.w.buildImageThumb(url, 'x'), /<img/);
+  }
+  const markup = c.w.buildImageThumb('https://lunch2.onrender.com/uploads/example.webp', '\" onerror=\"synthetic_canary()');
+  const host = c.d.createElement('div'); host.innerHTML = markup;
+  assert.equal(host.querySelector('img').hasAttribute('onerror'), false);
 });
 
 test("changing preorder dates during a slow request keeps the last chosen date on screen", async (t) => {
