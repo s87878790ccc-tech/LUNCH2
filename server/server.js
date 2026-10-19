@@ -178,6 +178,13 @@ const loginAccountLimiter = rateLimit({
   message: { message: 'too many login attempts, please try again shortly' },
 });
 const uploadLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
+// The old-password check is another authentication surface. Key it to the
+// verified account, so changing IPs or target IDs cannot reset its allowance.
+const passwordChangeLimiter = rateLimit({
+  windowMs: 60_000, limit: req => req.user.role === 'admin' ? 60 : 5,
+  keyGenerator: req => String(req.user.uid), standardHeaders: 'draft-7', legacyHeaders: false,
+  message: { message: '密碼操作過於頻繁，請一分鐘後再試' },
+});
 const dummyPasswordHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10);
 
 function normalizeTimeString(value, fallback) {
@@ -517,17 +524,29 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+async function lockActor(req, client, adminOnly, exclusive = false) {
+  const actor = await t_one(client, `select * from users where id=$1 for ${exclusive ? 'update' : 'share'}`, [req.user.uid]);
+  if (!actor || actor.status !== 'active' || !sessionMatches(req.authClaims, actor, JWT_SECRET))
+    throw Object.assign(new Error('登入已失效，請重新登入'), { status: 401 });
+  if (adminOnly && actor.role !== 'admin') throw Object.assign(new Error('forbidden'), { status: 403 });
+  return actor;
+}
+
+// Hold a shared actor lock through the business commit. A password reset,
+// logout, suspension, deletion or demotion either commits first (and this
+// request is rejected), or waits until this already-authorized write finishes.
+// Shared locks still allow different seats and administrators to work in parallel.
+async function authorizedTx(req, change, adminOnly = false) {
+  return tx(async client => change(client, await lockActor(req, client, adminOnly)));
+}
+
 // Serialize account-security mutations, then revalidate the caller inside the
 // transaction. A request authorized before a concurrent revocation cannot
 // finish with old privileges or remove the last active administrator.
 async function mutateUsers(req, change, adminOnly = true) {
   return tx(async client => {
     await client.query('select pg_advisory_xact_lock(7301, 0)');
-    const actor = await t_one(client, 'select * from users where id=$1 for update', [req.user.uid]);
-    if (!actor || actor.status !== 'active' || !sessionMatches(req.authClaims, actor, JWT_SECRET))
-      throw Object.assign(new Error('登入已失效，請重新登入'), { status: 401 });
-    if (adminOnly && actor.role !== 'admin')
-      throw Object.assign(new Error('forbidden'), { status: 403 });
+    const actor = await lockActor(req, client, adminOnly, true);
     return change(client, actor);
   });
 }
@@ -630,8 +649,8 @@ function zonedNowInfo(tz = BUSINESS_TZ) {
   return { hhmm: `${hh}:${mm}`, day, nowISO: now.toISOString(), nowLocal, tz };
 }
 
-async function isOpenNow() {
-  const s = await one('select open_days, open_start, open_end from settings where id=1');
+async function isOpenNow(client) {
+  const s = await t_one(client, 'select open_days, open_start, open_end from settings where id=1 for share');
   return inOpenWindow(s, zonedNowInfo());
 }
 
@@ -667,15 +686,18 @@ app.post('/api/uploads/images', auth(), requireAdmin, uploadLimiter, (req, res) 
       } catch {
         return res.status(400).json({ message: '圖片內容無效、尺寸過大或格式不支援' });
       }
-      await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), encoded, { flag: 'wx', mode: 0o600 });
-      created = true;
+      await authorizedTx(req, async () => {
+        await fs.promises.writeFile(path.join(UPLOAD_DIR, fileName), encoded, { flag: 'wx', mode: 0o600 });
+        created = true;
+      }, true);
       const url = `${getPublicBaseUrl(req)}/uploads/${encodeURIComponent(fileName)}`;
       await logAction(req.user, 'upload.image', { filename: fileName, size: encoded.length }, req);
       res.json({ url, filename: fileName });
     } catch (e) {
-      console.error('Image upload failed:', e.code || 'UNKNOWN');
+      if (![401, 403].includes(e.status)) console.error('Image upload failed:', e.code || 'UNKNOWN');
       if (created) fs.unlink(path.join(UPLOAD_DIR, fileName), () => {});
-      res.status(500).json({ message: '上傳失敗' });
+      const status = [401, 403].includes(e.status) ? e.status : 500;
+      res.status(status).json({ message: status === 500 ? '上傳失敗' : e.message });
     } finally {
       processingImage = false;
     }
@@ -710,7 +732,7 @@ app.get('/api/auth/me', auth(), asyncRoute(async (req, res) => {
   res.json({ user: { id: u.uid, username: u.username, role: u.role } });
 }));
 app.post('/api/auth/logout', auth(), asyncRoute(async (req, res) => {
-  await q('update users set auth_version=auth_version+1 where id=$1', [req.user.uid]);
+  await mutateUsers(req, c => c.query('update users set auth_version=auth_version+1 where id=$1', [req.user.uid]), false);
   await logAction(req.user, 'logout', { allDevices: true }, req);
   res.json({ ok: true });
 }));
@@ -731,7 +753,7 @@ app.put('/api/settings/open-window', auth(), requireAdmin, asyncRoute(async (req
   const days = [...new Set(normalizeOpenDays(body.openDays))];
   const start = normalizeTimeString(body.openStart, '07:00');
   const end = normalizeTimeString(body.openEnd, '12:00');
-  await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, start, end]);
+  await authorizedTx(req, c => c.query('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, start, end]), true);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart: start, openEnd: end }, req);
   res.json({ ok: true });
 }));
@@ -789,10 +811,10 @@ app.post('/api/menus', auth(), requireAdmin, asyncRoute(async (req, res) => {
       return res.status(400).json({ message });
     }
   }
-  const row = await one(
+  const row = await authorizedTx(req, c => t_one(c,
     'insert into menus(name, note, image_path, image_url) values ($1,$2,$3,null) returning id, name, note, image_path, image_url',
     [name, note, imageFilename]
-  );
+  ), true);
   const meta = buildMenuImageMeta(req, row);
   await logAction(req.user, 'menu.create', { id: row.id, name, note, imageFilename }, req);
   res.json({ id: row.id, name: row.name, note: row.note || '', imageUrl: meta.imageUrl, imageFilename: meta.imageFilename, items: [] });
@@ -825,7 +847,7 @@ app.put('/api/menus/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
     setParts.push(`image_url=$${params.length}`);
   }
   params.push(id);
-  await q(`update menus set ${setParts.join(', ')} where id=$${params.length}`, params);
+  await authorizedTx(req, c => c.query(`update menus set ${setParts.join(', ')} where id=$${params.length}`, params), true);
   const details = { id, name, note };
   if (hasImageField) details.imageFilename = imageFilename;
   await logAction(req.user, 'menu.update', details, req);
@@ -833,12 +855,12 @@ app.put('/api/menus/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
 }));
 app.delete('/api/menus/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
-  await tx(async (c) => {
+  await authorizedTx(req, async (c) => {
     await c.query('delete from menu_items where menu_id=$1', [id]);
     await c.query('delete from menus where id=$1', [id]);
     const s = await t_one(c, 'select active_menu_id from settings where id=1');
     if (s?.active_menu_id === id) await c.query('update settings set active_menu_id=null where id=1');
-  });
+  }, true);
   await logAction(req.user, 'menu.delete', { id }, req);
   res.json({ ok: true });
 }));
@@ -848,14 +870,14 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, asyncRoute(async (req, re
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const price = Number(body.price);
   if (!name || name.length > 100 || !integer(body.price, 0, MAX_PRICE)) throw badRequest('請輸入 1～100 字品名及非負整數價格');
-  const row = await tx(async c => {
+  const row = await authorizedTx(req, async c => {
     const menu = await t_one(c, 'select id from menus where id=$1 for update', [menuId]);
     if (!menu) throw Object.assign(new Error('菜單不存在'), { status: 404 });
     const max = await t_one(c, 'select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
     return t_one(c,
       'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
       [menuId, Number(max?.c || 0) + 1, name, price]);
-  });
+  }, true);
   await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
   res.json({
     id: row.id,
@@ -870,22 +892,22 @@ app.put('/api/menu-items/:itemId', auth(), requireAdmin, asyncRoute(async (req, 
   const name = typeof body.name === 'string' ? body.name.trim() : null;
   const price = Number(body.price);
   if (!name || name.length > 100 || !integer(body.price, 0, MAX_PRICE)) throw badRequest('請輸入 1～100 字品名及非負整數價格');
-  await q('update menu_items set name=$1, price=$2 where id=$3', [name ?? null, price, itemId]);
+  await authorizedTx(req, c => c.query('update menu_items set name=$1, price=$2 where id=$3', [name ?? null, price, itemId]), true);
   await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
   res.json({ ok: true });
 }));
 app.delete('/api/menu-items/:itemId', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const itemId = Number(req.params.itemId);
-  const row = await one('select menu_id from menu_items where id=$1', [itemId]);
-  if (row) {
-    await tx(async (c) => {
+  await authorizedTx(req, async c => {
+    const row = await t_one(c, 'select menu_id from menu_items where id=$1', [itemId]);
+    if (row) {
       await c.query('delete from menu_items where id=$1', [itemId]);
       const items = await t_q(c, 'select id from menu_items where menu_id=$1 order by code asc, id asc', [row.menu_id]);
       for (let i = 0; i < items.length; i++) {
         await c.query('update menu_items set code=$1 where id=$2', [i + 1, items[i].id]);
       }
-    });
-  }
+    }
+  }, true);
   await logAction(req.user, 'menu.item.delete', { itemId }, req);
   res.json({ ok: true });
 }));
@@ -893,8 +915,10 @@ app.put('/api/settings/active-menu', auth(), requireAdmin, asyncRoute(async (req
   const body = getBody(req);
   if (body.menuId != null && !integer(body.menuId, 1, 2_147_483_647)) throw badRequest('無效的菜單 ID');
   const menuId = body.menuId == null ? null : Number(body.menuId);
-  if (menuId !== null && !await one('select id from menus where id=$1', [menuId])) return res.status(404).json({ message: '菜單不存在' });
-  await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
+  await authorizedTx(req, async c => {
+    if (menuId !== null && !await t_one(c, 'select id from menus where id=$1', [menuId])) throw Object.assign(new Error('菜單不存在'), { status: 404 });
+    await c.query('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
+  }, true);
   await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
 }));
@@ -906,7 +930,7 @@ app.get('/api/settings/manual-order', auth(), asyncRoute(async (_req, res) => {
 app.put('/api/settings/manual-order', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
   if (typeof body.locked !== 'boolean') throw badRequest('locked 必須為布林值');
-  await q('update settings set manual_locked=$1 where id=1', [body.locked]);
+  await authorizedTx(req, c => c.query('update settings set manual_locked=$1 where id=1', [body.locked]), true);
   await logAction(req.user, 'settings.manualOrderLock', { locked: body.locked }, req);
   res.json({ locked: body.locked });
 }));
@@ -956,21 +980,20 @@ app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
 
-  if (req.user.role !== 'admin' && !(await isOpenNow())) {
-    return res.status(403).json({ message: 'not in open window' });
-  }
   const body = getBody(req);
   const finalItems = orderItems(body);
   const rawItems = body.items;
   const internalOnly = booleanField(body, 'internalOnly');
-  await tx(async (c) => {
+  await authorizedTx(req, async (c, actor) => {
+    if (!userCanAccessSeat(actor, seat)) throw Object.assign(new Error('forbidden'), { status: 403 });
     const context = await orderContext(c);
     await c.query('select pg_advisory_xact_lock(7201, $1::integer)', [seat]);
     const existing = await t_one(c, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
     assertReference(body, existing, context, false);
+    if (actor.role !== 'admin' && !await isOpenNow(c)) throw Object.assign(new Error('not in open window'), { status: 403 });
     const o = existing || await ensureOrder(seat, c, context);
     const previous = await t_q(c, 'select name, unit_price, qty from order_items where order_id=$1', [o.id]);
-    await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
+    await validateManualLock(actor, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
@@ -994,24 +1017,24 @@ app.put('/api/orders/:seat/paid', auth(), requireAdmin, asyncRoute(async (req, r
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   const body = getBody(req);
-  const order = await tx(async c => {
+  const order = await authorizedTx(req, async c => {
     const context = await orderContext(c);
     const o = await t_one(c, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
     const items = o ? await t_q(c, 'select * from order_items where order_id=$1 order by id', [o.id]) : [];
     return updatePayment(c, { order: o, items, context, body, userId: req.user.uid });
-  });
+  }, true);
   await logAction(req.user, 'order.paid', { seat, paid: order.paid, orderId: order.orderId, date: order.date, batch: order.batch, version: order.version }, req);
   res.json({ ok: true, order });
 }));
 app.delete('/api/orders/today', auth(), requireAdmin, asyncRoute(async (req, res) => {
-  const result = await tx(async (c) => {
+  const result = await authorizedTx(req, async (c) => {
     await c.query('select id from settings where id=1 for update');
     const previous = await orderContext(c);
     assertReference({ ...getBody(req), orderId: null, version: 0 }, null, previous, false);
     const next = { date: previous.date, batch: crypto.randomUUID() };
     await c.query('update settings set order_batch=$1 where id=1', [next.batch]);
     return { previous, ...next };
-  });
+  }, true);
   await logAction(req.user, 'orders.purgeToday', { ...result, archived: true }, req);
   res.json({ ok: true, ...result });
 }));
@@ -1084,7 +1107,7 @@ app.put('/api/settings/preorder', auth(), requireAdmin, asyncRoute(async (req, r
   const enabled = booleanField(body, 'enabled');
   if (!Array.isArray(body.dates) || body.dates.length > 366 || body.dates.some(d => !validDate(d))) throw badRequest('請提供有效的預訂日期，最多 366 日');
   const dates = [...new Set(body.dates)].sort();
-  await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [enabled, dates]);
+  await authorizedTx(req, c => c.query('update preorder_settings set enabled=$1, dates=$2 where id=1', [enabled, dates]), true);
   await logAction(req.user, 'settings.preorder', { enabled, dates }, req);
   res.json({ ok: true });
 }));
@@ -1103,9 +1126,9 @@ async function ensurePreorder(date, seat, client = null) {
   return o;
 }
 function canAccessPreSeat(user, seat){ return userCanAccessSeat(user, seat); }
-async function checkPreUserAllowed(user, date) {
+async function checkPreUserAllowed(user, date, client) {
   if (user.role === 'admin') return true;
-  const s = await one('select enabled, dates from preorder_settings where id=1');
+  const s = await t_one(client, 'select enabled, dates from preorder_settings where id=1 for share');
   if (!s || !s.enabled) return false;
   return (s.dates || []).includes(date);
 }
@@ -1165,22 +1188,19 @@ app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   if (!date) return res.status(400).json({ message:'bad date' });
   if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
-  if (req.user.role !== 'admin') {
-    const allowed = await checkPreUserAllowed(req.user, date);
-    if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
-  }
-
   const body = getBody(req);
   const finalItems = orderItems(body);
   const rawItems = body.items;
   const internalOnly = booleanField(body, 'internalOnly');
-  await tx(async (c)=>{
+  await authorizedTx(req, async (c, actor)=>{
+    if (!canAccessPreSeat(actor, seat)) throw Object.assign(new Error('forbidden'), { status: 403 });
     await c.query('select pg_advisory_xact_lock(7202, $1::integer)', [seat]);
     const existing = await t_one(c, 'select * from preorders where d=$1 and seat=$2 for update', [date, seat]);
     assertReference(body, existing, { date }, false);
+    if (!await checkPreUserAllowed(actor, date, c)) throw Object.assign(new Error('preorder not allowed for this date'), { status: 403 });
     const o = await ensurePreorder(date, seat, c);
     const previous = await t_q(c, 'select name, unit_price, qty from preorder_items where preorder_id=$1', [o.id]);
-    await validateManualLock(req.user, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
+    await validateManualLock(actor, c, finalItems, previous.map(row => ({ name: row.name, unitPrice: row.unit_price, qty: row.qty })));
     const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
@@ -1206,11 +1226,11 @@ app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, asyncRoute(asyn
   const date = toDateOrNull(req.params.date);
   if (!date) return res.status(400).json({ message:'bad date' });
   const body = getBody(req);
-  const order = await tx(async c => {
+  const order = await authorizedTx(req, async c => {
     const o = await t_one(c, 'select * from preorders where d=$1 and seat=$2 for update', [date, seat]);
     const items = o ? await t_q(c, 'select * from preorder_items where preorder_id=$1 order by id', [o.id]) : [];
     return updatePayment(c, { order: o, items, context: { date }, body, userId: req.user.uid, preorder: true });
-  });
+  }, true);
   await logAction(req.user, 'preorder.paid', { date, seat, paid: order.paid, orderId: order.orderId, version: order.version }, req);
   res.json({ ok:true, order });
 }));
@@ -1276,7 +1296,7 @@ app.get('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   );
   res.json({ users: rows, total: totalRow.c, page, pageSize });
 }));
-app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
+app.put('/api/users/:id/password', auth(), passwordChangeLimiter, asyncRoute(async (req, res) => {
   const targetId = Number(req.params.id);
   if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
 

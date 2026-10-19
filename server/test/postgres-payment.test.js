@@ -169,6 +169,86 @@ test('real PostgreSQL payment migration, locking and rollback', { skip: !databas
       assert.equal((await real.query('select count(*)::int n from users where username=$1', ['audit-success'])).rows[0].n, 1);
     } finally { pool.query = query; pool.connect = connect; console.error = log; }
   });
+  await t.test('assessment: committed administrator revocation rejects a pending real payment write', { timeout: 10000 }, async () => {
+    const actor = (await real.query("insert into users(username,password_hash,role,status) values('inflight-admin',$1,'admin','active') returning *", [hash])).rows[0];
+    const credential = issueToken(actor, process.env.JWT_SECRET);
+    await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+    const before = await read();
+    const query = pool.query; let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+    pool.query = async (sql, args) => {
+      const result = await query(sql, args);
+      if (sql.startsWith('select id, username, role, status, password_hash, auth_version from users') && args[0] === actor.id) { entered(); await gate; }
+      return result;
+    };
+    let pending;
+    try {
+      pending = request(app).put('/api/orders/2/paid').set('Authorization', 'Bearer ' + credential).send({ ...before, paid: !before.paid }).then(r => r);
+      await ready;
+      await as(request(app).patch(`/api/users/${actor.id}/status`)).send({ status: 'disabled' }).expect(200);
+      release(); assert.equal((await pending).status, 401);
+      const after = await read(); assert.equal(after.paid, before.paid); assert.equal(after.version, before.version);
+    } finally { release(); pool.query = query; if (pending) await pending; }
+  });
+  await t.test('assessment: PostgreSQL holds actor and setting locks until a business commit', { timeout: 15000 }, async t => {
+    const waitForBlocked = async prefix => {
+      for (let n = 0; n < 100; n++) {
+        const result = await real.query("select exists(select 1 from pg_stat_activity where datname=current_database() and pid<>pg_backend_pid() and wait_event_type='Lock' and query like $1) as waiting", [prefix + '%']);
+        if (result.rows[0].waiting) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.fail('the competing write did not wait on the expected PostgreSQL lock');
+    };
+    for (const preorder of [false, true]) await t.test(preorder ? 'preorder setting' : 'order-window setting', async () => {
+      await real.query("update settings set open_days='{0,1,2,3,4,5,6}',open_start='00:00',open_end='23:59'");
+      await real.query('update preorder_settings set enabled=true');
+      const route = preorder ? '/api/preorders/2026-10-20/2' : '/api/orders/2';
+      const before = await read(route), connect = pool.connect;
+      const writePrefix = preorder ? 'update preorders set submitted' : 'update orders set submitted';
+      const closeSql = preorder ? 'update preorder_settings set enabled=false where id=1' : "update settings set open_days='{}' where id=1";
+      let entered, release;
+      const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+      pool.connect = async () => {
+        const client = await connect();
+        return { release: () => client.release(), query: async (sql, args) => {
+          if (sql.startsWith(writePrefix)) { entered(); await gate; }
+          return client.query(sql, args);
+        } };
+      };
+      let pending, closing;
+      try {
+        pending = as(request(app).put(route), 2).send({ ...before, items: [{ ...item, qty: 4 }] }).then(r => r);
+        await ready; closing = real.query(closeSql);
+        await waitForBlocked(closeSql);
+        release(); assert.equal((await pending).status, 200); await closing;
+        const closedOrder = await read(route);
+        await as(request(app).put(route), 2).send({ ...closedOrder, items: [item] }).expect(403);
+        assert.equal((await read(route)).version, closedOrder.version);
+      } finally { release(); pool.connect = connect; if (pending) await pending; if (closing) await closing; }
+    });
+    await t.test('account revocation', async () => {
+      await real.query("update settings set open_days='{0,1,2,3,4,5,6}'");
+      const before = await read(), connect = pool.connect;
+      let entered, release;
+      const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+      pool.connect = async () => {
+        const client = await connect();
+        return { release: () => client.release(), query: async (sql, args) => {
+          if (sql.startsWith('update orders set submitted')) { entered(); await gate; }
+          return client.query(sql, args);
+        } };
+      };
+      let pending, revoking;
+      const revokeSql = 'update users set auth_version=auth_version+1 where id=' + users[2].id;
+      try {
+        pending = as(request(app).put('/api/orders/2'), 2).send({ ...before, items: [item] }).then(r => r);
+        await ready; revoking = real.query(revokeSql);
+        await waitForBlocked(revokeSql);
+        release(); assert.equal((await pending).status, 200); await revoking;
+        await as(request(app).put('/api/orders/2'), 2).send({ items: [item] }).expect(401);
+      } finally { release(); pool.connect = connect; if (pending) await pending; if (revoking) await revoking; }
+    });
+  });
   await t.test('pentest: simultaneous mutual administrator revocations preserve an active administrator', async () => {
     for (const mode of ['role', 'status', 'delete', 'bulk']) {
       await real.query("update users set status='disabled',auth_version=auth_version+1 where role='admin'");

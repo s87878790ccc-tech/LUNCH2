@@ -1,5 +1,22 @@
 'use strict';
 const { test, expect } = require('@playwright/test');
+const { fixture } = require('./fixture');
+
+test('assessment: stored order and account markup stays literal in an actual browser', async ({ page }) => {
+  const model = await fixture(page);
+  const payload = '<img src=x onerror=window.assessmentXss=1>';
+  model.orders[0].items[0].name = payload;
+  model.users.push({ id: 100, username: payload, role: 'user', status: 'active' });
+  await page.locator('#refreshAllSeats').click();
+  await expect(page.locator('#seat-card-1')).toContainText(payload);
+  await expect(page.locator('#seat-card-1 img')).toHaveCount(0);
+  await page.locator('#tabUsers').click();
+  await page.locator('#refreshUsers').click();
+  await page.locator('#userSearch').fill(payload);
+  await expect(page.locator('#usersTableBody')).toContainText(payload);
+  await expect(page.locator('#usersTableBody img')).toHaveCount(0);
+  expect(await page.evaluate(() => window.assessmentXss)).toBeUndefined();
+});
 
 test('pentest: a hostile cross-origin frame cannot expose the login or ordering interface', async ({ page }) => {
   const calls = [];
