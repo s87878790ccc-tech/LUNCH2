@@ -440,7 +440,7 @@ async function seed() {
     );
     console.log('[seed] admin created:', adminName);
     if (ADMIN_PASS_CONFIG.generated) {
-      console.warn(`[seed] Admin default password (auto-generated): ${adminPass}`);
+      console.warn('[seed] Admin password was generated. Configure ADMIN_DEFAULT_PASS before creating new accounts; passwords are never logged.');
     }
   } else {
     console.log('[seed] admin exists:', adminName);
@@ -462,7 +462,7 @@ async function seed() {
     if (inserted) createdSeats++;
   }
   if (createdSeats > 0) {
-    console.log(`[seed] seat users 1~36 ready (default pass = ${seatPass})`);
+    console.log(`[seed] created ${createdSeats} seat accounts; passwords are never logged.`);
     if (SEAT_PASS_CONFIG.generated) {
       console.warn('[seed] Seat default password auto-generated for this run. Set SEAT_DEFAULT_PASS to persist across restarts.');
     }
