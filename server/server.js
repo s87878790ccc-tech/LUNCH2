@@ -507,6 +507,7 @@ function auth(required = true) {
     }
     const current = await one('select id, username, role, status, password_hash, auth_version from users where id=$1', [req.user.uid]);
     if (!current || current.status !== 'active' || !sessionMatches(req.user, current, JWT_SECRET)) return res.status(401).json({ message: '登入已失效，請重新登入' });
+    req.authClaims = req.user;
     req.user = { uid: current.id, username: current.username, role: current.role };
     next();
   });
@@ -514,6 +515,21 @@ function auth(required = true) {
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
   next();
+}
+
+// Serialize account-security mutations, then revalidate the caller inside the
+// transaction. A request authorized before a concurrent revocation cannot
+// finish with old privileges or remove the last active administrator.
+async function mutateUsers(req, change, adminOnly = true) {
+  return tx(async client => {
+    await client.query('select pg_advisory_xact_lock(7301, 0)');
+    const actor = await t_one(client, 'select * from users where id=$1 for update', [req.user.uid]);
+    if (!actor || actor.status !== 'active' || !sessionMatches(req.authClaims, actor, JWT_SECRET))
+      throw Object.assign(new Error('登入已失效，請重新登入'), { status: 401 });
+    if (adminOnly && actor.role !== 'admin')
+      throw Object.assign(new Error('forbidden'), { status: 403 });
+    return change(client, actor);
+  });
 }
 function getPublicBaseUrl() {
   return PUBLIC_BASE_URL;
@@ -1217,12 +1233,12 @@ app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const error = passwordError(password, role);
   if (error) throw badRequest(error);
   const hash = await bcrypt.hash(password, 10);
-  const row = await one(
+  const row = await mutateUsers(req, c => t_one(c,
     `insert into users(username, password_hash, role, status, created_at, updated_at)
      values ($1,$2,$3,'active',now(),now())
      returning id, username, role, status`,
     [username, hash, role]
-  );
+  ));
   if (!row) return res.status(409).json({ message: '此帳號已存在，請在使用者清單中查詢' });
   await logAction(req.user, 'user.create', { id: row.id, username, role }, req);
   res.json(row);
@@ -1267,12 +1283,12 @@ app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   const body = getBody(req);
   const oldPassword = normalizePasswordInput(body.oldPassword);
   const newPassword = normalizePasswordInput(body.newPassword);
-  const u = await one('select * from users where id=$1', [targetId]);
-  if (!u) return res.status(404).json({ message: 'user not found' });
-
   const isAdmin = req.user && req.user.role === 'admin';
   const isSelf = req.user && req.user.uid === targetId;
   if (!isAdmin && !isSelf) return res.status(403).json({ message: 'forbidden' });
+
+  const u = await one('select * from users where id=$1', [targetId]);
+  if (!u) return res.status(404).json({ message: 'user not found' });
 
   const error = passwordError(newPassword, u.role);
   if (error) throw badRequest(error);
@@ -1284,7 +1300,16 @@ app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
-  await q('update users set password_hash=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [hash, targetId]);
+  await mutateUsers(req, async (c, actor) => {
+    if (actor.role !== 'admin' && actor.id !== targetId) throw Object.assign(new Error('forbidden'), { status: 403 });
+    const current = await t_one(c, 'select * from users where id=$1 for update', [targetId]);
+    if (!current) throw Object.assign(new Error('user not found'), { status: 404 });
+    if (current.password_hash !== u.password_hash || current.auth_version !== u.auth_version || current.role !== u.role || current.status !== u.status)
+      throw Object.assign(new Error('帳號狀態或密碼已變更，請重新載入後再操作'), { status: 409 });
+    const policyError = passwordError(newPassword, current.role);
+    if (policyError) throw badRequest(policyError);
+    await c.query('update users set password_hash=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [hash, targetId]);
+  }, false);
   await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
   res.json({ ok: true });
 }));
@@ -1296,10 +1321,15 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, asyncRoute(async (req, 
   if (!['active', 'disabled'].includes(status)) return res.status(400).json({ message: 'bad status' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的狀態' });
 
-  const u = await one('select * from users where id=$1', [id]);
-  if (!u) return res.status(404).json({ message: 'user not found' });
-
-  await q('update users set status=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [status, id]);
+  await mutateUsers(req, async c => {
+    const u = await t_one(c, 'select * from users where id=$1 for update', [id]);
+    if (!u) throw Object.assign(new Error('user not found'), { status: 404 });
+    if (u.role === 'admin' && u.status === 'active' && status === 'disabled') {
+      const count = await t_one(c, "select count(*)::int as c from users where role='admin' and status='active'");
+      if (count.c <= 1) throw badRequest('系統至少需要一位使用中的管理員');
+    }
+    await c.query('update users set status=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [status, id]);
+  });
   await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
 }));
@@ -1311,15 +1341,16 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, asyncRoute(async (req, re
   if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: 'bad role' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的角色' });
 
-  const u = await one('select * from users where id=$1', [id]);
-  if (!u) return res.status(404).json({ message: 'user not found' });
-
-  if (u.role === 'admin' && role === 'user') {
-    const a = await one(`select count(*)::int as c from users where role='admin'`);
-    if (a.c <= 1) return res.status(400).json({ message: '系統至少需要一位管理員' });
-  }
-
-  await q('update users set role=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [role, id]);
+  const u = await mutateUsers(req, async c => {
+    const current = await t_one(c, 'select * from users where id=$1 for update', [id]);
+    if (!current) throw Object.assign(new Error('user not found'), { status: 404 });
+    if (current.role === 'admin' && current.status === 'active' && role === 'user') {
+      const count = await t_one(c, "select count(*)::int as c from users where role='admin' and status='active'");
+      if (count.c <= 1) throw badRequest('系統至少需要一位使用中的管理員');
+    }
+    await c.query('update users set role=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [role, id]);
+    return current;
+  });
   await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
   res.json({ ok: true });
 }));
@@ -1333,12 +1364,9 @@ app.delete('/api/users/bulk-delete', auth(), requireAdmin, asyncRoute(async (req
   if (ids.some(id => !Number.isInteger(id))) return res.status(400).json({ message: 'bad user id in list' });
   if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
 
-  const admins = await q(`select id from users where role='admin'`);
-  const adminIds = new Set(admins.map(x => x.id));
-  const remainingAdmins = [...adminIds].filter(id => !ids.includes(id));
-  if (remainingAdmins.length === 0) return res.status(400).json({ message: '不能刪除所有管理員' });
-
-  const deleted = await tx(async (c) => {
+  const deleted = await mutateUsers(req, async c => {
+    const admins = await t_q(c, "select id from users where role='admin' and status='active'");
+    if (!admins.some(admin => !ids.includes(admin.id))) throw badRequest('不能刪除所有使用中的管理員');
     const placeholders = ids.map((_id, index) => `$${index + 1}`).join(',');
     const result = await c.query(`delete from users where id in (${placeholders})`, ids);
     return result.rowCount;
@@ -1352,15 +1380,16 @@ app.delete('/api/users/:id', auth(), requireAdmin, asyncRoute(async (req, res) =
   if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
   if (req.user && req.user.uid === targetId) return res.status(400).json({ message: '無法刪除自己' });
 
-  const u = await one('select * from users where id=$1', [targetId]);
-  if (!u) return res.status(404).json({ message: 'user not found' });
-
-  if (u.role === 'admin') {
-    const a = await one(`select count(*)::int as c from users where role='admin'`);
-    if (a.c <= 1) return res.status(400).json({ message: '系統至少需要一位管理員，無法刪除' });
-  }
-
-  await q('delete from users where id=$1', [targetId]);
+  const u = await mutateUsers(req, async c => {
+    const current = await t_one(c, 'select * from users where id=$1 for update', [targetId]);
+    if (!current) throw Object.assign(new Error('user not found'), { status: 404 });
+    if (current.role === 'admin' && current.status === 'active') {
+      const count = await t_one(c, "select count(*)::int as c from users where role='admin' and status='active'");
+      if (count.c <= 1) throw badRequest('系統至少需要一位使用中的管理員，無法刪除');
+    }
+    await c.query('delete from users where id=$1', [targetId]);
+    return current;
+  });
   await logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
   res.json({ ok: true });
 }));

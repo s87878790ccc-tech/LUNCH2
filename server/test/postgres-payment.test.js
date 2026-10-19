@@ -154,15 +154,75 @@ test('real PostgreSQL payment migration, locking and rollback', { skip: !databas
     await asNew(request(app).put('/api/orders/37/paid')).send({ ...saved, paid: false }).expect(403);
   });
   await t.test('a real failed insert is atomic, and audit failure cannot turn a committed account into a reported failure', async () => {
-    const query = pool.query, log = console.error;
+    const query = pool.query, connect = pool.connect, log = console.error;
     console.error = () => {};
     try {
-      pool.query = (sql, args) => /^insert into users/.test(sql.trim()) ? Promise.reject(new Error('isolated insert failure')) : query(sql, args);
+      pool.connect = async () => {
+        const client = await connect();
+        return { release: () => client.release(), query: (sql, args) => /^insert into users/.test(sql.trim()) ? Promise.reject(new Error('isolated insert failure')) : client.query(sql, args) };
+      };
       await as(request(app).post('/api/users')).send({ username: 'insert-failure', password: 'abcdef' }).expect(500);
       assert.equal((await real.query('select count(*)::int n from users where username=$1', ['insert-failure'])).rows[0].n, 0);
+      pool.connect = connect;
       pool.query = (sql, args) => /^insert into audit_logs/.test(sql.trim()) ? Promise.reject(new Error('isolated audit failure')) : query(sql, args);
       await as(request(app).post('/api/users')).send({ username: 'audit-success', password: 'abcdef' }).expect(200);
       assert.equal((await real.query('select count(*)::int n from users where username=$1', ['audit-success'])).rows[0].n, 1);
-    } finally { pool.query = query; console.error = log; }
+    } finally { pool.query = query; pool.connect = connect; console.error = log; }
+  });
+  await t.test('pentest: simultaneous mutual administrator revocations preserve an active administrator', async () => {
+    for (const mode of ['role', 'status', 'delete', 'bulk']) {
+      await real.query("update users set status='disabled',auth_version=auth_version+1 where role='admin'");
+      const pair = [];
+      for (const name of [`pair-a-${mode}`, `pair-b-${mode}`]) {
+        pair.push((await real.query("insert into users(username,password_hash,role,status,created_at,updated_at) values($1,$2,'admin','active',now(),now()) returning *", [name, hash])).rows[0]);
+      }
+      const credentials = pair.map(u => issueToken(u, process.env.JWT_SECRET));
+      const query = pool.query;
+      let arrived = 0, release;
+      const gate = new Promise(resolve => { release = resolve; });
+      pool.query = async (sql, args) => {
+        const result = await query(sql, args);
+        if (sql.startsWith('select id, username, role, status, password_hash, auth_version from users') && pair.some(u => u.id === args[0])) {
+          arrived++; if (arrived === 2) release(); await gate;
+        }
+        return result;
+      };
+      const revoke = (caller, target) => {
+        const url = mode === 'bulk' ? '/api/users/bulk-delete' : `/api/users/${target.id}${['role','status'].includes(mode) ? '/' + mode : ''}`;
+        const method = ['role','status'].includes(mode) ? 'patch' : 'delete';
+        const body = mode === 'role' ? { role: 'user' } : mode === 'status' ? { status: 'disabled' } : mode === 'bulk' ? { ids: [target.id] } : {};
+        return request(app)[method](url).set('Authorization', 'Bearer ' + credentials[caller]).send(body);
+      };
+      try {
+        const results = await Promise.all([revoke(0, pair[1]), revoke(1, pair[0])]);
+        assert.deepEqual(results.map(r => r.status).sort(), [200, 401], mode);
+        assert.equal((await real.query("select count(*)::int n from users where role='admin' and status='active'")).rows[0].n, 1, mode);
+      } finally { release(); pool.query = query; }
+    }
+  });
+  await t.test('pentest: real PostgreSQL rejects an old password write after a newer administrative reset', async () => {
+    const actor = (await real.query("select * from users where role='admin' and status='active' limit 1")).rows[0];
+    const account = (await real.query("select * from users where username='2'")).rows[0];
+    const actorToken = issueToken(actor, process.env.JWT_SECRET), accountToken = issueToken(account, process.env.JWT_SECRET);
+    const originalHash = bcrypt.hash;
+    let entered, release;
+    const gate = new Promise(resolve => { release = resolve; }), ready = new Promise(resolve => { entered = resolve; });
+    const oldWrite = 'isolated-outdated-password-change';
+    bcrypt.hash = async (password, ...args) => {
+      const result = await originalHash(password, ...args);
+      if (password === oldWrite) { entered(); await gate; }
+      return result;
+    };
+    let pending;
+    try {
+      pending = request(app).put(`/api/users/${account.id}/password`).set('Authorization', 'Bearer ' + accountToken).send({ oldPassword: 'isolated-user-password', newPassword: oldWrite }).then(r => r);
+      await ready;
+      await request(app).put(`/api/users/${account.id}/password`).set('Authorization', 'Bearer ' + actorToken).send({ newPassword: 'isolated-current-admin-password' }).expect(200);
+      release();
+      const rejected = await pending;
+      assert.ok([401,409].includes(rejected.status));
+      const current = (await real.query('select password_hash from users where id=$1', [account.id])).rows[0];
+      assert.ok(await bcrypt.compare('isolated-current-admin-password', current.password_hash));
+    } finally { release(); bcrypt.hash = originalHash; if (pending) await pending; }
   });
 });
