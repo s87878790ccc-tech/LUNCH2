@@ -11,6 +11,10 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
+
+// Express 4 does not forward rejected async handlers to its error middleware.
+const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
 const app = express();
 app.disable('x-powered-by');
@@ -69,6 +73,7 @@ const SEAT_PASS_CONFIG = ensurePasswordFromEnv('SEAT_DEFAULT_PASS', {
 // 允許的前端網域（GitHub Pages）
 const ALLOW_ORIGINS = [
   'https://s87878790ccc-tech.github.io',
+  ...(process.env.CORS_ORIGINS || '').split(',').map(origin => origin.trim()).filter(Boolean),
 ];
 
 // 反向代理（Render/Cloudflare 等）下要設定，否則 rate-limit 對 XFF 會警告
@@ -120,8 +125,6 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 function enforcePlainObjectBody(req, res, next) {
   const method = (req.method || 'GET').toUpperCase();
@@ -130,15 +133,14 @@ function enforcePlainObjectBody(req, res, next) {
   if (typeof req.body === 'object' && !Array.isArray(req.body)) return next();
   return res.status(400).json({ message: 'invalid payload type' });
 }
-app.use(enforcePlainObjectBody);
 
 const globalLimiter = rateLimit({
   windowMs: 60_000,
-  limit: 200,
+  limit: 600, // A classroom may share one public IP address.
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  message: { message: '請求過於頻繁，請稍後再試' },
 });
-app.use(globalLimiter);
 
 function getBody(req) {
   if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) return {};
@@ -167,6 +169,8 @@ const loginLimiter = rateLimit({
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { message: 'too many login attempts, please try again shortly' },
+  keyGenerator: req => `${req.ip}:${normalizeUsernameInput(getBody(req).username)}`,
+  skipSuccessfulRequests: true,
 });
 
 function normalizeTimeString(value, fallback) {
@@ -197,6 +201,18 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
+app.use(enforcePlainObjectBody);
+app.use('/api', globalLimiter);
+app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+
+for (const [key, max] of [['seat', 36], ['id', 2_147_483_647], ['itemId', 2_147_483_647]]) {
+  app.param(key, (_req, _res, next, value) => next(
+    integer(value, 1, max) ? undefined : badRequest(`無效的 ${key}`)
+  ));
+}
+app.param('date', (_req, _res, next, value) => next(validDate(value) ? undefined : badRequest('日期格式不正確')));
 
 // logging
 app.use(morgan('combined', { stream: fs.createWriteStream(path.join(LOG_DIR, 'access.log'), { flags: 'a' }) }));
@@ -231,6 +247,7 @@ const pool = new Pool({
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
 });
+pool.on('error', err => console.error('Unexpected idle database connection error:', err.message));
 
 async function q(sql, params = []) { const { rows } = await pool.query(sql, params); return rows; }
 async function one(sql, params = []) { const { rows } = await pool.query(sql, params); return rows[0] || null; }
@@ -242,7 +259,8 @@ async function tx(fn) {
     await client.query('COMMIT');
     return result;
   } catch (e) {
-    await client.query('ROLLBACK'); throw e;
+    try { await client.query('ROLLBACK'); } catch (rollbackError) { console.error('Rollback failed:', rollbackError.message); }
+    throw e;
   } finally { client.release(); }
 }
 async function t_one(c, sql, params = []) { const { rows } = await c.query(sql, params); return rows[0] || null; }
@@ -463,17 +481,20 @@ function sign(user) {
   return jwt.sign({ uid: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 }
 function auth(required = true) {
-  return (req, res, next) => {
+  return asyncRoute(async (req, res, next) => {
     const h = req.headers.authorization || '';
     const t = h.startsWith('Bearer ') ? h.slice(7) : null;
     if (!t) return required ? res.status(401).json({ message: 'no token' }) : next();
     try {
-      req.user = jwt.verify(t, JWT_SECRET);
-      next();
+      req.user = jwt.verify(t, JWT_SECRET, { algorithms: ['HS256'] });
     } catch {
       return res.status(401).json({ message: 'invalid token' });
     }
-  };
+    const current = await one('select id, username, role, status from users where id=$1', [req.user.uid]);
+    if (!current || current.status !== 'active') return res.status(401).json({ message: '登入已失效，請重新登入' });
+    req.user = { uid: current.id, username: current.username, role: current.role };
+    next();
+  });
 }
 function requireAdmin(req, res, next) {
   if (!req.user || req.user.role !== 'admin') return res.status(403).json({ message: 'forbidden' });
@@ -517,25 +538,28 @@ function buildMenuImageMeta(req, row) {
   return { imageUrl: fallback, imageFilename: '' };
 }
 async function logAction(user, action, details, req) {
-  await q(
-    `insert into audit_logs(user_id, action, details, ip, ua, ts)
-     values ($1,$2,$3,$4,$5,now())`,
-    [user?.uid || null, action, details ? JSON.stringify(details) : null, req.ip, req.headers['user-agent'] || '']
-  );
+  try {
+    await q(
+      `insert into audit_logs(user_id, action, details, ip, ua, ts)
+       values ($1,$2,$3,$4,$5,now())`,
+      [user?.uid || null, action, details ? JSON.stringify(details) : null, req.ip, req.headers['user-agent'] || '']
+    );
+  } catch (err) {
+    // A failed audit insert must not report a committed order as failed and invite a duplicate retry.
+    console.error('Audit log write failed:', action, err.message);
+  }
 }
 
 // helpers
-async function ensureOrder(seat) {
-  let o = await one('select * from orders where seat=$1', [seat]);
-  if (!o) {
-    o = await one(
-      `insert into orders(seat, submitted, internal_only, paid, created_at, updated_at)
-       values ($1,false,false,false,now(),now())
-       returning *`,
-      [seat]
-    );
-  }
-  return o;
+async function ensureOrder(seat, client = null) {
+  if (!client) return tx(c => ensureOrder(seat, c));
+  // Serialize creation without assuming the legacy orders table has a unique seat index.
+  await client.query('select pg_advisory_xact_lock(7201, $1::integer)', [seat]);
+  const existing = await t_one(client, 'select * from orders where seat=$1 for update', [seat]);
+  if (existing) return existing;
+  return t_one(client,
+    `insert into orders(seat, submitted, internal_only, paid, created_at, updated_at)
+     values ($1,false,false,false,now(),now()) returning *`, [seat]);
 }
 function userCanAccessSeat(user, seat) {
   if (!user) return false;
@@ -570,12 +594,7 @@ function zonedNowInfo(tz = BUSINESS_TZ) {
 
 async function isOpenNow() {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
-  if (!s) return true; // 沒設定就放行
-  const openDays = (s.open_days || []).map(Number); // 0(日)~6(六)
-  const { hhmm, day } = zonedNowInfo();
-  const start = s.open_start || '00:00';
-  const end   = s.open_end   || '23:59';
-  return openDays.includes(day) && start <= hhmm && hhmm <= end;
+  return inOpenWindow(s, zonedNowInfo());
 }
 
 /* =========================
@@ -604,7 +623,7 @@ app.post('/api/uploads/images', auth(), requireAdmin, (req, res) => {
 });
 
 // Auth
-app.post('/api/auth/login', loginLimiter, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const username = normalizeUsernameInput(body.username);
   const password = normalizePasswordInput(body.password);
@@ -626,49 +645,58 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
   await logAction({ uid: u.id }, 'login', { username }, req);
   // 統一回傳 shape（id/username/role）
   res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
-});
+}));
 
 // ✅ 統一 /auth/me 回傳 shape（修正原本只有 uid 導致前端 id 為 undefined）
-app.get('/api/auth/me', auth(), async (req, res) => {
+app.get('/api/auth/me', auth(), asyncRoute(async (req, res) => {
   const u = req.user;
   res.json({ user: { id: u.uid, username: u.username, role: u.role } });
-});
+}));
 
 // Settings（admin）
-app.get('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
+app.get('/api/settings/open-window', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   res.json({
     openDays: s?.open_days || ['1','2','3','4','5'],
     openStart: s?.open_start || '07:00',
     openEnd: s?.open_end || '12:00',
   });
-});
-app.put('/api/settings/open-window', auth(), requireAdmin, async (req, res) => {
+}));
+app.put('/api/settings/open-window', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
-  const days = normalizeOpenDays(body.openDays);
+  if (!Array.isArray(body.openDays) || !body.openDays.length || body.openDays.some(d => !integer(d, 0, 6))) throw badRequest('請選擇有效的開放日');
+  if (![body.openStart, body.openEnd].every(t => typeof t === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(t))) throw badRequest('請設定有效的開始與結束時間');
+  const days = [...new Set(normalizeOpenDays(body.openDays))];
   const start = normalizeTimeString(body.openStart, '07:00');
   const end = normalizeTimeString(body.openEnd, '12:00');
   await q('update settings set open_days=$1, open_start=$2, open_end=$3 where id=1', [days, start, end]);
   await logAction(req.user, 'settings.openWindow', { openDays: days, openStart: start, openEnd: end }, req);
   res.json({ ok: true });
-});
+}));
 
 // 公開：是否在開放點餐時段
-app.get('/api/open-status', async (req, res) => {
+app.get('/api/open-status', asyncRoute(async (req, res) => {
   const s = await one('select open_days, open_start, open_end from settings where id=1');
   const info = zonedNowInfo();
   const openDays = (s?.open_days || []).map(Number);
   const start = s?.open_start || '07:00';
   const end   = s?.open_end   || '12:00';
-  const open = openDays.includes(info.day) && start <= info.hhmm && info.hhmm <= end;
+  const open = inOpenWindow(s, info);
   res.json({ open, openDays: openDays.map(String), openStart: start, openEnd: end, nowISO: info.nowISO, nowLocal: info.nowLocal, tz: info.tz });
-});
+}));
 
 // Menus
-app.get('/api/menus', auth(false), async (req, res) => {
-  const menus = await q('select * from menus order by id asc');
-  const items = await q('select * from menu_items order by menu_id asc, code asc');
-  const setting = await one('select active_menu_id from settings where id=1');
+app.get('/api/menus', auth(false), asyncRoute(async (req, res) => {
+  const [menus, items, setting] = await Promise.all([
+    q('select * from menus order by id asc'),
+    q('select * from menu_items order by menu_id asc, code asc'),
+    one('select active_menu_id from settings where id=1'),
+  ]);
+  const byMenu = new Map();
+  for (const item of items) {
+    if (!byMenu.has(item.menu_id)) byMenu.set(item.menu_id, []);
+    byMenu.get(item.menu_id).push({ id: item.id, code: item.code, name: item.name, price: item.price });
+  }
   const grouped = menus.map(m => {
     const meta = buildMenuImageMeta(req, m);
     return {
@@ -677,19 +705,12 @@ app.get('/api/menus', auth(false), async (req, res) => {
       note: m.note || '',
       imageUrl: meta.imageUrl,
       imageFilename: meta.imageFilename,
-      items: items
-        .filter(x => x.menu_id === m.id)
-        .map(x => ({
-          id: x.id,
-          code: x.code,
-          name: x.name,
-          price: x.price,
-        }))
+      items: byMenu.get(m.id) || [],
     };
   });
   res.json({ menus: grouped, activeMenuId: setting?.active_menu_id ?? null });
-});
-app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
+}));
+app.post('/api/menus', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   if (!name || name.length > 128) return res.status(400).json({ message: 'name required' });
@@ -713,8 +734,8 @@ app.post('/api/menus', auth(), requireAdmin, async (req, res) => {
   const meta = buildMenuImageMeta(req, row);
   await logAction(req.user, 'menu.create', { id: row.id, name, note, imageFilename }, req);
   res.json({ id: row.id, name: row.name, note: row.note || '', imageUrl: meta.imageUrl, imageFilename: meta.imageFilename, items: [] });
-});
-app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
+}));
+app.put('/api/menus/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -747,8 +768,8 @@ app.put('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   if (hasImageField) details.imageFilename = imageFilename;
   await logAction(req.user, 'menu.update', details, req);
   res.json({ ok: true });
-});
-app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
+}));
+app.delete('/api/menus/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   await tx(async (c) => {
     await c.query('delete from menu_items where menu_id=$1', [id]);
@@ -758,18 +779,21 @@ app.delete('/api/menus/:id', auth(), requireAdmin, async (req, res) => {
   });
   await logAction(req.user, 'menu.delete', { id }, req);
   res.json({ ok: true });
-});
-app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
+}));
+app.post('/api/menus/:id/items', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const menuId = Number(req.params.id);
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : '';
   const price = Number(body.price);
-  if (!name || name.length > 128 || Number.isNaN(price)) return res.status(400).json({ message: 'name/price required' });
-  const max = await one('select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
-  const row = await one(
-    'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
-    [menuId, Number(max?.c || 0) + 1, name, price]
-  );
+  if (!name || name.length > 100 || !integer(body.price, 0, MAX_PRICE)) throw badRequest('請輸入 1～100 字品名及非負整數價格');
+  const row = await tx(async c => {
+    const menu = await t_one(c, 'select id from menus where id=$1 for update', [menuId]);
+    if (!menu) throw Object.assign(new Error('菜單不存在'), { status: 404 });
+    const max = await t_one(c, 'select coalesce(max(code),0) c from menu_items where menu_id=$1', [menuId]);
+    return t_one(c,
+      'insert into menu_items(menu_id, code, name, price) values ($1,$2,$3,$4) returning id, code, name, price',
+      [menuId, Number(max?.c || 0) + 1, name, price]);
+  });
   await logAction(req.user, 'menu.item.create', { menuId, itemId: row.id, name, price }, req);
   res.json({
     id: row.id,
@@ -777,18 +801,18 @@ app.post('/api/menus/:id/items', auth(), requireAdmin, async (req, res) => {
     name: row.name,
     price: row.price,
   });
-});
-app.put('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
+}));
+app.put('/api/menu-items/:itemId', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const itemId = Number(req.params.itemId);
   const body = getBody(req);
   const name = typeof body.name === 'string' ? body.name.trim() : null;
   const price = Number(body.price);
-  if (Number.isNaN(price)) return res.status(400).json({ message: 'price required' });
+  if (!name || name.length > 100 || !integer(body.price, 0, MAX_PRICE)) throw badRequest('請輸入 1～100 字品名及非負整數價格');
   await q('update menu_items set name=$1, price=$2 where id=$3', [name ?? null, price, itemId]);
   await logAction(req.user, 'menu.item.update', { itemId, name, price }, req);
   res.json({ ok: true });
-});
-app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => {
+}));
+app.delete('/api/menu-items/:itemId', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const itemId = Number(req.params.itemId);
   const row = await one('select menu_id from menu_items where id=$1', [itemId]);
   if (row) {
@@ -802,27 +826,51 @@ app.delete('/api/menu-items/:itemId', auth(), requireAdmin, async (req, res) => 
   }
   await logAction(req.user, 'menu.item.delete', { itemId }, req);
   res.json({ ok: true });
-});
-app.put('/api/settings/active-menu', auth(), requireAdmin, async (req, res) => {
+}));
+app.put('/api/settings/active-menu', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
+  if (body.menuId != null && !integer(body.menuId, 1, 2_147_483_647)) throw badRequest('無效的菜單 ID');
   const menuId = body.menuId == null ? null : Number(body.menuId);
+  if (menuId !== null && !await one('select id from menus where id=$1', [menuId])) return res.status(404).json({ message: '菜單不存在' });
   await q('update settings set active_menu_id=$1 where id=1', [menuId ?? null]);
   await logAction(req.user, 'settings.activeMenu', { menuId }, req);
   res.json({ ok: true });
-});
+}));
 
 // Orders
-app.get('/api/orders/:seat', auth(), async (req, res) => {
+// A single read replaces 36 per-seat HTTP requests in the admin overview.
+app.get('/api/orders', auth(), requireAdmin, asyncRoute(async (_req, res) => {
+  const [orders, items] = await Promise.all([
+    q('select * from orders where seat between 1 and 36 order by seat'),
+    q('select oi.* from order_items oi join orders o on oi.order_id=o.id where o.seat between 1 and 36 order by oi.id'),
+  ]);
+  const byOrder = new Map();
+  for (const item of items) {
+    if (!byOrder.has(item.order_id)) byOrder.set(item.order_id, []);
+    byOrder.get(item.order_id).push({
+      id: item.id, name: item.name, unitPrice: item.unit_price, qty: item.qty,
+      updatedAt: item.updated_at ? new Date(item.updated_at).toISOString() : null,
+    });
+  }
+  const bySeat = new Map(orders.map(o => [o.seat, o]));
+  res.json({ orders: Array.from({ length: 36 }, (_, i) => {
+    const seat = i + 1;
+    const o = bySeat.get(seat);
+    return { seat, submitted: !!o?.submitted, internalOnly: !!o?.internal_only, paid: !!o?.paid, items: byOrder.get(o?.id) || [] };
+  }) });
+}));
+
+app.get('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
-  const o = await ensureOrder(seat);
-  const items = await q('select * from order_items where order_id=$1 order by id asc', [o.id]);
+  const o = await one('select * from orders where seat=$1', [seat]);
+  const items = o ? await q('select * from order_items where order_id=$1 order by id asc', [o.id]) : [];
   res.json({
     seat,
-    submitted: !!o.submitted,
-    internalOnly: !!o.internal_only,
-    paid: !!o.paid,
+    submitted: !!o?.submitted,
+    internalOnly: !!o?.internal_only,
+    paid: !!o?.paid,
     items: items.map(i => ({
       id: i.id,
       name: i.name,
@@ -831,8 +879,8 @@ app.get('/api/orders/:seat', auth(), async (req, res) => {
       updatedAt: i.updated_at ? new Date(i.updated_at).toISOString() : null,
     })),
   });
-});
-app.put('/api/orders/:seat', auth(), async (req, res) => {
+}));
+app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
@@ -841,34 +889,15 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
     return res.status(403).json({ message: 'not in open window' });
   }
   const body = getBody(req);
-  const rawItems = Array.isArray(body.items) ? body.items : [];
-  const internalOnly = !!body.internalOnly;
+  const finalItems = orderItems(body);
+  const rawItems = body.items;
+  const internalOnly = booleanField(body, 'internalOnly');
   await tx(async (c) => {
-    const o = await t_one(c, 'select * from orders where seat=$1', [seat]) || await t_one(
-      c,
-      `insert into orders(seat, submitted, internal_only, paid, created_at, updated_at)
-       values ($1,false,false,false,now(),now()) returning *`,
-      [seat]
-    );
-    const sanitizedItems = rawItems
-      .map(it => {
-        const name = typeof it.name === 'string' ? it.name.trim().slice(0, 100) : '';
-        const price = Number(it.unitPrice);
-        const qtyRaw = Number(it.qty);
-        const qty = Number.isFinite(qtyRaw) ? Math.max(1, Math.floor(qtyRaw)) : NaN;
-        return {
-          name,
-          unitPrice: Number.isFinite(price) ? Math.round(price) : NaN,
-          qty,
-        };
-      })
-      .filter(it => it.name && Number.isFinite(it.unitPrice) && Number.isFinite(it.qty));
-    let finalItems = sanitizedItems;
-    let flag = internalOnly;
-    if (internalOnly) finalItems = [{ name: '內訂', unitPrice: 0, qty: 1 }];
+    const o = await ensureOrder(seat, c);
+    const flag = internalOnly;
     const submitted = finalItems.length > 0;
 
-    await c.query('update orders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
+    await c.query('update orders set submitted=$1, internal_only=$2, paid=case when $1 then paid else false end, updated_at=now() where id=$3', [
       submitted, flag, o.id,
     ]);
     await c.query('delete from order_items where order_id=$1', [o.id]);
@@ -881,19 +910,19 @@ app.put('/api/orders/:seat', auth(), async (req, res) => {
   });
   await logAction(req.user, 'order.update', { seat, internalOnly: !!internalOnly, itemsCount: rawItems.length }, req);
   res.json({ ok: true });
-});
+}));
 // 訂單「已付款」切換（admin）
-app.put('/api/orders/:seat/paid', auth(), requireAdmin, async (req, res) => {
+app.put('/api/orders/:seat/paid', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   const body = getBody(req);
-  const paid = !!body.paid;
+  const paid = booleanField(body, 'paid');
   const o = await ensureOrder(seat);
   await q('update orders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
   await logAction(req.user, 'order.paid', { seat, paid }, req);
   res.json({ ok: true });
-});
-app.delete('/api/orders/today', auth(), requireAdmin, async (req, res) => {
+}));
+app.delete('/api/orders/today', auth(), requireAdmin, asyncRoute(async (req, res) => {
   let deletedItems = 0;
   let resetOrders = 0;
   await tx(async (c) => {
@@ -904,12 +933,12 @@ app.delete('/api/orders/today', auth(), requireAdmin, async (req, res) => {
   });
   await logAction(req.user, 'orders.purgeToday', { deletedItems, resetOrders }, req);
   res.json({ ok: true, deletedItems, resetOrders });
-});
+}));
 
 // Reports（僅 admin）
-app.get('/api/reports/aggregate', auth(), requireAdmin, async (req, res) => {
+app.get('/api/reports/aggregate', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const rows = await q(
-    `select name, sum(qty)::int as "totalQty", sum(unit_price*qty)::int as "totalMoney"
+    `select name, sum(qty)::float8 as "totalQty", sum(unit_price::bigint*qty)::float8 as "totalMoney"
      from order_items oi
      join orders o on oi.order_id=o.id
      group by name
@@ -917,16 +946,16 @@ app.get('/api/reports/aggregate', auth(), requireAdmin, async (req, res) => {
   );
   const total = rows.reduce((s, r) => s + (r.totalMoney || 0), 0);
   res.json({ items: rows, classTotal: total });
-});
-app.get('/api/reports/missing', auth(), requireAdmin, async (req, res) => {
+}));
+app.get('/api/reports/missing', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const rows = await q('select seat, submitted from orders');
   const submittedSet = new Set(rows.filter(r => r.submitted).map(r => r.seat));
   const missing = [];
   for (let s = 1; s <= 36; s++) if (!submittedSet.has(s)) missing.push(s);
   res.json({ missing });
-});
+}));
 // 未付款清單（目前 orders 不分日期）
-app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
+app.get('/api/reports/unpaid', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const rows = await q(
     `select o.seat, oi.name, oi.unit_price, oi.qty
        from orders o
@@ -957,45 +986,36 @@ app.get('/api/reports/unpaid', auth(), requireAdmin, async (req, res) => {
     items: entry.items,
   }));
   res.json({ list });
-});
+}));
 
 /* =========================
    預訂設定 / 預訂資料 API
    ========================= */
-app.get('/api/settings/preorder', auth(), async (req, res) => {
+app.get('/api/settings/preorder', auth(), asyncRoute(async (req, res) => {
   const s = await one('select enabled, dates from preorder_settings where id=1');
   res.json({ enabled: !!s?.enabled, dates: s?.dates || [] });
-});
-app.put('/api/settings/preorder', auth(), requireAdmin, async (req, res) => {
+}));
+app.put('/api/settings/preorder', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
-  const enabled = !!body.enabled;
-  const dates = Array.isArray(body.dates) ? body.dates.filter(d => typeof d === 'string') : [];
+  const enabled = booleanField(body, 'enabled');
+  if (!Array.isArray(body.dates) || body.dates.length > 366 || body.dates.some(d => !validDate(d))) throw badRequest('請提供有效的預訂日期，最多 366 日');
+  const dates = [...new Set(body.dates)].sort();
   await q('update preorder_settings set enabled=$1, dates=$2 where id=1', [enabled, dates]);
   await logAction(req.user, 'settings.preorder', { enabled, dates }, req);
   res.json({ ok: true });
-});
+}));
 
-function toDateOrNull(s){
-  if (!s) return null;
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  if (!m) return null;
-  return `${m[1]}-${m[2]}-${m[3]}`; // 存 DB 用原字串，避免時區偏移
-}
+const toDateOrNull = validDate;
+
 async function ensurePreorder(date, seat, client = null) {
   const d = toDateOrNull(date);
   if (!d) throw new Error('bad date');
   const execOne = client ? (sql, params) => t_one(client, sql, params) : (sql, params) => one(sql, params);
-  const execQuery = client ? (sql, params) => client.query(sql, params) : (sql, params) => pool.query(sql, params);
-  let o = await execOne('select * from preorders where d=$1 and seat=$2', [d, seat]);
-  if (!o) {
-    const inserted = await execQuery(
-      `insert into preorders(d, seat, submitted, internal_only, paid, created_at, updated_at)
-       values ($1,$2,false,false,false,now(),now())
-       returning *`,
-      [d, seat]
-    );
-    o = inserted.rows[0];
-  }
+  const o = await execOne(
+    `insert into preorders(d, seat, submitted, internal_only, paid, created_at, updated_at)
+     values ($1,$2,false,false,false,now(),now())
+     on conflict (d, seat) do update set seat=excluded.seat returning *`, [d, seat]
+  );
   return o;
 }
 function canAccessPreSeat(user, seat){ return userCanAccessSeat(user, seat); }
@@ -1006,147 +1026,120 @@ async function checkPreUserAllowed(user, date) {
   return (s.dates || []).includes(date);
 }
 
-app.get('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  try{
-    const seat = Number(req.params.seat);
-    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
-    const date = toDateOrNull(req.params.date);
-    if (!date) return res.status(400).json({ message:'bad date' });
-    if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
-
-    const o = await ensurePreorder(date, seat);
-    const items = await q('select * from preorder_items where preorder_id=$1 order by id asc', [o.id]);
-    res.json({
-      date, seat,
-      submitted: !!o.submitted,
-      internalOnly: !!o.internal_only,
-      paid: !!o.paid,
-      items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
-    });
-  }catch(e){
-    res.status(500).json({ message:String(e.message||e) });
-  }
-});
-app.put('/api/preorders/:date/:seat', auth(), async (req, res) => {
-  try{
-    const seat = Number(req.params.seat);
-    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
-    const date = toDateOrNull(req.params.date);
-    if (!date) return res.status(400).json({ message:'bad date' });
-    if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
-
-    if (req.user.role !== 'admin') {
-      const allowed = await checkPreUserAllowed(req.user, date);
-      if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
+app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, asyncRoute(async (req, res)=>{
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  const rows = await q(
+    `select p.seat, pi.name, pi.unit_price, pi.qty
+       from preorders p
+       left join preorder_items pi on pi.preorder_id=p.id
+      where p.d=$1 and p.paid=false and p.submitted=true
+      order by p.seat asc, pi.id asc`,
+    [date]
+  );
+  const map = new Map();
+  for (const row of rows) {
+    const seat = Number(row.seat);
+    if (!map.has(seat)) {
+      map.set(seat, { seat, subtotal: 0, items: [] });
     }
-
-    const body = getBody(req);
-    const rawItems = Array.isArray(body.items) ? body.items : [];
-    const internalOnly = !!body.internalOnly;
-    await tx(async (c)=>{
-      const o = await ensurePreorder(date, seat, c);
-      const sanitizedItems = rawItems
-        .map(it => {
-          const name = typeof it.name === 'string' ? it.name.trim().slice(0, 100) : '';
-          const price = Number(it.unitPrice);
-          const qtyRaw = Number(it.qty);
-          const qty = Number.isFinite(qtyRaw) ? Math.max(1, Math.floor(qtyRaw)) : NaN;
-          return {
-            name,
-            unitPrice: Number.isFinite(price) ? Math.round(price) : NaN,
-            qty,
-          };
-        })
-        .filter(it => it.name && Number.isFinite(it.unitPrice) && Number.isFinite(it.qty));
-      let finalItems = sanitizedItems;
-      let flag = internalOnly;
-      if (internalOnly) finalItems = [{ name:'內訂', unitPrice:0, qty:1 }];
-      const submitted = finalItems.length > 0;
-
-      await c.query('update preorders set submitted=$1, internal_only=$2, updated_at=now() where id=$3', [
-        submitted, flag, o.id
-      ]);
-      await c.query('delete from preorder_items where preorder_id=$1', [o.id]);
-      for (const it of finalItems) {
-        await c.query(
-          'insert into preorder_items(preorder_id, name, unit_price, qty) values ($1,$2,$3,$4)',
-          [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
-        );
-      }
-    });
-
-    await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: rawItems.length }, req);
-    res.json({ ok: true });
-  }catch(e){
-    res.status(500).json({ message:String(e.message||e) });
-  }
-});
-app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, async (req, res)=>{
-  try{
-    const seat = Number(req.params.seat);
-    if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
-    const date = toDateOrNull(req.params.date);
-    if (!date) return res.status(400).json({ message:'bad date' });
-    const o = await ensurePreorder(date, seat);
-    const body = getBody(req);
-    const paid = !!body.paid;
-    await q('update preorders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
-    await logAction(req.user, 'preorder.paid', { date, seat, paid }, req);
-    res.json({ ok:true });
-  }catch(e){
-    res.status(500).json({ message:String(e.message||e) });
-  }
-});
-app.get('/api/preorders/:date/unpaid', auth(), requireAdmin, async (req, res)=>{
-  try{
-    const date = toDateOrNull(req.params.date);
-    if (!date) return res.status(400).json({ message:'bad date' });
-    const rows = await q(
-      `select p.seat, pi.name, pi.unit_price, pi.qty
-         from preorders p
-         left join preorder_items pi on pi.preorder_id=p.id
-        where p.d=$1 and p.paid=false and p.submitted=true
-        order by p.seat asc, pi.id asc`,
-      [date]
-    );
-    const map = new Map();
-    for (const row of rows) {
-      const seat = Number(row.seat);
-      if (!map.has(seat)) {
-        map.set(seat, { seat, subtotal: 0, items: [] });
-      }
-      if (row.name) {
-        const item = {
-          name: row.name,
-          unitPrice: Number(row.unit_price),
-          qty: Number(row.qty),
-        };
-        const entry = map.get(seat);
-        entry.items.push(item);
-        entry.subtotal += item.unitPrice * item.qty;
-      }
+    if (row.name) {
+      const item = {
+        name: row.name,
+        unitPrice: Number(row.unit_price),
+        qty: Number(row.qty),
+      };
+      const entry = map.get(seat);
+      entry.items.push(item);
+      entry.subtotal += item.unitPrice * item.qty;
     }
-    const list = Array.from(map.values()).map(entry => ({
-      seat: entry.seat,
-      subtotal: entry.subtotal,
-      items: entry.items,
-    }));
-    res.json({ list });
-  }catch(e){
-    res.status(500).json({ message:String(e.message||e) });
   }
-});
+  const list = Array.from(map.values()).map(entry => ({
+    seat: entry.seat,
+    subtotal: entry.subtotal,
+    items: entry.items,
+  }));
+  res.json({ list });
+}));
+
+app.get('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
+  const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
+
+  const o = await one('select * from preorders where d=$1 and seat=$2', [date, seat]);
+  const items = o ? await q('select * from preorder_items where preorder_id=$1 order by id asc', [o.id]) : [];
+  res.json({
+    date, seat,
+    submitted: !!o?.submitted,
+    internalOnly: !!o?.internal_only,
+    paid: !!o?.paid,
+    items: items.map(i => ({ id:i.id, name:i.name, unitPrice:i.unit_price, qty:i.qty }))
+  });
+}));
+app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
+  const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
+
+  if (req.user.role !== 'admin') {
+    const allowed = await checkPreUserAllowed(req.user, date);
+    if (!allowed) return res.status(403).json({ message:'preorder not allowed for this date' });
+  }
+
+  const body = getBody(req);
+  const finalItems = orderItems(body);
+  const rawItems = body.items;
+  const internalOnly = booleanField(body, 'internalOnly');
+  await tx(async (c)=>{
+    const o = await ensurePreorder(date, seat, c);
+    const flag = internalOnly;
+    const submitted = finalItems.length > 0;
+
+    await c.query('update preorders set submitted=$1, internal_only=$2, paid=case when $1 then paid else false end, updated_at=now() where id=$3', [
+      submitted, flag, o.id
+    ]);
+    await c.query('delete from preorder_items where preorder_id=$1', [o.id]);
+    for (const it of finalItems) {
+      await c.query(
+        'insert into preorder_items(preorder_id, name, unit_price, qty) values ($1,$2,$3,$4)',
+        [o.id, String(it.name), Number(it.unitPrice), Number(it.qty)]
+      );
+    }
+  });
+
+  await logAction(req.user, 'preorder.update', { date, seat, internalOnly: !!internalOnly, itemsCount: rawItems.length }, req);
+  res.json({ ok: true });
+}));
+app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, asyncRoute(async (req, res)=>{
+  const seat = Number(req.params.seat);
+  if (!Number.isInteger(seat)) return res.status(400).json({ message:'bad seat' });
+  const date = toDateOrNull(req.params.date);
+  if (!date) return res.status(400).json({ message:'bad date' });
+  const body = getBody(req);
+  const paid = booleanField(body, 'paid');
+  const o = await ensurePreorder(date, seat);
+  await q('update preorders set paid=$1, updated_at=now() where id=$2', [paid, o.id]);
+  await logAction(req.user, 'preorder.paid', { date, seat, paid }, req);
+  res.json({ ok:true });
+}));
+
 
 /* =========================
    Users
    ========================= */
-app.post('/api/users', auth(), requireAdmin, async (req, res) => {
+app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const username = normalizeUsernameInput(body.username);
   const password = normalizePasswordInput(body.password);
   const role = body.role === 'admin' ? 'admin' : 'user';
   if (!username || username.length > USERNAME_MAX_LEN) return res.status(400).json({ message: 'bad username' });
   if (!password || password.length < 6 || password.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: 'bad password' });
+  if (Buffer.byteLength(password, 'utf8') > 72) throw badRequest('密碼不可超過 72 個 UTF-8 位元組');
   const exist = await one('select 1 from users where username=$1', [username]);
   if (exist) return res.status(409).json({ message: 'username already exists' });
   const hash = await bcrypt.hash(password, 10);
@@ -1158,13 +1151,14 @@ app.post('/api/users', auth(), requireAdmin, async (req, res) => {
   );
   await logAction(req.user, 'user.create', { id: row.id, username, role }, req);
   res.json(row);
-});
-app.get('/api/users', auth(), requireAdmin, async (req, res) => {
-  const qkw = (req.query.q || '').trim();
-  const role = (req.query.role || '').trim();
-  const status = (req.query.status || '').trim();
-  const page = Math.max(1, Number(req.query.page || 1));
-  const pageSize = Math.min(100, Math.max(5, Number(req.query.pageSize || 20)));
+}));
+app.get('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
+  const qkw = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 64) : '';
+  const role = typeof req.query.role === 'string' ? req.query.role.trim() : '';
+  const status = typeof req.query.status === 'string' ? req.query.status.trim() : '';
+  const page = req.query.page === undefined ? 1 : req.query.page;
+  const pageSize = req.query.pageSize === undefined ? 20 : req.query.pageSize;
+  if (!integer(page, 1, 1_000_000) || !integer(pageSize, 5, 100)) throw badRequest('無效的分頁參數');
 
   const clauses = [];
   const params = [];
@@ -1174,7 +1168,7 @@ app.get('/api/users', auth(), requireAdmin, async (req, res) => {
   const where = clauses.length ? 'where ' + clauses.join(' and ') : '';
 
   const totalRow = await one(`select count(*)::int as c from users ${where}`, params);
-  params.push(pageSize, (page - 1) * pageSize);
+  params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
   const rows = await q(
     `select id, username, role, status, created_at, updated_at, last_login_at
      from users
@@ -1184,16 +1178,16 @@ app.get('/api/users', auth(), requireAdmin, async (req, res) => {
     params
   );
   res.json({ users: rows, total: totalRow.c, page, pageSize });
-});
-app.put('/api/users/:id/password', auth(), async (req, res) => {
+}));
+app.put('/api/users/:id/password', auth(), asyncRoute(async (req, res) => {
   const targetId = Number(req.params.id);
   if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
 
   const body = getBody(req);
-  const oldPassword = typeof body.oldPassword === 'string' ? body.oldPassword : '';
+  const oldPassword = normalizePasswordInput(body.oldPassword);
   const newPassword = normalizePasswordInput(body.newPassword);
   if (!newPassword || newPassword.length < 6) return res.status(400).json({ message: 'newPassword too short' });
-  if (newPassword.length > PASSWORD_MAX_LEN) return res.status(400).json({ message: 'newPassword too long' });
+  if (newPassword.length > PASSWORD_MAX_LEN || Buffer.byteLength(newPassword, 'utf8') > 72) return res.status(400).json({ message: '新密碼不可超過 72 個 UTF-8 位元組' });
 
   const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
@@ -1205,15 +1199,15 @@ app.put('/api/users/:id/password', auth(), async (req, res) => {
   if (!isAdmin) {
     if (!oldPassword) return res.status(400).json({ message: 'oldPassword required' });
     const ok = await bcrypt.compare(oldPassword, u.password_hash);
-    if (!ok) return res.status(401).json({ message: 'oldPassword incorrect' });
+    if (!ok) return res.status(400).json({ message: 'oldPassword incorrect' });
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
   await q('update users set password_hash=$1, updated_at=now() where id=$2', [hash, targetId]);
   await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
   res.json({ ok: true });
-});
-app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
+}));
+app.patch('/api/users/:id/status', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
   const body = getBody(req);
@@ -1227,8 +1221,8 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, async (req, res) => {
   await q('update users set status=$1, updated_at=now() where id=$2', [status, id]);
   await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
-});
-app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
+}));
+app.patch('/api/users/:id/role', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
   const body = getBody(req);
@@ -1247,8 +1241,32 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, async (req, res) => {
   await q('update users set role=$1, updated_at=now() where id=$2', [role, id]);
   await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
   res.json({ ok: true });
-});
-app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
+}));
+app.delete('/api/users/bulk-delete', auth(), requireAdmin, asyncRoute(async (req, res) => {
+  const body = getBody(req);
+  const rawIds = Array.isArray(body.ids) ? body.ids : [];
+  if (rawIds.length > 100) throw badRequest('一次最多刪除 100 位使用者');
+  if (rawIds.some(id => !integer(id, 1, 2_147_483_647))) throw badRequest('bad user id in list');
+  const ids = [...new Set(rawIds.map(Number))];
+  if (!ids.length) return res.status(400).json({ message: 'ids required' });
+  if (ids.some(id => !Number.isInteger(id))) return res.status(400).json({ message: 'bad user id in list' });
+  if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
+
+  const admins = await q(`select id from users where role='admin'`);
+  const adminIds = new Set(admins.map(x => x.id));
+  const remainingAdmins = [...adminIds].filter(id => !ids.includes(id));
+  if (remainingAdmins.length === 0) return res.status(400).json({ message: '不能刪除所有管理員' });
+
+  const deleted = await tx(async (c) => {
+    const placeholders = ids.map((_id, index) => `$${index + 1}`).join(',');
+    const result = await c.query(`delete from users where id in (${placeholders})`, ids);
+    return result.rowCount;
+  });
+  await logAction(req.user, 'user.bulkDelete', { ids }, req);
+  res.json({ ok: true, deleted });
+}));
+
+app.delete('/api/users/:id', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const targetId = Number(req.params.id);
   if (!Number.isInteger(targetId)) return res.status(400).json({ message: 'bad user id' });
   if (req.user && req.user.uid === targetId) return res.status(400).json({ message: '無法刪除自己' });
@@ -1264,43 +1282,37 @@ app.delete('/api/users/:id', auth(), requireAdmin, async (req, res) => {
   await q('delete from users where id=$1', [targetId]);
   await logAction(req.user, 'user.delete', { targetId, username: u.username, role: u.role }, req);
   res.json({ ok: true });
-});
-app.delete('/api/users/bulk-delete', auth(), requireAdmin, async (req, res) => {
-  const body = getBody(req);
-  const ids = Array.isArray(body.ids) ? body.ids.map(Number) : [];
-  if (!ids.length) return res.status(400).json({ message: 'ids required' });
-  if (ids.some(id => !Number.isInteger(id))) return res.status(400).json({ message: 'bad user id in list' });
-  if (ids.includes(req.user.uid)) return res.status(400).json({ message: '包含自己，無法刪除' });
+}));
 
-  const admins = await q(`select id from users where role='admin'`);
-  const adminIds = new Set(admins.map(x => x.id));
-  const remainingAdmins = [...adminIds].filter(id => !ids.includes(id));
-  if (remainingAdmins.length === 0) return res.status(400).json({ message: '不能刪除所有管理員' });
-
-  await tx(async (c) => {
-    for (const id of ids) {
-      await c.query('delete from users where id=$1', [id]);
-    }
-  });
-  await logAction(req.user, 'user.bulkDelete', { ids }, req);
-  res.json({ ok: true, deleted: ids.length });
-});
 
 // Logs
-app.get('/api/logs', auth(), requireAdmin, async (req, res) => {
+app.get('/api/logs', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const rows = await q('select * from audit_logs order by id desc limit 500');
   res.json({ logs: rows });
-});
+}));
 
 // Root
 app.get('/', (req, res) => {
   res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
 });
 
+app.use('/api', (_req, res) => res.status(404).json({ message: '找不到此 API' }));
+app.use((err, _req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.message === 'Not allowed by CORS') return res.status(403).json({ message: '此來源不允許存取' });
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ message: 'JSON 格式不正確' });
+  if (err.type === 'entity.too.large') return res.status(413).json({ message: '請求內容過大' });
+  if (err.code === '23505') return res.status(409).json({ message: '資料已存在，請重新載入後再試' });
+  if (err.code === '23503') return res.status(409).json({ message: '資料仍被使用或參照不存在，請重新載入後再試' });
+  const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status === 500) console.error('Request failed:', err);
+  res.status(status).json({ message: status === 500 ? '系統暫時無法處理，請稍後再試' : err.message });
+});
+
 /* =========================
    Start
    ========================= */
-(async function start() {
+async function start() {
   try {
     await one('select now()');          // test DB
     await ensureAuditLogsSchema();      // 避免 logAction 因表不存在而失敗
@@ -1311,9 +1323,25 @@ app.get('/', (req, res) => {
     await ensurePreorderSchema();
     await seed();
     console.log('[tz check]', zonedNowInfo());
-    app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
+    return app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {
     console.error('Startup error:', e);
     process.exit(1);
   }
-})();
+
+}
+
+module.exports = { app, pool, start };
+if (require.main === module) {
+  start().then(server => {
+    let closing = false;
+    const shutdown = () => {
+      if (closing) return;
+      closing = true;
+      const timeout = setTimeout(() => process.exit(1), 10_000).unref();
+      server.close(() => pool.end().then(() => { clearTimeout(timeout); process.exit(0); }));
+    };
+    process.once('SIGTERM', shutdown);
+    process.once('SIGINT', shutdown);
+  });
+}
