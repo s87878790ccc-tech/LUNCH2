@@ -1,6 +1,6 @@
 'use strict';
 const { expect } = require('@playwright/test');
-async function fixture(page, origin = 'http://127.0.0.1:4173') {
+async function fixture(page, origin = 'https://127.0.0.1:4173') {
   const date = '2026-10-19', batch = 'isolated-browser-batch';
   const empty = seat => ({ seat, orderId: seat, version: 0, date, batch, submitted: false, internalOnly: false, paid: false, items: [] });
   const model = { users: [{ id: 1, username: 'admin', role: 'admin', status: 'active' }, ...Array.from({ length: 36 }, (_, n) => ({ id: n+2, username: String(n+1), role: 'user', status: 'active' }))], creates: 0, fail: false, writes: 0, orders: Array.from({ length: 36 }, (_, i) => empty(i + 1)) };
