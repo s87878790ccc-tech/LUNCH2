@@ -479,9 +479,11 @@ async function uploadImageFile(file) {
 /* =========================
    狀態
    ========================= */
-const MIN_SEAT=1, MAX_SEAT=36;
+const MIN_SEAT=1, MAX_SEAT=2_147_483_647;
+const baseSeats = () => Array.from({ length: 36 }, (_, i) => i + 1);
 const state = {
   manualLocked: true,
+  seats: baseSeats(),
   me: null,
   menus: [],
   activeMenuId: null,
@@ -527,6 +529,10 @@ function listen(element, type, handler) {
 function resetClientState() {
   sessionEpoch += 1;
   state.me = null;
+  state.seats = baseSeats();
+  usersView.rows = []; usersView.generation++; usersView.lastCreated = null;
+  for (const id of ['createUserStatus', 'usersLoadStatus']) document.getElementById(id).textContent = '';
+  for (const id of ['userSearch', 'userRoleFilter', 'userStatusFilter']) document.getElementById(id).value = '';
   state.manualLocked = true;
   state.menus = [];
   state.activeMenuId = null;
@@ -1193,14 +1199,21 @@ function buildMenuPreview(menu, { compact=false } = {}){
   return `<div class="${cls}">${parts.join('')}</div>`;
 }
 
+async function fetchSeats() {
+  const data = await api('/seats', { cache: 'no-store' });
+  if (!Array.isArray(data.seats) || data.seats.some(seat => !Number.isInteger(seat) || seat < 1 || seat > MAX_SEAT)) throw new Error('座號清單格式不正確');
+  state.seats = [...new Set([...baseSeats(), ...data.seats])].sort((a, b) => a - b);
+  renderSeats();
+}
 function renderSeats(){
+  const previous = seatSelect.value;
   seatSelect.innerHTML = '';
-  for(let s=MIN_SEAT; s<=MAX_SEAT; s++){
+  for(const s of state.seats){
     const opt = document.createElement('option');
     opt.value=String(s); opt.textContent = `座號 ${s}`;
     seatSelect.appendChild(opt);
   }
-  seatSelect.value = seatSelect.value || '1';
+  seatSelect.value = !isAdmin() && state.me ? String(Number(state.me.username)) : state.seats.includes(Number(previous)) ? previous : String(state.seats[0] || '');
 }
 function renderActiveMenu() {
   const m = state.menus.find(x=>x.id===state.activeMenuId);
@@ -1986,24 +1999,44 @@ async function getLogs(){ return api('/logs'); }
 /* =========================
    使用者頁（抓全部分頁）
    ========================= */
-async function listUsersAdv({q='',role='',status='',page=1,pageSize=20}={}) {
-  const p = new URLSearchParams({ q, role, status, page, pageSize });
-  return api('/users?'+p.toString());
+const usersView = { rows: [], generation: 0, lastCreated: null };
+function accountPasswordError(password, role) {
+  const minimum = role === 'admin' ? 12 : 6;
+  if (Array.from(password).length < minimum) return `${role === 'admin' ? '管理員' : ''}密碼至少需要 ${minimum} 個字元`;
+  if (new Blob([password]).size > 72) return '密碼不可超過 72 個 UTF-8 位元組';
+  return '';
 }
-// 自動翻頁抓完
+function passwordHint(role) {
+  return `${role === 'admin' ? '管理員' : '一般使用者'}密碼至少需要 ${role === 'admin' ? 12 : 6} 個字元；最多 72 個 UTF-8 位元組，前後空白不列入。`;
+}
+function updateCreatePasswordHint() {
+  const role = newUserRole.value;
+  newUserPass.minLength = role === 'admin' ? 12 : 6;
+  newUserPass.placeholder = `${role === 'admin' ? '管理員' : ''}密碼至少需要 ${newUserPass.minLength} 個字元`;
+  document.getElementById('newUserPasswordHint').textContent = passwordHint(role);
+}
+newUserRole.addEventListener('change', updateCreatePasswordHint);
+updateCreatePasswordHint();
+async function listUsersAdv({q='',role='',status='',page=1,pageSize=100,afterId}={}) {
+  const p = new URLSearchParams({ q, role, status, page, pageSize });
+  if (afterId !== undefined) p.set('afterId', afterId);
+  return api('/users?'+p.toString(), { cache: 'no-store', dedupe: false });
+}
 async function fetchAllUsers() {
-  const pageSize = 100;
-  let page = 1;
-  let all = [];
-  while (true) {
-    const data = await listUsersAdv({ page, pageSize });
-    const chunk = data.users || [];
-    all = all.concat(chunk);
-    if (typeof data.total === 'number' && all.length >= data.total) break;
-    if (chunk.length < pageSize) break;
-    page += 1;
+  const all = new Map();
+  let afterId = 0;
+  // Never stop early using a potentially outdated count from another page.
+  for (let page = 1; page <= 10000; page++) {
+    const data = await listUsersAdv({ afterId });
+    if (!Array.isArray(data.users) || data.users.some(u => !Number.isInteger(u.id) || typeof u.username !== 'string' || !['admin', 'user'].includes(u.role)))
+      throw new Error('使用者清單回傳格式不正確');
+    for (const user of data.users) all.set(user.id, user);
+    if (data.users.length < 100) return [...all.values()].sort((a, b) => a.id - b.id);
+    const next = data.users.at(-1).id;
+    if (next <= afterId) throw new Error('使用者清單分頁無法繼續');
+    afterId = next;
   }
-  return all;
+  throw new Error('使用者清單過大，請聯絡管理員');
 }
 async function createUser(username, password, role){
   return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
@@ -2014,169 +2047,138 @@ async function resetPasswordAdmin(userId, newPassword){
 async function resetPasswordSelf(userId, oldPassword, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
 }
-async function loadUsers(){
-  const admin = isAdmin();
-
-  // 讀表頭實際欄位數，讓 colspan 跟著對
-  const headCols = document.querySelector('#pageUsers thead tr')?.children.length || 4;
-
-  if (!admin) {
-    usersTableBody.innerHTML = `
-      <tr>
-        <td colspan="${headCols}">
-          <div class="card only-user">
-            <h4>變更我的密碼</h4>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <input type="password" id="selfOldPwd" placeholder="舊密碼" />
-              <input type="password" id="selfNewPwd" placeholder="新密碼(至少12碼)" />
-              <button id="selfChangeBtn">送出</button>
-            </div>
-          </div>
-        </td>
-      </tr>
-    `;
-    const btn = document.getElementById('selfChangeBtn');
-    btn.onclick = async ()=>{
-      const oldP = document.getElementById('selfOldPwd').value;
-      const newP = document.getElementById('selfNewPwd').value;
-      if (!newP || newP.length<12) return alert('新密碼至少 12 碼');
-
-      // ✅ 兼容 id/uid；仍拿不到則請使用者重新登入（避免 /users/undefined/password）
-      const uid = Number(state.me?.id ?? state.me?.uid);
-      if (!Number.isInteger(uid)) { alert('找不到使用者 ID，請重新登入後再試一次'); return; }
-
-      try{
-        await resetPasswordSelf(uid, oldP, newP);
-        clearSession(); showLogin();
-        loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
-      }catch(e){
-        alert('失敗：'+e.message);
-      }
-    };
-    return;
-  }
-
-  usersTableBody.innerHTML = `<tr><td colspan="${headCols}">載入中…</td></tr>`;
-  try{
-    // 一次抓完全部頁次
-    const users = await fetchAllUsers();
-
-    // 顯示總筆數
-    const title = document.getElementById('usersListTitle');
-    if (title) {
-      title.textContent = '使用者列表 ';
-      const span = document.createElement('span');
-      span.className = 'small muted';
-      span.textContent = `（共 ${users.length} 筆）`;
-      title.appendChild(span);
+function userMatchesFilters(user) {
+  const search = normalizeUsername(document.getElementById('userSearch').value).toLocaleLowerCase();
+  const role = document.getElementById('userRoleFilter').value;
+  const status = document.getElementById('userStatusFilter').value;
+  return user.username.toLocaleLowerCase().includes(search) && (!role || user.role === role) && (!status || user.status === status);
+}
+function renderUsersList() {
+  const drafts = new Map([...usersTableBody.querySelectorAll('input[type="password"]')].map(input => [input.id, input.value]));
+  const visible = usersView.rows.filter(userMatchesFilters);
+  document.getElementById('usersListTitle').textContent = `使用者列表（顯示 ${visible.length}／共 ${usersView.rows.length} 筆）`;
+  const fragment = document.createDocumentFragment();
+  for (const u of visible) {
+    const tr = document.createElement('tr');
+    tr.dataset.userId = u.id;
+    tr.classList.toggle('user-created', u.id === usersView.lastCreated?.id);
+    for (const [label, value] of [['ID', u.id], ['帳號', u.username], ['角色', u.role === 'admin' ? '管理員' : '一般使用者'], ['狀態', u.status === 'disabled' ? '已停用' : '使用中']]) {
+      const td = document.createElement('td'); td.dataset.label = label; td.textContent = String(value); tr.appendChild(td);
     }
-
-    usersTableBody.replaceChildren();
-    const frag = document.createDocumentFragment();
-    users.forEach(u => {
-      const tr = document.createElement('tr');
-
-      const idTd = document.createElement('td');
-      idTd.textContent = String(u.id);
-      idTd.dataset.label = 'ID';
-      tr.appendChild(idTd);
-
-      const usernameTd = document.createElement('td');
-      usernameTd.textContent = u.username;
-      usernameTd.dataset.label = '帳號';
-      tr.appendChild(usernameTd);
-
-      const roleTd = document.createElement('td');
-      roleTd.textContent = u.role;
-      roleTd.dataset.label = '角色';
-      tr.appendChild(roleTd);
-
-      const actionTd = document.createElement('td');
-      actionTd.dataset.label = '操作';
-      const rowDiv = document.createElement('div');
-      rowDiv.className = 'row';
-      rowDiv.style.gap = '6px';
-      rowDiv.style.flexWrap = 'wrap';
-      rowDiv.style.alignItems = 'center';
-
-      const input = document.createElement('input');
-      input.type = 'password';
-      input.placeholder = '新密碼(至少12碼)';
-      input.id = `reset_${u.id}`;
-      rowDiv.appendChild(input);
-
-      const resetBtn = document.createElement('button');
-      resetBtn.className = 'resetPwd';
-      resetBtn.dataset.id = String(u.id);
-      resetBtn.textContent = '重設';
-      rowDiv.appendChild(resetBtn);
-
-      const delBtn = document.createElement('button');
-      delBtn.className = 'danger delUser';
-      delBtn.dataset.id = String(u.id);
-      delBtn.textContent = '刪除';
-      if (u.id === state.me.id) {
-        delBtn.disabled = true;
-        delBtn.title = '不可刪除自己';
-      }
-      rowDiv.appendChild(delBtn);
-
-      actionTd.appendChild(rowDiv);
-      tr.appendChild(actionTd);
-
-      frag.appendChild(tr);
-    });
-    usersTableBody.appendChild(frag);
-  }catch(e){
-    usersTableBody.innerHTML = `<tr><td colspan="${headCols}">失敗：${safeText(e.message)}</td></tr>`;
+    const action = document.createElement('td'); action.dataset.label = '操作';
+    const row = document.createElement('div'); row.className = 'row user-actions';
+    const input = document.createElement('input');
+    input.type = 'password'; input.autocomplete = 'new-password'; input.minLength = u.role === 'admin' ? 12 : 6;
+    input.placeholder = `新密碼（至少 ${input.minLength} 個字元）`; input.id = `reset_${u.id}`;
+    input.setAttribute('aria-label', `重設 ${u.username} 的密碼`);
+    input.setAttribute('aria-describedby', `password-hint-${u.id}`);
+    input.value = drafts.get(input.id) || '';
+    row.appendChild(input);
+    const reset = document.createElement('button'); reset.className = 'resetPwd'; reset.dataset.id = u.id; reset.textContent = '重設'; row.appendChild(reset);
+    const del = document.createElement('button'); del.className = 'danger delUser'; del.dataset.id = u.id; del.textContent = '刪除';
+    if (u.id === Number(state.me?.id)) { del.disabled = true; del.title = '不可刪除自己'; }
+    row.appendChild(del);
+    const hint = document.createElement('p'); hint.id = `password-hint-${u.id}`; hint.className = 'small muted'; hint.textContent = passwordHint(u.role);
+    action.append(row, hint); tr.appendChild(action); fragment.appendChild(tr);
+  }
+  if (!visible.length) {
+    const tr = document.createElement('tr'), td = document.createElement('td'); td.colSpan = 5; td.className = 'empty-state';
+    td.textContent = usersView.rows.length ? '目前沒有符合篩選的帳號。' : '目前沒有使用者。'; tr.appendChild(td); fragment.appendChild(tr);
+  }
+  usersTableBody.replaceChildren(fragment);
+  const created = usersView.lastCreated;
+  if (created) {
+    document.getElementById('createUserStatus').textContent = `已建立帳號「${created.username}」（ID ${created.id}）。` + (visible.some(u => u.id === created.id) ? '已在下方清單標示。' : '目前篩選條件未包含此帳號；原有篩選已保留，可調整搜尋查看。');
   }
 }
-
-listen(createUserBtn, 'click', async ()=>{
-  const username = newUserName.value.trim();
-  const password = newUserPass.value;
-  const role     = newUserRole.value;
-  if (!username || !password || password.length<12) return alert('請填帳號與密碼(至少12碼)');
-  try{
-    await createUser(username, password, role);
-    newUserName.value=''; newUserPass.value='';
-    await loadUsers();
-    alert('已建立');
-  }catch(e){ alert('建立失敗：'+e.message); }
-});
-listen(usersTableBody, 'click', async (e)=>{
-  const t = e.target;
-
-  // 重設密碼（admin）
-  if (t.classList.contains('resetPwd')) {
-    const id = Number(t.dataset.id);
-    const input = document.getElementById(`reset_${id}`);
-    const pwd = input?.value || '';
-    if (!pwd || pwd.length < 12) return alert('新密碼至少 12 碼');
-    try{
-      await resetPasswordAdmin(id, pwd);
-      input.value = '';
-      if (id === Number(state.me?.id)) {
-        clearSession(); showLogin();
-        loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
-      } else alert('已重設');
-    }catch(err){
-      alert('重設失敗：' + err.message);
-    }
+async function loadUsers({ quiet = false } = {}) {
+  const generation = ++usersView.generation, epoch = sessionEpoch;
+  if (!isAdmin()) {
+    const role = state.me?.role;
+    usersTableBody.innerHTML = `<tr><td colspan="5"><div class="card only-user"><h4>變更我的密碼</h4><div class="row user-actions"><input type="password" id="selfOldPwd" autocomplete="current-password" placeholder="舊密碼" aria-label="舊密碼" /><input type="password" id="selfNewPwd" autocomplete="new-password" minlength="6" placeholder="新密碼至少需要 6 個字元" aria-label="新密碼" aria-describedby="selfPasswordHint" /><button id="selfChangeBtn">送出</button></div><p id="selfPasswordHint" class="small muted">${passwordHint(role)}</p><p id="selfPasswordStatus" role="status"></p></div></td></tr>`;
+    listen(document.getElementById('selfChangeBtn'), 'click', async () => {
+      const oldP = normalizePassword(document.getElementById('selfOldPwd').value), newP = normalizePassword(document.getElementById('selfNewPwd').value);
+      const message = document.getElementById('selfPasswordStatus');
+      const error = accountPasswordError(newP, role);
+      if (error || !oldP) { message.textContent = error || '請輸入目前密碼'; return; }
+      const uid = Number(state.me?.id ?? state.me?.uid);
+      if (!Number.isInteger(uid)) { message.textContent = '找不到使用者 ID，請重新登入後再試一次'; return; }
+      const btn = document.getElementById('selfChangeBtn'); btn.disabled = true;
+      try {
+        await resetPasswordSelf(uid, oldP, newP);
+        clearSession(); showLogin(); loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
+      } catch (e) { message.textContent = '變更失敗：' + e.message; }
+      finally { btn.disabled = false; }
+    });
+    return true;
   }
-
-  // 刪除使用者（admin）
+  const message = document.getElementById('usersLoadStatus');
+  if (!quiet) message.textContent = '正在取得最新使用者清單…';
+  try {
+    const users = await fetchAllUsers();
+    if (generation !== usersView.generation || epoch !== sessionEpoch) return false;
+    usersView.rows = users; renderUsersList(); message.textContent = '已同步伺服器最新清單。'; return true;
+  } catch (error) {
+    if (generation === usersView.generation && epoch === sessionEpoch) {
+      message.textContent = `清單更新失敗：${error.message}。請按「更新清單」重試；目前資料可能不是最新。`;
+    }
+    return false;
+  }
+}
+for (const id of ['userSearch', 'userRoleFilter', 'userStatusFilter'])
+  document.getElementById(id).addEventListener(id === 'userSearch' ? 'input' : 'change', renderUsersList);
+listen(document.getElementById('refreshUsers'), 'click', () => loadUsers());
+listen(createUserBtn, 'click', async () => {
+  if (!isAdmin()) return;
+  const username = normalizeUsername(newUserName.value), password = normalizePassword(newUserPass.value), role = newUserRole.value;
+  const message = document.getElementById('createUserStatus');
+  const error = accountPasswordError(password, role);
+  if (!username || error) { message.textContent = !username ? '請輸入帳號' : error; return; }
+  usersView.lastCreated = null; usersView.generation++;
+  createUserBtn.disabled = true; createUserBtn.textContent = '建立中…'; message.textContent = '正在建立帳號…';
+  try {
+    const created = await createUser(username, password, role);
+    if (!Number.isInteger(created?.id) || created.username !== username || created.role !== role) throw new Error('帳號建立回應無法確認，請查詢清單');
+    usersView.lastCreated = created;
+    newUserName.value = ''; newUserPass.value = '';
+    const loaded = await loadUsers();
+    if (!loaded || !usersView.rows.some(u => u.id === created.id)) {
+      message.textContent = `帳號「${created.username}」（ID ${created.id}）已建立，但清單尚未同步，請按「更新清單」；不要重複建立。`;
+    }
+    try { await fetchSeats(); ensurePreorderUI(); if (loaded) await renderAllSeatsAdmin(true); }
+    catch { message.textContent += ' 座號同步未完成，請稍後更新頁面。'; }
+  } catch (e) {
+    const uncertain = !e.status || e.status >= 500;
+    if (uncertain) await loadUsers();
+    message.textContent = uncertain ? `新增結果尚未確認：${e.message}。請先在清單查詢「${username}」，不要重複送出。` : `建立失敗：${e.message}`;
+  } finally { createUserBtn.disabled = false; createUserBtn.textContent = '建立'; }
+});
+listen(usersTableBody, 'click', async e => {
+  const t = e.target.closest('button'); if (!t) return;
+  if (t.classList.contains('resetPwd')) {
+    const id = Number(t.dataset.id), input = document.getElementById(`reset_${id}`), user = usersView.rows.find(u => u.id === id);
+    if (!user) return;
+    const pwd = normalizePassword(input.value), error = accountPasswordError(pwd, user.role);
+    if (error) { notify(error, true); return; }
+    t.disabled = true;
+    try {
+      await resetPasswordAdmin(id, pwd); input.value = '';
+      if (id === Number(state.me?.id)) { clearSession(); showLogin(); loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。'; }
+      else notify(`已重設「${user.username}」的密碼`);
+    } catch (err) { notify('重設失敗：' + err.message, true); }
+    finally { t.disabled = false; }
+  }
   if (t.classList.contains('delUser')) {
     const id = Number(t.dataset.id);
     if (!confirm(`確定要刪除使用者 ID=${id}？`)) return;
-    try{
+    t.disabled = true;
+    try {
       await api(`/users/${id}`, { method: 'DELETE' });
-      await loadUsers(); // 重新載入列表
-      alert('已刪除');
-    }catch(err){
-      // 後端會保護：不可刪自己、至少保留一名管理員
-      alert('刪除失敗：' + err.message);
-    }
+      if (usersView.lastCreated?.id === id) { usersView.lastCreated = null; document.getElementById('createUserStatus').textContent = ''; }
+      await loadUsers(); await fetchSeats(); ensurePreorderUI(); await renderAllSeatsAdmin(true);
+      notify('已刪除');
+    } catch (err) { notify('刪除失敗：' + err.message, true); }
+    finally { t.disabled = false; }
   }
 });
 
@@ -2403,7 +2405,9 @@ function ensurePreorderUI(){
   tab.classList.toggle('hidden', !isAdmin() && !state.pre.settings.enabled);
   page.querySelectorAll('.only-admin').forEach(el => el.classList.toggle('hidden', !isAdmin()));
   const select = document.getElementById('preSeatSelect');
-  if (!select.options.length) select.innerHTML = Array.from({ length: MAX_SEAT }, (_, i) => `<option value="${i + 1}">座號 ${i + 1}</option>`).join('');
+  const previous = select.value;
+  select.replaceChildren(...state.seats.map(seat => { const option = document.createElement('option'); option.value = String(seat); option.textContent = `座號 ${seat}`; return option; }));
+  if (state.seats.includes(Number(previous))) select.value = previous;
   select.disabled = !isAdmin();
   if (!isAdmin()) select.value = String(Number(state.me?.username));
   const dateInput = document.getElementById('preDate');
@@ -2768,7 +2772,7 @@ listen(document.getElementById('manualOrderLocked'), 'change', async () => {
 });
 
 async function initApp(){
-  await Promise.all([loadMenus(), fetchManualPolicy()]);
+  await Promise.all([loadMenus(), fetchManualPolicy(), fetchSeats()]);
   renderActiveMenu();
   renderMenuPage();
   ensurePreorderUI();          // 確保預訂頁存在
@@ -2790,10 +2794,11 @@ async function refreshVisibleView() {
   refreshingView = true;
   const epoch = sessionEpoch;
   try {
-    await Promise.all([fetchOpenStatus(), fetchPreSettings(), fetchManualPolicy(), loadMenus()]);
+    await Promise.all([fetchOpenStatus(), fetchPreSettings(), fetchManualPolicy(), loadMenus(), fetchSeats()]);
     if (epoch !== sessionEpoch) return;
     state.ordersCache.clear(); state.pre.cache.clear(); allSeatsSnapshot = null;
     ensurePreorderUI();
+    if (!pageUsers.classList.contains('hidden') && isAdmin() && !usersTableBody.querySelector('[data-busy]') && ![...usersTableBody.querySelectorAll('input')].some(input => input.value || input === document.activeElement)) await loadUsers({ quiet: true });
     renderActiveMenu();
     if (!pageOrders.classList.contains('hidden')) { await renderSeatOrder(); if (isAdmin()) await renderAllSeatsAdmin(true); }
     if (!document.getElementById('pagePreorders').classList.contains('hidden')) await renderPreorder();

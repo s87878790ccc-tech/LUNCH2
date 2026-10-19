@@ -11,7 +11,7 @@
     <meta name="referrer" content="no-referrer" />
     <meta name="description" content="班級午餐訂餐、預訂及付款管理系統" />
     <title>班級午餐訂單系統</title>
-    <link rel="stylesheet" href="styles.css?v=cef553a51c84" />
+    <link rel="stylesheet" href="styles.css?v=4d8a796cf262" />
   </head>
   <body>
     <!-- 登入層 -->
@@ -606,13 +606,16 @@
       <section id="pageUsers" class="hidden">
         <div class="card only-admin">
           <h3>新增使用者</h3>
-          <div class="row">
+          <div class="row user-create-row">
             <input id="newUserName" placeholder="帳號" aria-label="帳號" />
             <input
               id="newUserPass"
-              placeholder="密碼 (>=6)"
+              placeholder="密碼至少需要 6 個字元"
               type="password"
-              aria-label="密碼 (>=6)"
+              autocomplete="new-password"
+              minlength="6"
+              aria-label="新使用者密碼"
+              aria-describedby="newUserPasswordHint"
             />
             <select id="newUserRole" aria-label="新使用者角色">
               <option value="user">user</option>
@@ -620,10 +623,20 @@
             </select>
             <button id="createUserBtn" class="primary">建立</button>
           </div>
+          <p id="newUserPasswordHint" class="small muted">一般使用者密碼至少需要 6 個字元；管理員至少 12 個字元。最多 72 個 UTF-8 位元組，前後空白不列入。</p>
+          <p class="small muted">數字帳號即為座號，建立後同步加入點餐、預訂與全部座號；其他帳號可登入，但未對應訂餐座號。</p>
+          <p id="createUserStatus" role="status" aria-live="polite"></p>
         </div>
 
         <div class="card mt8">
           <h3 id="usersListTitle">使用者列表</h3>
+          <div class="row only-admin user-filters">
+            <input id="userSearch" type="search" placeholder="搜尋帳號" aria-label="搜尋帳號" />
+            <select id="userRoleFilter" aria-label="篩選角色"><option value="">所有角色</option><option value="user">一般使用者</option><option value="admin">管理員</option></select>
+            <select id="userStatusFilter" aria-label="篩選狀態"><option value="">所有狀態</option><option value="active">使用中</option><option value="disabled">已停用</option></select>
+            <button id="refreshUsers" type="button">更新清單</button>
+          </div>
+          <p id="usersLoadStatus" class="small" role="status" aria-live="polite"></p>
           <div
             class="table-scroll"
             tabindex="0"
@@ -636,6 +649,7 @@
                   <th>ID</th>
                   <th>帳號</th>
                   <th>角色</th>
+                  <th>狀態</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -671,6 +685,6 @@
       </div>
     </div>
 
-    <script src="app.js?v=f9ad79acd058"></script>
+    <script src="app.js?v=89ba0586f60e"></script>
   </body>
 </html>

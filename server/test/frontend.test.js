@@ -30,6 +30,8 @@ async function client(
     preItems = [],
     enabled = true,
     manualLocked = false,
+    username = null,
+    users = null,
   } = {},
 ) {
   const errors = [],
@@ -61,10 +63,11 @@ async function client(
   });
   const model = {
     manualLocked,
+    users: users || [{ id: 1, username: "admin", role: "admin", status: "active" }, { id: 2, username: "2", role: "user", status: "active" }],
     user:
       role === "admin"
         ? { id: 1, username: "admin", role }
-        : { id: 2, username: "2", role },
+        : { id: 2, username: username || "2", role },
     orders: new Map([
       [1, { ...empty(1), submitted: orderItems.length > 0, items: structuredClone(orderItems) }],
       [2, { ...empty(2), submitted: role === 'user' && orderItems.length > 0, items: structuredClone(role === 'user' ? orderItems : []) }],
@@ -129,6 +132,7 @@ async function client(
     else if (route === "/auth/me") data = { user: model.user };
     else if (/^\/users\/\d+\/password$/.test(route) && method === "PUT")
       data = { ok: true };
+    else if (route === "/seats") data = { seats: [...new Set([...Array.from({ length: 36 }, (_, i) => i+1), ...model.users.map(u => Number(u.username)).filter(n => Number.isSafeInteger(n) && n > 0)])] };
     else if (route === "/open-status") data = { open: true };
     else if (route === "/settings/manual-order") {
       if (method === "PUT") model.manualLocked = body.locked;
@@ -146,7 +150,7 @@ async function client(
       data = {
         date: '2026-10-19', batch: 'test-batch',
         orders: Array.from(
-          { length: 36 },
+          { length: Math.max(36, ...model.users.map(u => /^\d+$/.test(u.username) ? Number(u.username) : 0)) },
           (_, i) => model.orders.get(i + 1) || empty(i + 1),
         ),
       };
@@ -186,7 +190,18 @@ async function client(
     else if (route === "/reports/missing") data = { missing: [] };
     else if (route === "/reports/unpaid" || route.endsWith("/unpaid"))
       data = { list: [] };
-    else if (route.startsWith("/users?")) data = { users: [], total: 0 };
+    else if (route.startsWith("/users?")) {
+      if (model.usersResponse) return model.usersResponse(route);
+      const params = new URLSearchParams(route.split('?')[1]);
+      const page = Number(params.get('page') || 1), afterId = Number(params.get('afterId') || 0);
+      data = { users: params.has('afterId') ? model.users.filter(u => u.id > afterId).slice(0,100) : model.users.slice((page-1)*100,page*100), total: model.users.length };
+    } else if (route === '/users' && method === 'POST') {
+      if (model.userCreateError) return Response.json({ message: '測試新增失敗' }, { status: 500 });
+      if (model.users.some(u => u.username === body.username)) return Response.json({ message: '此帳號已存在' }, { status: 409 });
+      data = { id: Math.max(...model.users.map(u => u.id),0)+1, username: body.username, role: body.role, status: 'active' };
+      model.users.push(data);
+      if (model.userCreateLostResponse) throw new TypeError('lost response');
+    }
     else if (route === "/logs") data = { logs: [] };
     else if (route === "/settings/open-window")
       data = { openDays: [1, 2], openStart: "07:00", openEnd: "12:00" };
@@ -659,4 +674,115 @@ test('students have no overview payment controls', async t => {
   const c = await client(t, { role: 'user', orderItems: [lunchItem] });
   assert.ok(c.d.getElementById('adminAllSeats').classList.contains('hidden'));
   assert.equal(c.d.querySelectorAll('.payment-control input').length, 0);
+});
+
+async function openUsers(c) {
+  c.click('tabUsers');
+  await until(() => /已同步/.test(c.d.getElementById('usersLoadStatus').textContent));
+}
+function enterUser(c, username = '37', password = 'abcdef', role = 'user') {
+  c.set('newUserName', username); c.set('newUserPass', password); c.change('newUserRole', role);
+}
+
+test('creating a six-character account immediately refreshes the real list, count and seat selectors', async t => {
+  const c = await client(t); await openUsers(c);
+  enterUser(c); c.click('createUserBtn'); c.click('createUserBtn'); await c.idle();
+  assert.equal(c.calls.filter(x => x.route === '/users' && x.method === 'POST').length, 1);
+  assert.equal(c.model.users.filter(u => u.username === '37').length, 1);
+  assert.match(c.d.getElementById('usersListTitle').textContent, /共 3 筆/);
+  assert.match(c.d.getElementById('createUserStatus').textContent, /已建立.*37.*下方清單/);
+  assert.ok([...c.d.getElementById('usersTableBody').rows].some(row => row.textContent.includes('37')));
+  assert.ok([...c.d.getElementById('seatSelect').options].some(o => o.value === '37'));
+  assert.ok([...c.d.getElementById('preSeatSelect').options].some(o => o.value === '37'));
+  assert.ok(c.d.getElementById('seat-card-37'));
+  c.click('tabOrders'); c.click('tabUsers'); await until(() => /已同步/.test(c.d.getElementById('usersLoadStatus').textContent));
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+});
+
+test('creation respects existing filters and tells the administrator where the new account is', async t => {
+  const c = await client(t); await openUsers(c);
+  c.change('userRoleFilter', 'admin'); c.set('userSearch', 'admin');
+  c.d.getElementById('userSearch').dispatchEvent(new c.w.Event('input', { bubbles: true }));
+  enterUser(c); c.click('createUserBtn'); await c.idle();
+  assert.equal(c.d.getElementById('userRoleFilter').value, 'admin');
+  assert.equal(c.d.getElementById('userSearch').value, 'admin');
+  assert.match(c.d.getElementById('createUserStatus').textContent, /目前篩選條件未包含/);
+  assert.match(c.d.getElementById('usersListTitle').textContent, /顯示 1.*共 3/);
+  c.set('userSearch', '37'); c.change('userRoleFilter', 'user');
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+});
+
+test('a delayed old list response cannot overwrite the post-create list', async t => {
+  const c = await client(t);
+  let release, requested = false, reads = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  c.model.usersResponse = async () => {
+    const snapshot = structuredClone(c.model.users);
+    if (++reads === 1) { requested = true; await gate; }
+    return Response.json({ users: snapshot, total: snapshot.length });
+  };
+  c.click('tabUsers'); await until(() => requested);
+  enterUser(c); c.click('createUserBtn'); await c.idle();
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+  release(); await sleep(30);
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+  assert.match(c.d.getElementById('usersListTitle').textContent, /共 3/);
+});
+
+test('a committed creation with a failed list refresh is identified separately and can be refreshed', async t => {
+  const c = await client(t); await openUsers(c);
+  c.model.usersResponse = () => { throw new TypeError('list unavailable'); };
+  enterUser(c); c.click('createUserBtn'); await c.idle();
+  assert.equal(c.model.users.length, 3);
+  assert.match(c.d.getElementById('createUserStatus').textContent, /已建立，但清單尚未同步/);
+  assert.doesNotMatch(c.d.getElementById('createUserStatus').textContent, /建立失敗/);
+  c.model.usersResponse = null; c.click('refreshUsers'); await c.idle();
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+});
+
+test('failed and lost create responses preserve form values and never invent a successful row', async t => {
+  const c = await client(t); await openUsers(c);
+  c.model.userCreateError = true;
+  enterUser(c); c.click('createUserBtn'); await c.idle();
+  assert.equal(c.model.users.length, 2);
+  assert.equal(c.d.getElementById('newUserName').value, '37');
+  assert.equal(c.d.getElementById('newUserPass').value, 'abcdef');
+  assert.match(c.d.getElementById('createUserStatus').textContent, /結果尚未確認/);
+  assert.equal(c.d.querySelectorAll('.user-created').length, 0);
+  c.model.userCreateError = false; c.model.userCreateLostResponse = true;
+  c.click('createUserBtn'); await c.idle();
+  assert.equal(c.model.users.length, 3);
+  assert.match(c.d.getElementById('createUserStatus').textContent, /結果尚未確認/);
+  assert.match(c.d.getElementById('usersTableBody').textContent, /37/);
+});
+
+test('the full list spans more than one page and keeps disabled accounts visible under their filter', async t => {
+  const users = Array.from({ length: 105 }, (_, n) => ({ id: n+1, username: `account-${n}`, role: n === 0 ? 'admin' : 'user', status: n % 2 ? 'disabled' : 'active' }));
+  const c = await client(t, { users }); await openUsers(c);
+  assert.match(c.d.getElementById('usersListTitle').textContent, /共 105/);
+  assert.equal(c.d.getElementById('usersTableBody').rows.length, 105);
+  c.change('userStatusFilter', 'disabled');
+  assert.equal(c.d.getElementById('usersTableBody').rows.length, 52);
+});
+
+test('password prompts and validation agree for ordinary and administrator accounts', async t => {
+  const c = await client(t); await openUsers(c);
+  enterUser(c, '37', 'abcde'); c.click('createUserBtn'); await c.idle();
+  assert.match(c.d.getElementById('createUserStatus').textContent, /6 個字元/);
+  assert.equal(c.calls.filter(x => x.route === '/users' && x.method === 'POST').length, 0);
+  c.change('newUserRole', 'admin');
+  assert.match(c.d.getElementById('newUserPasswordHint').textContent, /管理員.*12 個字元/);
+  enterUser(c, 'other-admin', 'abcdef', 'admin'); c.click('createUserBtn'); await c.idle();
+  assert.match(c.d.getElementById('createUserStatus').textContent, /12 個字元/);
+  assert.equal(c.d.getElementById('reset_2').minLength, 6);
+  assert.equal(c.d.getElementById('reset_1').minLength, 12);
+});
+
+test('new numeric users can use their own dynamic seat without choosing another seat', async t => {
+  const c = await client(t, { role: 'user', username: '37', users: [{ id: 1, username: 'admin', role: 'admin', status: 'active' }, { id: 2, username: '37', role: 'user', status: 'active' }] });
+  assert.equal(c.d.getElementById('seatSelect').value, '37');
+  assert.equal(c.d.getElementById('seatSelect').disabled, true);
+  assert.equal(c.d.getElementById('preSeatSelect').value, '37');
+  c.set('codeInput', 1); c.click('addByCode'); await c.idle();
+  assert.ok(c.calls.some(call => call.route === '/orders/37' && call.method === 'PUT'));
 });
