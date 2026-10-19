@@ -1,393 +1,664 @@
 <!doctype html>
 <html lang="zh-Hant">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>班級午餐訂單系統</title>
-  <link rel="stylesheet" href="styles.css" />
-  <style>
-    /* 讓整頁可以捲動到最底，避免 100vh / overflow 限制 */
-    html, body { height: auto; min-height: 100%; overflow-y: auto; }
-    #app { min-height: 100vh; height: auto; overflow: visible; }
-    section { height: auto !important; overflow: visible !important; }
-    .card { overflow: visible; }
-
-    /* Admin 全部座號一覽 */
-    #allSeatsGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px}
-    .seat-card{border:1px solid #3a2d19;background:#1b140d;border-radius:10px;padding:10px}
-    .seat-card .hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-    .badge{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid #555}
-    .badge.ok{background:#103a1a;border-color:#1f7a35}
-    .badge.pending{background:#3a2a10;border-color:#a36b1a}
-    .badge.paid{background:#0f2f49;border-color:#3aa0ff}
-    .seat-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-    .items{font-size:12px;color:#d8d8d8}
-  </style>
-</head>
-<body>
-  <!-- 登入層 -->
-  <div id="loginLayer" class="layer">
-    <div class="card w400 login-card">
-      <h2>午餐系統V0.11c</h2>
-      <input id="loginUser" placeholder="帳號" />
-      <input id="loginPass" placeholder="密碼" type="password" />
-      <button id="loginBtn" class="primary">登入</button>
-      <div id="loginMsg" class="muted small"></div>
-      <div id="loginLoading" class="login-loading hidden" aria-live="polite" aria-busy="true">
-        <div class="login-loading-spinner" role="presentation"></div>
-        <div class="small">登入/載入中，請稍候...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- 主畫面 -->
-  <div id="app" class="hidden">
-    <div class="topbar">
-      <div class="left">
-        <strong>🍱 班級午餐訂單系統</strong>
-        <span class="muted small" id="apiBaseHint"></span>
-      </div>
-      <div class="right">
-        <button id="tabOrders" class="tab active">訂單</button>
-        <button id="tabPreorder" class="tab hidden">預訂</button>
-        <button id="tabMenus" class="tab">菜單</button>
-        <button id="tabReports" class="tab">後台</button>
-        <button id="tabLogs" class="tab hidden">紀錄</button>
-        <button id="tabUsers" class="tab hidden">使用者</button>
-        <!-- 僅 admin 顯示，一鍵捲到「全部座號」 -->
-        <button id="tabAllSeats" class="tab hidden">全座號</button>
-        <span id="whoami" class="pill"></span>
-        <button id="logoutBtn">登出</button>
-      </div>
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b1020" />
+    <meta name="description" content="班級午餐訂餐、預訂及付款管理系統" />
+    <title>班級午餐訂單系統</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- 登入層 -->
+    <div id="loginLayer" class="layer">
+      <form id="loginForm" class="card w400 login-card">
+        <div class="login-brand" aria-hidden="true">🍱</div>
+        <h1>班級午餐系統</h1>
+        <p class="muted">登入後，即可查看菜單與管理午餐訂單。</p>
+        <label for="loginUser">帳號</label>
+        <input
+          id="loginUser"
+          name="username"
+          placeholder="請輸入帳號或座號"
+          autocomplete="username"
+          autocapitalize="none"
+          spellcheck="false"
+          required
+          maxlength="64"
+          aria-label="請輸入帳號或座號"
+        />
+        <label for="loginPass">密碼</label>
+        <input
+          id="loginPass"
+          name="password"
+          placeholder="請輸入密碼"
+          type="password"
+          autocomplete="current-password"
+          required
+          maxlength="256"
+          aria-label="請輸入密碼"
+        />
+        <button id="loginBtn" type="submit" class="primary">登入</button>
+        <div id="loginMsg" class="small" role="alert"></div>
+        <div
+          id="loginLoading"
+          class="login-loading hidden"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <div class="login-loading-spinner" role="presentation"></div>
+          <div class="small">登入/載入中，請稍候...</div>
+        </div>
+      </form>
     </div>
 
-    <!-- 訂單頁 -->
-    <section id="pageOrders">
-      <!-- 非點餐時段的提示橫幅 -->
-      <div id="closedBanner" class="card hidden" style="border:1px solid #f59e0b;background:#24190b;color:#ffd38a">
-        <strong>目前不在點餐時段</strong>
-        <div class="small">可點餐時間由管理員設定（週期與時段）。一般使用者在關閉時段不可修改訂單。</div>
-      </div>
+    <!-- 主畫面 -->
+    <div id="app" class="hidden">
+      <header class="topbar">
+        <div class="left">
+          <strong>🍱 班級午餐訂單系統</strong>
+          <span class="muted small" id="apiBaseHint"></span>
+        </div>
+        <div class="account">
+          <span id="whoami" class="pill"></span>
+          <button id="logoutBtn">登出</button>
+        </div>
+        <nav class="right" aria-label="主要功能">
+          <button id="tabOrders" class="tab active">訂單</button>
+          <button id="tabPreorders" class="tab hidden">預訂</button>
+          <button id="tabMenus" class="tab">菜單</button>
+          <button id="tabReports" class="tab">後台</button>
+          <button id="tabLogs" class="tab hidden">紀錄</button>
+          <button id="tabUsers" class="tab hidden">使用者</button>
+          <!-- 僅 admin 顯示，一鍵捲到「全部座號」 -->
+          <button id="tabAllSeats" class="tab hidden">全座號</button>
+        </nav>
+      </header>
 
-      <div class="grid">
-        <div class="card">
-          <h3>點餐</h3>
-          <div class="row">
-            <label>座號
-              <select id="seatSelect"></select>
-            </label>
-            <button id="clearSeat" class="danger">清空本座</button>
+      <!-- 訂單頁 -->
+      <section id="pageOrders">
+        <!-- 非點餐時段的提示橫幅 -->
+        <div
+          id="closedBanner"
+          class="card hidden"
+          style="border: 1px solid #f59e0b; background: #24190b; color: #ffd38a"
+        >
+          <strong>目前不在點餐時段</strong>
+          <div class="small">
+            可點餐時間由管理員設定（週期與時段）。一般使用者在關閉時段不可修改訂單。
           </div>
+        </div>
 
-          <div class="hr"></div>
-
-          <details open>
-            <summary><strong>由菜單代號新增</strong> <span class="muted small">（輸入代號與數量，如 <span class="kbd">1</span>、<span class="kbd">2</span>）</span></summary>
-            <div class="row mt8">
-              <input id="codeInput" type="number" min="1" placeholder="代號" class="w120" />
-              <input id="qtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
-              <button id="addByCode" class="primary">加入</button>
+        <div class="grid">
+          <div class="card">
+            <h3>點餐</h3>
+            <div class="row">
+              <label
+                >座號
+                <select id="seatSelect"></select>
+              </label>
+              <button id="clearSeat" class="danger">清空本座</button>
             </div>
-            <div id="menuView" class="menu-preview-host compact mt8"></div>
-          </details>
 
-          <details>
-            <summary><strong>手動新增餐點</strong></summary>
-            <div class="row mt8">
-              <input id="manualName" placeholder="品名" />
-              <input id="manualPrice" type="number" placeholder="單價" class="w140" />
-              <input id="manualQty" type="number" placeholder="數量" value="1" class="w120" />
-              <button id="addManual" class="ghost">新增</button>
+            <div class="hr"></div>
+
+            <details open>
+              <summary>
+                <strong>由菜單代號新增</strong>
+                <span class="muted small"
+                  >（輸入代號與數量，如 <span class="kbd">1</span>、<span
+                    class="kbd"
+                    >2</span
+                  >）</span
+                >
+              </summary>
+              <div class="row mt8">
+                <input
+                  id="codeInput"
+                  type="number"
+                  inputmode="numeric"
+                  step="1"
+                  min="1"
+                  placeholder="代號"
+                  class="w120"
+                  aria-label="代號"
+                />
+                <input
+                  id="qtyInput"
+                  type="number"
+                  inputmode="numeric"
+                  step="1"
+                  min="1"
+                  value="1"
+                  placeholder="數量"
+                  class="w120"
+                  aria-label="數量"
+                />
+                <button id="addByCode" class="primary">加入</button>
+              </div>
+              <div id="menuView" class="menu-preview-host compact mt8"></div>
+            </details>
+
+            <details>
+              <summary><strong>手動新增餐點</strong></summary>
+              <div class="row mt8">
+                <input id="manualName" placeholder="品名" aria-label="品名" />
+                <input
+                  min="0"
+                  max="1000000"
+                  id="manualPrice"
+                  type="number"
+                  inputmode="numeric"
+                  step="1"
+                  placeholder="單價"
+                  class="w140"
+                  aria-label="單價"
+                />
+                <input
+                  id="manualQty"
+                  type="number"
+                  inputmode="numeric"
+                  step="1"
+                  placeholder="數量"
+                  value="1"
+                  class="w120"
+                  aria-label="數量"
+                />
+                <button id="addManual" class="ghost">新增</button>
+              </div>
+            </details>
+
+            <div class="row mt8" style="gap: 16px">
+              <label><input type="checkbox" id="internalOnly" /> 內訂</label>
+              <!--<label><input type="checkbox" id="paid" /> 已付款</label>       被注釋掉-->
             </div>
-          </details>
 
-          <div class="row mt8" style="gap:16px">
-            <label><input type="checkbox" id="internalOnly" /> 內訂</label>
-            <!--<label><input type="checkbox" id="paid" /> 已付款</label>       被注釋掉-->
+            <div class="hr"></div>
+
+            <h3>本座訂單</h3>
+            <div
+              class="only-admin mt8"
+              style="
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 12px;
+              "
+            >
+              <span class="small muted"
+                >將清空今日所有座號的訂單、內訂與付款狀態。</span
+              >
+              <button id="purgeOrdersBtn" class="danger">
+                刪除今日全部訂單
+              </button>
+            </div>
+            <div
+              class="table-scroll"
+              tabindex="0"
+              role="region"
+              aria-label="可捲動的資料表"
+            >
+              <table id="orderTable">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>品名</th>
+                    <th>單價</th>
+                    <th>數量</th>
+                    <th>小計</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+                <tfoot>
+                  <tr>
+                    <th colspan="4" style="text-align: right">小計</th>
+                    <th id="seatSubtotal">0</th>
+                    <th></th>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
           </div>
 
-          <div class="hr"></div>
-
-          <h3>本座訂單</h3>
-          <div class="only-admin mt8" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
-            <span class="small muted">將清空今日所有座號的訂單、內訂與付款狀態。</span>
-            <button id="purgeOrdersBtn" class="danger">刪除今日全部訂單</button>
+          <div class="card">
+            <div class="section-title">
+              <h3>目前菜單</h3>
+              <span id="activeMenuName" class="pill">(未選擇)</span>
+            </div>
+            <div id="activeMenuNote" class="menu-note-block hidden"></div>
+            <div id="activeMenuList" class="menu-preview-host"></div>
           </div>
-          <table id="orderTable">
-            <thead>
-              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
-            </thead>
-            <tbody></tbody>
-            <tfoot>
-              <tr><th colspan="4" style="text-align:right">小計</th><th id="seatSubtotal">0</th><th></th></tr>
-            </tfoot>
-          </table>
         </div>
 
-        <div class="card">
-          <div class="section-title">
-            <h3>目前菜單</h3>
-            <span id="activeMenuName" class="pill">(未選擇)</span>
+        <!-- 管理員一頁看完全部座號 -->
+        <div id="adminAllSeats" class="card hidden" style="margin-top: 12px">
+          <div
+            class="section-title"
+            style="
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+            "
+          >
+            <h3>全部座號（管理員快速檢視 / 操作）</h3>
+            <button id="refreshAllSeats" class="ghost">重新整理</button>
           </div>
-          <div id="activeMenuNote" class="menu-note-block hidden"></div>
-          <div id="activeMenuList" class="menu-preview-host"></div>
+          <div id="allSeatsGrid"></div>
         </div>
-      </div>
+      </section>
 
-      <!-- 管理員一頁看完全部座號 -->
-      <div id="adminAllSeats" class="card hidden" style="margin-top:12px">
-        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
-          <h3>全部座號（管理員快速檢視 / 操作）</h3>
-          <button id="refreshAllSeats" class="ghost">重新整理</button>
-        </div>
-        <div id="allSeatsGrid"></div>
-      </div>
-    </section>
-
-    <!-- ⭐ 預訂便當頁 -->
-    <section id="pagePreorder" class="hidden">
-      <div class="grid">
+      <!-- ⭐ 預訂便當頁 -->
+      <section id="pagePreorders" class="hidden">
         <div class="card">
           <h3>預訂便當</h3>
-          <div class="row" style="gap:16px">
-            <label>日期
-              <select id="preDateSelect"></select>
-            </label>
-            <label>座號
-              <select id="preSeatSelect"></select>
-            </label>
-          </div>
-
-          <div class="row mt8" style="gap:16px">
-            <label><input type="checkbox" id="preInternalOnly" /> 內訂</label>
-            <label><input type="checkbox" id="prePaid" /> 已付款</label>
+          <div class="row">
+            <label>日期 <input id="preDate" type="date" /></label>
+            <label
+              >座號
+              <select id="preSeatSelect"></select
+            ></label>
+            <button id="preLoad" class="ghost">載入</button>
           </div>
 
           <div class="hr"></div>
 
           <details open>
-            <summary><strong>由菜單代號新增</strong></summary>
+            <summary>
+              <strong>由菜單代號新增</strong>
+              <span class="small muted">（輸入代號與數量）</span>
+            </summary>
             <div class="row mt8">
-              <input id="preCodeInput" type="number" min="1" placeholder="代號" class="w120" />
-              <input id="preQtyInput" type="number" min="1" value="1" placeholder="數量" class="w120" />
+              <input
+                id="preCodeInput"
+                type="number"
+                inputmode="numeric"
+                step="1"
+                min="1"
+                placeholder="代號"
+                class="w120"
+                aria-label="代號"
+              />
+              <input
+                id="preQtyInput"
+                type="number"
+                inputmode="numeric"
+                step="1"
+                min="1"
+                value="1"
+                placeholder="數量"
+                class="w120"
+                aria-label="數量"
+              />
               <button id="preAddByCode" class="primary">加入</button>
             </div>
+            <div id="preMenuView" class="menu-preview-host compact mt8"></div>
           </details>
 
           <details>
             <summary><strong>手動新增餐點</strong></summary>
             <div class="row mt8">
-              <input id="preManualName" placeholder="品名" />
-              <input id="preManualPrice" type="number" placeholder="單價" class="w140" />
-              <input id="preManualQty" type="number" placeholder="數量" value="1" class="w120" />
+              <input id="preManualName" placeholder="品名" aria-label="品名" />
+              <input
+                min="0"
+                max="1000000"
+                id="preManualPrice"
+                type="number"
+                inputmode="numeric"
+                step="1"
+                placeholder="單價"
+                class="w140"
+                aria-label="單價"
+              />
+              <input
+                id="preManualQty"
+                type="number"
+                inputmode="numeric"
+                step="1"
+                placeholder="數量"
+                value="1"
+                class="w120"
+                aria-label="數量"
+              />
               <button id="preAddManual" class="ghost">新增</button>
             </div>
           </details>
 
+          <div class="row mt8">
+            <label><input type="checkbox" id="preInternalOnly" /> 內訂</label>
+          </div>
+
           <div class="hr"></div>
 
-          <h3>本座預訂明細</h3>
-          <table id="preOrderTable">
-            <thead>
-              <tr><th>#</th><th>品名</th><th>單價</th><th>數量</th><th>小計</th><th></th></tr>
-            </thead>
-            <tbody id="preOrderTbody"></tbody>
-            <tfoot>
-              <tr><th colspan="4" style="text-align:right">小計</th><th id="preSeatSubtotal">0</th><th></th></tr>
-            </tfoot>
-          </table>
-        </div>
-
-        <div class="card only-admin">
-          <div class="section-title">
-            <h3>預訂設定</h3>
-            <span id="preSettingsMsg" class="small muted"></span>
-          </div>
-          <div class="row" style="gap:16px">
-            <label><input type="checkbox" id="preEnabled" /> 開啟預訂功能（對一般使用者顯示）</label>
-          </div>
-          <div class="row mt8" style="gap:8px">
-            <input id="preAddDate" type="date" />
-            <button id="preAddDateBtn" class="ghost">加入日期</button>
-            <button id="preSaveDates" class="primary">儲存</button>
-            <button id="preReload" class="ghost">重新載入</button>
-          </div>
-          <div class="small muted mt8">允許的日期清單：</div>
-          <div id="preDatesList" class="mt8"></div>
-        </div>
-      </div>
-    </section>
-
-    <!-- 菜單頁 -->
-    <section id="pageMenus" class="hidden">
-      <div class="card">
-        <h3>菜單管理</h3>
-        <div class="row">
-          <select id="menuSelect"></select>
-          <button id="useMenu" class="primary">切換啟用</button>
-          <button id="addMenu" class="ghost">新增菜單</button>
-        </div>
-        <div class="row mt8">
-          <input id="menuNewName" placeholder="新菜單名稱 / 重新命名" />
-          <button id="renameMenu">重新命名</button>
-          <button id="dupMenu">複製</button>
-          <button id="delMenu" class="danger">刪除</button>
-        </div>
-
-        <textarea id="menuNote" class="menu-note-input mt8" placeholder="菜單備註（顯示給所有使用者）"></textarea>
-
-        <div class="menu-cover-editor mt8">
-          <div class="menu-image-label">菜單圖片</div>
-          <div class="menu-image-upload">
-            <div class="menu-image-upload-row">
-              <input id="menuImage" type="file" accept="image/*" />
-              <button type="button" id="menuImageClear" class="ghost small hidden">移除</button>
-            </div>
-            <div id="menuImagePreview" class="menu-image-preview">
-              <div class="menu-thumb placeholder">無圖片</div>
-            </div>
-            <div id="menuImageStatus" class="small muted menu-image-status"></div>
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="可捲動的資料表"
+          >
+            <table id="preTable">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>品名</th>
+                  <th>單價</th>
+                  <th>數量</th>
+                  <th>小計</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+              <tfoot>
+                <tr>
+                  <th colspan="4" style="text-align: right">小計</th>
+                  <th id="preSubtotal">0</th>
+                  <th id="prePaidCell"></th>
+                </tr>
+              </tfoot>
+            </table>
           </div>
         </div>
 
-        <div class="hr"></div>
-
-        <div class="row">
-          <input id="itemName" placeholder="品名" />
-          <input id="itemPrice" type="number" placeholder="價格" class="w140" />
-          <button id="addItem">新增項目</button>
+        <div class="card only-admin" id="preAdminNote">
+          <div class="small muted">
+            管理員可隨時調整預訂內容與「已付款」；一般使用者只能在開啟「預訂」且日期允許時操作，且無法更改「已付款」。
+          </div>
         </div>
+      </section>
 
-        <table id="menuTable" class="mt8">
-          <thead><tr><th>代號</th><th>品名</th><th>價格</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- 後台頁（彙整＋缺單＋未付款） -->
-    <section id="pageReports" class="hidden">
-      <div class="grid">
+      <!-- 菜單頁 -->
+      <section id="pageMenus" class="hidden">
         <div class="card">
-          <h3>品項彙整</h3>
-          <table id="aggTable">
-            <thead><tr><th>品名</th><th>總數</th><th>總金額</th></tr></thead>
-            <tbody></tbody>
-            <tfoot><tr><th colspan="2" style="text-align:right">全班合計</th><th id="classTotal">0</th></tr></tfoot>
-          </table>
+          <h3>菜單管理</h3>
+          <div class="row">
+            <select id="menuSelect" aria-label="選擇要編輯的菜單"></select>
+            <button id="useMenu" class="primary">切換啟用</button>
+            <button id="addMenu" class="ghost">新增菜單</button>
+          </div>
+          <div class="row mt8">
+            <input
+              id="menuNewName"
+              placeholder="新菜單名稱 / 重新命名"
+              aria-label="新菜單名稱 / 重新命名"
+            />
+            <button id="renameMenu">儲存名稱與備註</button>
+            <button id="dupMenu">複製</button>
+            <button id="delMenu" class="danger">刪除</button>
+          </div>
+
+          <textarea
+            id="menuNote"
+            class="menu-note-input mt8"
+            aria-label="菜單備註"
+            placeholder="菜單備註（顯示給所有使用者）"
+            maxlength="2000"
+          ></textarea>
+
+          <div class="menu-cover-editor mt8">
+            <div class="menu-image-label">菜單圖片</div>
+            <div class="menu-image-upload">
+              <div class="menu-image-upload-row">
+                <input
+                  id="menuImage"
+                  type="file"
+                  aria-label="上傳菜單圖片"
+                  accept="image/jpeg,image/png,image/gif,image/webp"
+                />
+                <button
+                  type="button"
+                  id="menuImageClear"
+                  class="ghost small hidden"
+                >
+                  移除
+                </button>
+              </div>
+              <div id="menuImagePreview" class="menu-image-preview">
+                <div class="menu-thumb placeholder">無圖片</div>
+              </div>
+              <div
+                id="menuImageStatus"
+                class="small muted menu-image-status"
+              ></div>
+            </div>
+          </div>
+
+          <div class="hr"></div>
+
+          <div class="row">
+            <input id="itemName" placeholder="品名" aria-label="品名" />
+            <input
+              min="0"
+              max="1000000"
+              id="itemPrice"
+              type="number"
+              inputmode="numeric"
+              step="1"
+              placeholder="價格"
+              class="w140"
+              aria-label="價格"
+            />
+            <button id="addItem">新增項目</button>
+          </div>
+
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="可捲動的資料表"
+          >
+            <table id="menuTable" class="mt8">
+              <thead>
+                <tr>
+                  <th>代號</th>
+                  <th>品名</th>
+                  <th>價格</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- 後台頁（彙整＋缺單＋未付款） -->
+      <section id="pageReports" class="hidden">
+        <div class="grid">
+          <div class="card">
+            <h3>品項彙整</h3>
+            <div
+              class="table-scroll"
+              tabindex="0"
+              role="region"
+              aria-label="可捲動的資料表"
+            >
+              <table id="aggTable">
+                <thead>
+                  <tr>
+                    <th>品名</th>
+                    <th>總數</th>
+                    <th>總金額</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+                <tfoot>
+                  <tr>
+                    <th colspan="2" style="text-align: right">全班合計</th>
+                    <th id="classTotal">0</th>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>尚未完成訂單名單</h3>
+            <div id="missingList" class="muted"></div>
+          </div>
         </div>
 
+        <div class="card mt8">
+          <div
+            class="row"
+            style="justify-content: space-between; align-items: center"
+          >
+            <h3>座號合計與明細</h3>
+            <button id="loadBySeat" class="ghost">載入/重新整理</button>
+          </div>
+          <div id="loadBySeatMsg" class="small muted"></div>
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="可捲動的資料表"
+          >
+            <table>
+              <thead>
+                <tr>
+                  <th>座號</th>
+                  <th>狀態</th>
+                  <th>小計</th>
+                  <th>明細</th>
+                </tr>
+              </thead>
+              <tbody id="bySeatTBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card mt8 only-admin">
+          <h3>點餐時段設定</h3>
+          <div class="row" style="flex-wrap: wrap; gap: 8px">
+            <label><input type="checkbox" name="owDay" value="1" /> 週一</label>
+            <label><input type="checkbox" name="owDay" value="2" /> 週二</label>
+            <label><input type="checkbox" name="owDay" value="3" /> 週三</label>
+            <label><input type="checkbox" name="owDay" value="4" /> 週四</label>
+            <label><input type="checkbox" name="owDay" value="5" /> 週五</label>
+            <label><input type="checkbox" name="owDay" value="6" /> 週六</label>
+            <label><input type="checkbox" name="owDay" value="0" /> 週日</label>
+          </div>
+          <div class="row mt8" style="gap: 8px; align-items: center">
+            <label>開始 <input id="owStart" type="time" step="60" /></label>
+            <label>結束 <input id="owEnd" type="time" step="60" /></label>
+            <button id="owSave" class="primary">儲存</button>
+            <button id="owReload" class="ghost">重新載入</button>
+            <span id="owMsg" class="small muted"></span>
+          </div>
+          <div class="small muted mt8">
+            顯示為 24 小時制；系統時區由後端設定（預設
+            Asia/Taipei）。儲存後立即生效。
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs（僅 admin） -->
+      <section id="pageLogs" class="hidden">
         <div class="card">
-          <h3>尚未完成訂單名單</h3>
-          <div id="missingList" class="muted"></div>
-        </div>
-      </div>
-
-      <div class="card mt8">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3>座號合計與明細</h3>
-          <button id="loadBySeat" class="ghost">載入/重新整理</button>
-        </div>
-        <div id="loadBySeatMsg" class="small muted"></div>
-        <table>
-          <thead><tr><th>座號</th><th>狀態</th><th>小計</th><th>明細</th></tr></thead>
-          <tbody id="bySeatTBody"></tbody>
-        </table>
-      </div>
-
-      <div class="card mt8 only-admin">
-        <h3>未付款名單（今日）</h3>
-        <div id="unpaidList" class="muted"></div>
-      </div>
-
-      <div class="card mt8 only-admin">
-        <div class="row" style="justify-content:space-between;align-items:center">
-          <h3>預訂未付款名單</h3>
-          <div>
-            <label>日期
-              <select id="unpaidPreDateSelect"></select>
+          <h3>審計紀錄（最近 500 筆）</h3>
+          <div class="row log-filter-row">
+            <label class="log-filter-label"
+              >分類
+              <select id="logCategoryFilter"></select>
             </label>
-            <button id="reloadUnpaidPre" class="ghost">重新整理</button>
+            <span id="logCategoryHint" class="small muted"></span>
+          </div>
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="可捲動的資料表"
+          >
+            <table id="logsTable">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>時間</th>
+                  <th>分類</th>
+                  <th>事件</th>
+                  <th>說明</th>
+                  <th>使用者</th>
+                  <th>IP</th>
+                  <th>裝置</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
-        <div id="unpaidPreList" class="muted"></div>
-      </div>
+      </section>
 
-      <div class="card mt8 only-admin">
-        <h3>點餐時段設定</h3>
-        <div class="row" style="flex-wrap:wrap;gap:8px">
-          <label><input type="checkbox" name="owDay" value="1"> 週一</label>
-          <label><input type="checkbox" name="owDay" value="2"> 週二</label>
-          <label><input type="checkbox" name="owDay" value="3"> 週三</label>
-          <label><input type="checkbox" name="owDay" value="4"> 週四</label>
-          <label><input type="checkbox" name="owDay" value="5"> 週五</label>
-          <label><input type="checkbox" name="owDay" value="6"> 週六</label>
-          <label><input type="checkbox" name="owDay" value="0"> 週日</label>
+      <!-- 使用者管理（僅 admin） -->
+      <section id="pageUsers" class="hidden">
+        <div class="card only-admin">
+          <h3>新增使用者</h3>
+          <div class="row">
+            <input id="newUserName" placeholder="帳號" aria-label="帳號" />
+            <input
+              id="newUserPass"
+              placeholder="密碼 (>=6)"
+              type="password"
+              aria-label="密碼 (>=6)"
+            />
+            <select id="newUserRole" aria-label="新使用者角色">
+              <option value="user">user</option>
+              <option value="admin">admin</option>
+            </select>
+            <button id="createUserBtn" class="primary">建立</button>
+          </div>
         </div>
-        <div class="row mt8" style="gap:8px;align-items:center">
-          <label>開始 <input id="owStart" type="time" step="60"></label>
-          <label>結束 <input id="owEnd" type="time" step="60"></label>
-          <button id="owSave" class="primary">儲存</button>
-          <button id="owReload" class="ghost">重新載入</button>
-          <span id="owMsg" class="small muted"></span>
-        </div>
-        <div class="small muted mt8">
-          顯示為 24 小時制；系統時區由後端設定（預設 Asia/Taipei）。儲存後立即生效。
-        </div>
-      </div>
-    </section>
 
-    <!-- Logs（僅 admin） -->
-    <section id="pageLogs" class="hidden">
-      <div class="card">
-        <h3>審計紀錄（最近 500 筆）</h3>
-        <div class="row log-filter-row">
-          <label class="log-filter-label">分類
-            <select id="logCategoryFilter"></select>
-          </label>
-          <span id="logCategoryHint" class="small muted"></span>
+        <div class="card mt8">
+          <h3 id="usersListTitle">使用者列表</h3>
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="可捲動的資料表"
+          >
+            <table class="users-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>帳號</th>
+                  <th>角色</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="usersTableBody"></tbody>
+            </table>
+          </div>
         </div>
-        <table id="logsTable">
-          <thead>
-            <tr><th>ID</th><th>時間</th><th>分類</th><th>事件</th><th>說明</th><th>使用者</th><th>IP</th><th>裝置</th></tr>
-          </thead>
-        <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <!-- 使用者管理（僅 admin） -->
-    <section id="pageUsers" class="hidden">
-      <div class="card only-admin">
-        <h3>新增使用者</h3>
-        <div class="row">
-          <input id="newUserName" placeholder="帳號" />
-          <input id="newUserPass" placeholder="密碼 (>=6)" type="password" />
-          <select id="newUserRole">
-            <option value="user">user</option>
-            <option value="admin">admin</option>
-          </select>
-          <button id="createUserBtn" class="primary">建立</button>
-        </div>
-      </div>
-
-      <div class="card mt8">
-        <h3>使用者列表</h3>
-        <table class="users-table">
-          <thead><tr><th>ID</th><th>帳號</th><th>角色</th><th>重設密碼</th><th>刪除</th></tr></thead>
-          <tbody id="usersTableBody"></tbody>
-        </table>
-      </div>
-    </section>
-  </div>
-
-  <div id="imageLightbox" class="image-lightbox hidden">
-    <div class="image-lightbox-content">
-      <button type="button" class="image-lightbox-close">✕</button>
-      <img src="" alt="預覽圖片" />
+      </section>
     </div>
-  </div>
 
-  <script src="app.js"></script>
-</body>
+    <div
+      id="appNotice"
+      class="app-notice hidden"
+      role="status"
+      aria-live="polite"
+    ></div>
+    <div
+      id="imageLightbox"
+      class="image-lightbox hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-label="菜單圖片預覽"
+    >
+      <div class="image-lightbox-content">
+        <button
+          type="button"
+          class="image-lightbox-close"
+          aria-label="關閉圖片預覽"
+        >
+          ✕
+        </button>
+        <img src="" alt="預覽圖片" />
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
 </html>
