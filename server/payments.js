@@ -33,6 +33,18 @@ function orderJSON(order, items, seat, context) {
   };
 }
 
+// Join reads keep versions, paid flags and amounts in one database snapshot.
+function joinedOrders(rows) {
+  const result = new Map();
+  for (const row of rows) {
+    if (!result.has(row.seat)) result.set(row.seat, { order: row, items: [] });
+    if (row.line_id != null) result.get(row.seat).items.push({
+      id: row.line_id, name: row.line_name, unit_price: row.line_price, qty: row.line_qty, updated_at: row.line_updated_at,
+    });
+  }
+  return result;
+}
+
 function assertReference(body, order, context, required = true) {
   if (!required && body.version === undefined && body.orderId === undefined && body.batch === undefined) return;
   if (!Number.isInteger(body.version) || body.version < 0 || !validDate(body.date) ||
@@ -64,4 +76,4 @@ async function updatePayment(client, { order, items, context, body, userId, preo
   return orderJSON(rows[0], items, order.seat, context);
 }
 
-module.exports = { businessDate, currentContext, orderJSON, assertReference, contentChanged, updatePayment, conflict };
+module.exports = { businessDate, currentContext, orderJSON, joinedOrders, assertReference, contentChanged, updatePayment, conflict };

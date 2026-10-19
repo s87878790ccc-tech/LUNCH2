@@ -13,7 +13,7 @@ const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
 const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
-const { currentContext, orderJSON, assertReference, contentChanged, updatePayment } = require('./payments');
+const { currentContext, orderJSON, joinedOrders, assertReference, contentChanged, updatePayment } = require('./payments');
 
 // Express 4 does not forward rejected async handlers to its error middleware.
 const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -614,6 +614,11 @@ async function isOpenNow() {
 /* =========================
    Routes
    ========================= */
+app.get('/api/health', asyncRoute(async (_req, res) => {
+  await one('select 1 as connected');
+  res.json({ ok: true, version: 'quick-payments-v1' });
+}));
+
 app.post('/api/uploads/images', auth(), requireAdmin, uploadLimiter, (req, res) => {
   imageUpload(req, res, async (err) => {
     if (err) {
@@ -901,20 +906,14 @@ async function validateManualLock(user, client, items, previousItems) {
 // A single read replaces 36 per-seat HTTP requests in the admin overview.
 app.get('/api/orders', auth(), requireAdmin, asyncRoute(async (_req, res) => {
   const context = await orderContext();
-  const [orders, items] = await Promise.all([
-    q('select * from orders where order_date=$1 and order_batch=$2 and seat between 1 and 36 order by seat', [context.date, context.batch]),
-    q('select oi.* from order_items oi join orders o on oi.order_id=o.id where o.order_date=$1 and o.order_batch=$2 and o.seat between 1 and 36 order by oi.id', [context.date, context.batch]),
-  ]);
-  const byOrder = new Map();
-  for (const item of items) {
-    if (!byOrder.has(item.order_id)) byOrder.set(item.order_id, []);
-    byOrder.get(item.order_id).push(item);
-  }
-  const bySeat = new Map(orders.map(o => [o.seat, o]));
+  const rows = await q(`select o.*, i.id as line_id, i.name as line_name, i.unit_price as line_price, i.qty as line_qty, i.updated_at as line_updated_at
+    from orders o left join order_items i on i.order_id=o.id
+    where o.order_date=$1 and o.order_batch=$2 and o.seat between 1 and 36 order by o.seat, i.id`, [context.date, context.batch]);
+  const bySeat = joinedOrders(rows);
   res.json({ ...context, orders: Array.from({ length: 36 }, (_, i) => {
     const seat = i + 1;
-    const o = bySeat.get(seat);
-    return orderJSON(o, byOrder.get(o?.id) || [], seat, context);
+    const record = bySeat.get(seat);
+    return orderJSON(record?.order, record?.items || [], seat, context);
   }) });
 }));
 
@@ -923,9 +922,10 @@ app.get('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   if (!Number.isInteger(seat)) return res.status(400).json({ message: 'bad seat' });
   if (!userCanAccessSeat(req.user, seat)) return res.status(403).json({ message: 'forbidden' });
   const context = await orderContext();
-  const o = await one('select * from orders where seat=$1 and order_date=$2 and order_batch=$3', [seat, context.date, context.batch]);
-  const items = o ? await q('select * from order_items where order_id=$1 order by id asc', [o.id]) : [];
-  res.json(orderJSON(o, items, seat, context));
+  const rows = await q(`select o.*, i.id as line_id, i.name as line_name, i.unit_price as line_price, i.qty as line_qty, i.updated_at as line_updated_at
+    from orders o left join order_items i on i.order_id=o.id where o.seat=$1 and o.order_date=$2 and o.order_batch=$3 order by i.id`, [seat, context.date, context.batch]);
+  const record = joinedOrders(rows).get(seat);
+  res.json(orderJSON(record?.order, record?.items || [], seat, context));
 }));
 app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);
@@ -1130,9 +1130,10 @@ app.get('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   if (!date) return res.status(400).json({ message:'bad date' });
   if (!canAccessPreSeat(req.user, seat)) return res.status(403).json({ message:'forbidden' });
 
-  const o = await one('select * from preorders where d=$1 and seat=$2', [date, seat]);
-  const items = o ? await q('select * from preorder_items where preorder_id=$1 order by id asc', [o.id]) : [];
-  res.json(orderJSON(o, items, seat, { date }));
+  const rows = await q(`select o.*, i.id as line_id, i.name as line_name, i.unit_price as line_price, i.qty as line_qty
+    from preorders o left join preorder_items i on i.preorder_id=o.id where o.d=$1 and o.seat=$2 order by i.id`, [date, seat]);
+  const record = joinedOrders(rows).get(seat);
+  res.json(orderJSON(record?.order, record?.items || [], seat, { date }));
 }));
 app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
   const seat = Number(req.params.seat);

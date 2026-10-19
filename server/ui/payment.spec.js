@@ -46,8 +46,8 @@ async function fixture(page) {
     return route.fulfill({ json: structuredClone(response), headers: cors });
   });
   await page.goto('/');
-  await page.getByLabel('帳號', { exact: true }).fill('admin');
-  await page.getByLabel('密碼', { exact: true }).fill('isolated-browser-password');
+  await page.locator('#loginUser').fill('admin');
+  await page.locator('#loginPass').fill('isolated-browser-password');
   await page.getByRole('button', { name: '登入', exact: true }).click();
   await expect(page.locator('#adminAllSeats')).toBeVisible();
   await expect(page.locator('#allSeatsGrid .seat-card')).toHaveCount(36);
