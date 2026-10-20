@@ -47,8 +47,12 @@ test('maintenance: actual Express CSP allows existing ordering UI and blocks cro
   await expect(page.locator('#allSeatsGrid .seat-card')).toHaveCount(36);
   const errors = [];
   page.on('console', msg => { if (msg.type() === 'error') errors.push(msg.text()); });
+  const loadedScripts = [];
+  page.on('request', req => { if (new URL(req.url()).pathname === '/app.js') loadedScripts.push(req.url()); });
   await page.unroute('**/*');
   await page.goto('https://127.0.0.1:4174/secure', { waitUntil:'domcontentloaded' });
   await expect.poll(() => errors.join(' ')).toMatch(/frame-ancestors|X-Frame-Options|refused to frame/i);
-  await expect(page.frameLocator('iframe').locator('#loginForm')).toHaveCount(0);
+  // Firefox intentionally has no execution context for a CSP-blocked frame.
+  // Inspecting its DOM can hang; assert the browser denial and no app loading.
+  expect(loadedScripts).toEqual([]);
 });
