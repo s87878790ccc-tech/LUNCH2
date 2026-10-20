@@ -16,6 +16,7 @@ const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inO
 const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
 const { currentContext, orderJSON, joinedOrders, assertReference, contentChanged, updatePayment } = require('./payments');
 const { MAX_SEAT, passwordError, seatNumber, seatsFromUsers } = require('./users');
+const { temporaryPassword, passwordChangeRequired, isCredentialRecoveryRequest } = require('./account-credentials');
 
 // Express 4 does not forward rejected async handlers to its error middleware.
 const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
@@ -52,28 +53,7 @@ function randomString(length, alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
   return output;
 }
 
-function ensurePasswordFromEnv(key, { minLength, generator }) {
-  const raw = process.env[key];
-  if (raw && raw.length >= minLength) return { value: raw, generated: false, insecure: false };
-  if (raw && raw.length < minLength) {
-    console.warn(`[security] ${key} is shorter than the recommended minimum of ${minLength} characters.`);
-    return { value: raw, generated: false, insecure: true };
-  }
-  const generatedValue = generator();
-  console.warn(`[security] ${key} not set; generated ephemeral fallback for this process. Set ${key} to persist.`);
-  return { value: generatedValue, generated: true, insecure: false };
-}
-
 const JWT_SECRET = ensureJwtSecret();
-const ADMIN_DEFAULT_USER = process.env.ADMIN_DEFAULT_USER || 'admin';
-const ADMIN_PASS_CONFIG = ensurePasswordFromEnv('ADMIN_DEFAULT_PASS', {
-  minLength: 12,
-  generator: () => randomString(24),
-});
-const SEAT_PASS_CONFIG = ensurePasswordFromEnv('SEAT_DEFAULT_PASS', {
-  minLength: 6,
-  generator: () => randomString(8, '0123456789'),
-});
 
 // 允許的前端網域（GitHub Pages）
 const ALLOW_ORIGINS = [
@@ -462,58 +442,6 @@ async function ensurePreorderSchema() {
 }
 
 /* =========================
-   bootstrap（seed）
-   ========================= */
-async function seed() {
-  const adminName = ADMIN_DEFAULT_USER;
-  const adminPass = ADMIN_PASS_CONFIG.value;
-  const seatPass = SEAT_PASS_CONFIG.value;
-
-  const u = await one('select * from users where username=$1', [adminName]);
-  if (!u) {
-    const hash = await bcrypt.hash(adminPass, 10);
-    await q(
-      `insert into users(username, password_hash, role, status, created_at, updated_at)
-       values ($1,$2,'admin','active',now(),now())`,
-      [adminName, hash]
-    );
-    console.log('[seed] admin created:', adminName);
-    if (ADMIN_PASS_CONFIG.generated) {
-      console.warn('[seed] Admin password was generated. Configure ADMIN_DEFAULT_PASS before creating new accounts; passwords are never logged.');
-    }
-  } else {
-    console.log('[seed] admin exists:', adminName);
-    if (ADMIN_PASS_CONFIG.generated) {
-      console.warn('[seed] Admin user already existed; generated fallback password was not applied. Set ADMIN_DEFAULT_PASS to rotate manually.');
-    }
-  }
-
-  const hashSeat = await bcrypt.hash(seatPass, 10);
-  let createdSeats = 0;
-  for (let s = 1; s <= 36; s++) {
-    const inserted = await one(
-      `insert into users(username, password_hash, role, status, created_at, updated_at)
-       values ($1,$2,'user','active',now(),now())
-       on conflict (username) do nothing
-       returning id`,
-      [String(s), hashSeat]
-    );
-    if (inserted) createdSeats++;
-  }
-  if (createdSeats > 0) {
-    console.log(`[seed] created ${createdSeats} seat accounts; passwords are never logged.`);
-    if (SEAT_PASS_CONFIG.generated) {
-      console.warn('[seed] Seat default password auto-generated for this run. Set SEAT_DEFAULT_PASS to persist across restarts.');
-    }
-  } else {
-    console.log('[seed] seat users 1~36 already existed');
-    if (SEAT_PASS_CONFIG.generated) {
-      console.warn('[seed] Seat accounts already existed; generated fallback password was not applied. Set SEAT_DEFAULT_PASS to rotate if needed.');
-    }
-  }
-}
-
-/* =========================
    Auth helpers
    ========================= */
 function sign(user) {
@@ -529,10 +457,11 @@ function auth(required = true) {
     } catch {
       return res.status(401).json({ message: 'invalid token' });
     }
-    const current = await one('select id, username, role, status, password_hash, auth_version from users where id=$1', [req.user.uid]);
+    const current = await one('select id, username, role, status, password_hash, auth_version, must_change_password from users where id=$1', [req.user.uid]);
     if (!current || current.status !== 'active' || !sessionMatches(req.user, current, JWT_SECRET)) return res.status(401).json({ message: '登入已失效，請重新登入' });
     req.authClaims = req.user;
-    req.user = { uid: current.id, username: current.username, role: current.role };
+    req.user = { uid: current.id, username: current.username, role: current.role, mustChangePassword: !!current.must_change_password };
+    if (current.must_change_password && !isCredentialRecoveryRequest(req, current.id)) throw passwordChangeRequired();
     next();
   });
 }
@@ -541,11 +470,13 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-async function lockActor(req, client, adminOnly, exclusive = false) {
+async function lockActor(req, client, adminOnly, exclusive = false, allowCredentialRecovery = false) {
   const actor = await t_one(client, `select * from users where id=$1 for ${exclusive ? 'update' : 'share'}`, [req.user.uid]);
   if (!actor || actor.status !== 'active' || !sessionMatches(req.authClaims, actor, JWT_SECRET))
     throw Object.assign(new Error('登入已失效，請重新登入'), { status: 401 });
   if (adminOnly && actor.role !== 'admin') throw Object.assign(new Error('forbidden'), { status: 403 });
+  if (actor.must_change_password && !(allowCredentialRecovery && isCredentialRecoveryRequest(req, actor.id)))
+    throw passwordChangeRequired();
   return actor;
 }
 
@@ -560,10 +491,10 @@ async function authorizedTx(req, change, adminOnly = false) {
 // Serialize account-security mutations, then revalidate the caller inside the
 // transaction. A request authorized before a concurrent revocation cannot
 // finish with old privileges or remove the last active administrator.
-async function mutateUsers(req, change, adminOnly = true) {
+async function mutateUsers(req, change, adminOnly = true, allowCredentialRecovery = false) {
   return tx(async client => {
     await client.query('select pg_advisory_xact_lock(7301, 0)');
-    const actor = await lockActor(req, client, adminOnly, true);
+    const actor = await lockActor(req, client, adminOnly, true, allowCredentialRecovery);
     return change(client, actor);
   });
 }
@@ -740,16 +671,16 @@ app.post('/api/auth/login', loginIpLimiter, loginAccountLimiter, loginLimiter, a
   const token = sign(u);
   await logAction({ uid: u.id }, 'login', { username }, req);
   // 統一回傳 shape（id/username/role）
-  res.json({ token, user: { id: u.id, username: u.username, role: u.role } });
+  res.json({ token, user: { id: u.id, username: u.username, role: u.role, mustChangePassword: !!u.must_change_password } });
 }));
 
 // ✅ 統一 /auth/me 回傳 shape（修正原本只有 uid 導致前端 id 為 undefined）
 app.get('/api/auth/me', auth(), asyncRoute(async (req, res) => {
   const u = req.user;
-  res.json({ user: { id: u.uid, username: u.username, role: u.role } });
+  res.json({ user: { id: u.uid, username: u.username, role: u.role, mustChangePassword: u.mustChangePassword } });
 }));
 app.post('/api/auth/logout', auth(), asyncRoute(async (req, res) => {
-  await mutateUsers(req, c => c.query('update users set auth_version=auth_version+1 where id=$1', [req.user.uid]), false);
+  await mutateUsers(req, c => c.query('update users set auth_version=auth_version+1 where id=$1', [req.user.uid]), false, true);
   await logAction(req.user, 'logout', { allDevices: true }, req);
   res.json({ ok: true });
 }));
@@ -1006,7 +937,7 @@ app.put('/api/orders/:seat', auth(), asyncRoute(async (req, res) => {
     const context = await orderContext(c);
     await c.query('select pg_advisory_xact_lock(7201, $1::integer)', [seat]);
     const existing = await t_one(c, 'select * from orders where seat=$1 and order_date=$2 and order_batch=$3 for update', [seat, context.date, context.batch]);
-    assertReference(body, existing, context, false);
+    assertReference(body, existing, context);
     if (actor.role !== 'admin' && !await isOpenNow(c)) throw Object.assign(new Error('not in open window'), { status: 403 });
     const o = existing || await ensureOrder(seat, c, context);
     const previous = await t_q(c, 'select name, unit_price, qty from order_items where order_id=$1', [o.id]);
@@ -1213,7 +1144,7 @@ app.put('/api/preorders/:date/:seat', auth(), asyncRoute(async (req, res) => {
     if (!canAccessPreSeat(actor, seat)) throw Object.assign(new Error('forbidden'), { status: 403 });
     await c.query('select pg_advisory_xact_lock(7202, $1::integer)', [seat]);
     const existing = await t_one(c, 'select * from preorders where d=$1 and seat=$2 for update', [date, seat]);
-    assertReference(body, existing, { date }, false);
+    assertReference(body, existing, { date });
     if (!await checkPreUserAllowed(actor, date, c)) throw Object.assign(new Error('preorder not allowed for this date'), { status: 403 });
     const o = await ensurePreorder(date, seat, c);
     const previous = await t_q(c, 'select name, unit_price, qty from preorder_items where preorder_id=$1', [o.id]);
@@ -1256,10 +1187,9 @@ app.put('/api/preorders/:date/:seat/paid', auth(), requireAdmin, asyncRoute(asyn
 /* =========================
    Users
    ========================= */
-app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
+app.post('/api/users', auth(), requireAdmin, passwordChangeLimiter, asyncRoute(async (req, res) => {
   const body = getBody(req);
   const username = normalizeUsernameInput(body.username);
-  const password = normalizePasswordInput(body.password);
   const role = body.role === undefined ? 'user' : body.role;
   if (!['admin', 'user'].includes(role)) throw badRequest('角色必須為一般使用者或管理員');
   if (!username || username.length > USERNAME_MAX_LEN) throw badRequest('帳號需為 1～64 個字元');
@@ -1267,18 +1197,26 @@ app.post('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   // second account capable of accessing another seat's orders.
   if (Number.isFinite(Number(username)) && seatNumber(username) === null)
     throw badRequest('座號帳號請使用 1～2147483647 的整數，不可含前導零或其他數字格式');
-  const error = passwordError(password, role);
-  if (error) throw badRequest(error);
+  if (body.password !== undefined)
+    throw badRequest('初始密碼由系統個別產生，請重新載入新版介面後新增帳號。');
+  const actorPassword = normalizePasswordInput(body.actorPassword);
+  if (role === 'admin' && (!actorPassword || Buffer.byteLength(actorPassword, 'utf8') > 72))
+    throw badRequest('請輸入目前管理員密碼確認建立管理員。');
+  const password = temporaryPassword();
   const hash = await bcrypt.hash(password, 10);
-  const row = await mutateUsers(req, c => t_one(c,
-    `insert into users(username, password_hash, role, status, created_at, updated_at)
-     values ($1,$2,$3,'active',now(),now())
-     returning id, username, role, status`,
-    [username, hash, role]
-  ));
+  const row = await mutateUsers(req, async (c, actor) => {
+    if (role === 'admin' && !await bcrypt.compare(actorPassword, actor.password_hash))
+      throw Object.assign(new Error('管理員密碼不正確'), { status: 403 });
+    return t_one(c,
+      `insert into users(username, password_hash, role, status, must_change_password, created_at, updated_at)
+       values ($1,$2,$3,'active',true,now(),now())
+       returning id, username, role, status`,
+      [username, hash, role]
+    );
+  });
   if (!row) return res.status(409).json({ message: '此帳號已存在，請在使用者清單中查詢' });
   await logAction(req.user, 'user.create', { id: row.id, username, role }, req);
-  res.json(row);
+  res.set('Cache-Control', 'no-store').json({ ...row, mustChangePassword: true, initialPassword: password });
 }));
 app.get('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const qkw = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 64) : '';
@@ -1304,14 +1242,14 @@ app.get('/api/users', auth(), requireAdmin, asyncRoute(async (req, res) => {
   }
   params.push(Number(pageSize), afterId === undefined ? (Number(page) - 1) * Number(pageSize) : 0);
   const rows = await q(
-    `select id, username, role, status, created_at, updated_at, last_login_at
+    `select id, username, role, status, must_change_password, created_at, updated_at, last_login_at
      from users
      ${where}
      order by id asc
      limit $${params.length - 1} offset $${params.length}`,
     params
   );
-  res.json({ users: rows, total: totalRow.c, page, pageSize });
+  res.json({ users: rows.map(({ must_change_password, ...user }) => ({ ...user, mustChangePassword: !!must_change_password })), total: totalRow.c, page, pageSize });
 }));
 app.put('/api/users/:id/password', auth(), passwordChangeLimiter, asyncRoute(async (req, res) => {
   const targetId = Number(req.params.id);
@@ -1319,10 +1257,17 @@ app.put('/api/users/:id/password', auth(), passwordChangeLimiter, asyncRoute(asy
 
   const body = getBody(req);
   const oldPassword = normalizePasswordInput(body.oldPassword);
-  const newPassword = normalizePasswordInput(body.newPassword);
   const isAdmin = req.user && req.user.role === 'admin';
   const isSelf = req.user && req.user.uid === targetId;
   if (!isAdmin && !isSelf) return res.status(403).json({ message: 'forbidden' });
+  const resetOther = !isSelf;
+  if (resetOther && (body.resetTemporary !== true || body.newPassword !== undefined))
+    throw badRequest('重設其他帳號時，請使用新版介面的個別初始密碼重設流程。');
+  if (isSelf && body.resetTemporary !== undefined) throw badRequest('請使用目前密碼變更自己的密碼。');
+  const actorPassword = normalizePasswordInput(body.actorPassword);
+  if (resetOther && (!actorPassword || Buffer.byteLength(actorPassword, 'utf8') > 72))
+    throw badRequest('請輸入目前管理員密碼確認重設。');
+  const newPassword = resetOther ? temporaryPassword() : normalizePasswordInput(body.newPassword);
 
   const u = await one('select * from users where id=$1', [targetId]);
   if (!u) return res.status(404).json({ message: 'user not found' });
@@ -1330,25 +1275,31 @@ app.put('/api/users/:id/password', auth(), passwordChangeLimiter, asyncRoute(asy
   const error = passwordError(newPassword, u.role);
   if (error) throw badRequest(error);
 
-  if (!isAdmin) {
+  if (isSelf) {
     if (!oldPassword) return res.status(400).json({ message: 'oldPassword required' });
+    if (Buffer.byteLength(oldPassword, 'utf8') > 72) throw badRequest('目前密碼格式不正確');
     const ok = await bcrypt.compare(oldPassword, u.password_hash);
     if (!ok) return res.status(400).json({ message: 'oldPassword incorrect' });
+    if (await bcrypt.compare(newPassword, u.password_hash)) throw badRequest('新密碼不可與目前或初始密碼相同。');
   }
 
   const hash = await bcrypt.hash(newPassword, 10);
   await mutateUsers(req, async (c, actor) => {
     if (actor.role !== 'admin' && actor.id !== targetId) throw Object.assign(new Error('forbidden'), { status: 403 });
+    if (resetOther && !await bcrypt.compare(actorPassword, actor.password_hash))
+      throw Object.assign(new Error('管理員密碼不正確'), { status: 403 });
     const current = await t_one(c, 'select * from users where id=$1 for update', [targetId]);
     if (!current) throw Object.assign(new Error('user not found'), { status: 404 });
     if (current.password_hash !== u.password_hash || current.auth_version !== u.auth_version || current.role !== u.role || current.status !== u.status)
       throw Object.assign(new Error('帳號狀態或密碼已變更，請重新載入後再操作'), { status: 409 });
     const policyError = passwordError(newPassword, current.role);
     if (policyError) throw badRequest(policyError);
-    await c.query('update users set password_hash=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [hash, targetId]);
-  }, false);
-  await logAction(req.user, 'user.changePassword', { targetId, by: 'admin?' + isAdmin }, req);
-  res.json({ ok: true });
+    await c.query('update users set password_hash=$1, must_change_password=$2, auth_version=auth_version+1, updated_at=now() where id=$3', [hash, resetOther, targetId]);
+  }, false, true);
+  await logAction(req.user, 'user.changePassword', { targetId, temporaryReset: resetOther }, req);
+  res.set('Cache-Control', 'no-store').json(resetOther
+    ? { ok: true, mustChangePassword: true, initialPassword: newPassword }
+    : { ok: true, mustChangePassword: false });
 }));
 app.patch('/api/users/:id/status', auth(), requireAdmin, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
@@ -1370,7 +1321,7 @@ app.patch('/api/users/:id/status', auth(), requireAdmin, asyncRoute(async (req, 
   await logAction(req.user, 'user.status', { targetId: id, status }, req);
   res.json({ ok: true });
 }));
-app.patch('/api/users/:id/role', auth(), requireAdmin, asyncRoute(async (req, res) => {
+app.patch('/api/users/:id/role', auth(), requireAdmin, passwordChangeLimiter, asyncRoute(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'bad user id' });
   const body = getBody(req);
@@ -1378,14 +1329,36 @@ app.patch('/api/users/:id/role', auth(), requireAdmin, asyncRoute(async (req, re
   if (!['admin', 'user'].includes(role)) return res.status(400).json({ message: 'bad role' });
   if (req.user.uid === id) return res.status(400).json({ message: '無法變更自己的角色' });
 
-  const u = await mutateUsers(req, async c => {
+  const actorPassword = normalizePasswordInput(body.actorPassword);
+  const newPassword = normalizePasswordInput(body.newPassword);
+  // A role upgrade must not reuse an ordinary account's old credentials.
+  // Hashing is outside the lock; current role and both credentials are checked
+  // again while the account-security transaction holds actor/target locks.
+  let promotedHash;
+  if (role === 'admin') {
+    if (!actorPassword || Buffer.byteLength(actorPassword, 'utf8') > 72)
+      throw badRequest('請輸入目前管理員密碼確認升權。');
+    const error = passwordError(newPassword, 'admin');
+    if (error) throw badRequest(error);
+    promotedHash = await bcrypt.hash(newPassword, 10);
+  }
+
+  const u = await mutateUsers(req, async (c, actor) => {
     const current = await t_one(c, 'select * from users where id=$1 for update', [id]);
     if (!current) throw Object.assign(new Error('user not found'), { status: 404 });
+    if (current.role === role) throw badRequest('帳號已使用此角色，請重新載入。');
     if (current.role === 'admin' && current.status === 'active' && role === 'user') {
       const count = await t_one(c, "select count(*)::int as c from users where role='admin' and status='active'");
       if (count.c <= 1) throw badRequest('系統至少需要一位使用中的管理員');
     }
-    await c.query('update users set role=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [role, id]);
+    if (role === 'admin') {
+      if (!await bcrypt.compare(actorPassword, actor.password_hash))
+        throw Object.assign(new Error('管理員密碼不正確'), { status: 403 });
+      if (await bcrypt.compare(newPassword, current.password_hash)) throw badRequest('升權時必須設定不同的管理員新密碼。');
+      await c.query('update users set role=$1, password_hash=$2, must_change_password=false, auth_version=auth_version+1, updated_at=now() where id=$3', [role, promotedHash, id]);
+    } else {
+      await c.query('update users set role=$1, auth_version=auth_version+1, updated_at=now() where id=$2', [role, id]);
+    }
     return current;
   });
   await logAction(req.user, 'user.role', { targetId: id, from: u.role, to: role }, req);
@@ -1465,9 +1438,13 @@ app.use((err, _req, res, next) => {
   if (err.type === 'entity.too.large') return res.status(413).json({ message: '請求內容過大' });
   if (err.code === '23505') return res.status(409).json({ message: err.constraint === 'users_username_key' ? '此帳號已存在，請在使用者清單中查詢' : '資料已存在，請重新載入後再試' });
   if (err.code === '23503') return res.status(409).json({ message: '資料仍被使用或參照不存在，請重新載入後再試' });
-  const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+  const status = err.status === 503 ? 503
+    : Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
   if (status === 500) console.error('Request failed:', err.code || 'UNKNOWN');
-  res.status(status).json({ message: status === 500 ? '系統暫時無法處理，請稍後再試' : err.message });
+  res.status(status).json({
+    message: status >= 500 ? '系統暫時無法處理，請稍後再試' : err.message,
+    ...(err.code === 'PASSWORD_CHANGE_REQUIRED' ? { code: 'PASSWORD_CHANGE_REQUIRED' } : {}),
+  });
 });
 
 /* =========================
@@ -1486,6 +1463,7 @@ async function start() {
     // The versioned, non-destructive migration must be applied before release.
     await q('select order_date, order_batch, revision, payment_updated_at, payment_updated_by from orders limit 0');
     await q('select revision, payment_updated_at, payment_updated_by from preorders limit 0');
+    await q('select must_change_password from users limit 0');
     if (durableLimits) {
       await q('select bucket, hits, expires_at from lunch_security.rate_limits limit 0');
       const prune = () => pruneRateLimits((sql, params) => pool.query(sql, params))
@@ -1493,7 +1471,8 @@ async function start() {
       await prune();
       setInterval(prune, 60_000).unref();
     }
-    await seed();
+    // Account installation is deliberately separate from normal startup.
+    // See npm run bootstrap:admin -- --initialize-empty for a pristine system.
     console.log('[tz check]', zonedNowInfo());
     return app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
   } catch (e) {

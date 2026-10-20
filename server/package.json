@@ -5,8 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "bootstrap:admin": "node scripts/bootstrap-admin.js",
     "assets": "node scripts/stamp-assets.js",
-    "check": "node --check server.js && node --check security.js && node --check payments.js && node --check users.js && node --check rate-store.js && node --check ../docs/app.js && node scripts/check-public-safety.js",
+    "check": "node --check server.js && node --check security.js && node --check account-credentials.js && node --check bootstrap.js && node --check scripts/bootstrap-admin.js && node --check payments.js && node --check users.js && node --check rate-store.js && node --check ../docs/app.js && node scripts/check-public-safety.js",
     "test": "node --test --test-concurrency=1 test/*.test.js",
     "test:ui": "playwright test"
   },

@@ -45,11 +45,16 @@ function joinedOrders(rows) {
   return result;
 }
 
-function assertReference(body, order, context, required = true) {
-  if (!required && body.version === undefined && body.orderId === undefined && body.batch === undefined) return;
-  if (!Number.isInteger(body.version) || body.version < 0 || !validDate(body.date) ||
-      (body.orderId !== null && (!Number.isInteger(body.orderId) || body.orderId < 1))) {
-    throw badRequest('缺少有效的訂單版本，請重新載入後操作。');
+function assertReference(body, order, context) {
+  // Every write must identify the exact snapshot it edits, including the first
+  // write (null ID / revision 0) and preorders (an explicit null batch). There
+  // is no compatibility path for clients that omit version information.
+  const fields = ['orderId', 'version', 'date', 'batch'];
+  if (!body || typeof body !== 'object' || fields.some(key => !Object.hasOwn(body, key)) ||
+      !Number.isSafeInteger(body.version) || body.version < 0 || body.version > 2_147_483_647 || !validDate(body.date) ||
+      (body.orderId !== null && (!Number.isSafeInteger(body.orderId) || body.orderId < 1 || body.orderId > 2_147_483_647)) ||
+      (body.batch !== null && (typeof body.batch !== 'string' || !body.batch.length || body.batch.length > 128))) {
+    throw badRequest('缺少有效的訂單版本資訊（orderId、version、date、batch），請重新載入頁面後再操作。');
   }
   if (body.orderId !== (order?.id ?? null) || body.version !== (order?.revision ?? 0) ||
       body.date !== context.date || (body.batch ?? null) !== (context.batch ?? null)) throw conflict();
