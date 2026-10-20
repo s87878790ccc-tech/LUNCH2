@@ -22,6 +22,14 @@ const token = (id, role = "user", username = String(id)) =>
   issueToken({ id, role, username, password_hash: fixtureHash, auth_version: 0 }, process.env.JWT_SECRET);
 const as = (r, value = admin) => r.set("Authorization", `Bearer ${value}`);
 const item = { name: "雞腿飯", unitPrice: 95, qty: 2 };
+// Valid clients first read the server context. Tests that intentionally forge
+// or omit references still send their exact payload without this helper.
+const referenceFor = async (route, body, credential = admin) => {
+  const current = (await as(request(app).get(route), credential).expect(200)).body;
+  const { orderId, version, date, batch } = current;
+  return { orderId, version, date, batch, ...body };
+};
+
 
 before(async () => {
   // pg-mem runs these requests serially; PostgreSQL owns real advisory-lock semantics.
@@ -33,7 +41,7 @@ before(async () => {
   });
   db.public.registerEquivalentType({ name: 'float8', equivalentTo: DataType.float, isValid: () => true });
   db.public.none(`
-    create table users(id serial primary key, username text unique, password_hash text, role text, status text, auth_version integer not null default 0, created_at timestamptz default now(), updated_at timestamptz default now(), last_login_at timestamptz);
+    create table users(id serial primary key, username text unique, password_hash text, role text, status text, auth_version integer not null default 0, must_change_password boolean not null default false, created_at timestamptz default now(), updated_at timestamptz default now(), last_login_at timestamptz);
     -- pg-mem cannot cast DATE to TEXT; real PostgreSQL integration tests cover
     -- that driver conversion, migration and row-lock behavior separately.
     create table settings(id integer primary key, active_menu_id integer, open_days integer[], open_start text, open_end text, manual_locked boolean not null default false, order_date text not null default '${businessDate()}', order_batch text not null default 'legacy');
@@ -75,7 +83,14 @@ before(async () => {
   }
   backup = db.backup();
 });
-beforeEach(() => backup.restore());
+beforeEach(async () => {
+  backup.restore();
+  // The imported app uses in-memory limiters. Isolate their state between
+  // cases while retaining every limiter invocation within each test.
+  const route = app._router.stack.find(layer => layer.route?.path === '/api/users/:id/password')?.route;
+  for (const layer of route?.stack || []) if (typeof layer.handle.resetKey === 'function')
+    for (const id of ['1', '2', '3', '4', '5']) await layer.handle.resetKey(id);
+});
 after(async () => {
   await memoryPool.end();
   await pool.end();
@@ -109,7 +124,7 @@ test("one admin request returns all 36 seats; normal users cannot read it", asyn
 
 test("saving a valid order and clearing it updates submitted and paid consistently", async () => {
   await as(request(app).put("/api/orders/2"), user)
-    .send({ items: [item], internalOnly: false, paid: true })
+    .send(await referenceFor("/api/orders/2", { items: [item], internalOnly: false, paid: true }, user))
     .expect(200);
   let res = await as(request(app).get("/api/orders/2"), user).expect(200);
   assert.equal(res.body.items[0].qty, 2);
@@ -119,7 +134,7 @@ test("saving a valid order and clearing it updates submitted and paid consistent
     .send({ ...res.body, paid: true })
     .expect(200);
   await as(request(app).put("/api/orders/2"), user)
-    .send({ items: [], internalOnly: false })
+    .send(await referenceFor("/api/orders/2", { items: [], internalOnly: false }, user))
     .expect(200);
   res = await as(request(app).get("/api/orders/2"), user).expect(200);
   assert.equal(res.body.paid, false);
@@ -128,7 +143,7 @@ test("saving a valid order and clearing it updates submitted and paid consistent
 
 test("an invalid update cannot erase a previously valid order", async () => {
   await as(request(app).put("/api/orders/2"), user)
-    .send({ items: [item] })
+    .send(await referenceFor("/api/orders/2", { items: [item] }, user))
     .expect(200);
   for (const invalid of [
     { qty: 0 },
@@ -137,7 +152,7 @@ test("an invalid update cannot erase a previously valid order", async () => {
     { name: "" },
   ]) {
     await as(request(app).put("/api/orders/2"), user)
-      .send({ items: [{ ...item, ...invalid }] })
+      .send(await referenceFor("/api/orders/2", { items: [{ ...item, ...invalid }] }, user))
       .expect(400);
   }
   const res = await as(request(app).get("/api/orders/2"), user).expect(200);
@@ -165,7 +180,7 @@ test("invalid IDs, seats, dates and pagination produce JSON validation errors", 
 
 test("the preorder unpaid route is reachable ahead of the generic seat route", async () => {
   await as(request(app).put("/api/preorders/2026-10-20/2"), user)
-    .send({ items: [item] })
+    .send(await referenceFor("/api/preorders/2026-10-20/2", { items: [item] }, user))
     .expect(200);
   const res = await as(
     request(app).get("/api/preorders/2026-10-20/unpaid"),
@@ -176,7 +191,7 @@ test("the preorder unpaid route is reachable ahead of the generic seat route", a
     403,
   );
   await as(request(app).put("/api/preorders/2026-10-21/2"), user)
-    .send({ items: [item] })
+    .send(await referenceFor("/api/preorders/2026-10-21/2", { items: [item] }, user))
     .expect(403);
 });
 
@@ -256,12 +271,12 @@ test("successful logins sharing a classroom IP do not exhaust another student’
   }
 });
 
-test("bcrypt passwords exceeding its 72-byte input limit are rejected at creation", async () => {
+test("caller-selected initial passwords and chosen passwords exceeding 72 bytes are rejected", async () => {
   await as(request(app).post("/api/users"))
     .send({ username: "new", password: "a".repeat(73) })
     .expect(400);
-  await as(request(app).put("/api/users/2/password"))
-    .send({ newPassword: "字".repeat(25) })
+  await as(request(app).put("/api/users/2/password"), user)
+    .send({ oldPassword: "test-password", newPassword: "字".repeat(25) })
     .expect(400);
 });
 
@@ -275,7 +290,7 @@ test("an audit insert failure does not report an already committed order as fail
   console.error = () => {};
   try {
     await as(request(app).put("/api/orders/2"), user)
-      .send({ items: [item] })
+      .send(await referenceFor("/api/orders/2", { items: [item] }, user))
       .expect(200);
     assert.equal(db.public.one("select count(*) as n from order_items").n, 1);
   } finally {
@@ -333,10 +348,10 @@ test("JWTs and authentication responses contain no passwords or password hashes"
 });
 
 test("a password reset immediately revokes old sessions without changing another account", async () => {
-  await as(request(app).put('/api/users/2/password')).send({ newPassword: 'new-local-password' }).expect(200);
+  const reset = await as(request(app).put('/api/users/2/password')).send({ resetTemporary: true, actorPassword: 'test-password' }).expect(200);
   await as(request(app).get('/api/auth/me'), user).expect(401);
   await as(request(app).get('/api/auth/me')).expect(200);
-  const login = await request(app).post('/api/auth/login').send({ username: '2', password: 'new-local-password' }).expect(200);
+  const login = await request(app).post('/api/auth/login').send({ username: '2', password: reset.body.initialPassword }).expect(200);
   await as(request(app).get('/api/auth/me'), login.body.token).expect(200);
 });
 
@@ -370,15 +385,15 @@ test("SQL injection and disabled-account login use the same generic credential e
 test("locking manual ordering rejects client price tampering for orders and preorders", async () => {
   await as(request(app).put('/api/settings/manual-order')).send({ locked: true }).expect(200);
   for (const route of ['/api/orders/2', '/api/preorders/2026-10-20/2']) {
-    await as(request(app).put(route), user).send({ items: [item] }).expect(200);
+    await as(request(app).put(route), user).send(await referenceFor(route, { items: [item] }, user)).expect(200);
     for (const row of [{ ...item, unitPrice: 1 }, { ...item, name: '未列入菜單的餐點' }]) {
-      await as(request(app).put(route), user).send({ items: [row] }).expect(403);
+      await as(request(app).put(route), user).send(await referenceFor(route, { items: [row] }, user)).expect(403);
     }
     const saved = await as(request(app).get(route), user).expect(200);
     assert.equal(saved.body.items[0].unitPrice, 95);
     assert.equal(saved.body.items[0].qty, 2);
   }
-  await as(request(app).put('/api/orders/3')).send({ items: [{ name: '管理員手動餐點', unitPrice: 55, qty: 1 }] }).expect(200);
+  await as(request(app).put('/api/orders/3')).send(await referenceFor('/api/orders/3', { items: [{ name: '管理員手動餐點', unitPrice: 55, qty: 1 }] }, admin)).expect(200);
 });
 
 test("manual ordering stays available until an administrator locks it", async () => {
@@ -386,19 +401,19 @@ test("manual ordering stays available until an administrator locks it", async ()
   await as(request(app).put('/api/settings/manual-order'), user).send({ locked: true }).expect(403);
   await as(request(app).put('/api/settings/manual-order')).send({ locked: 'false' }).expect(400);
   for (const route of ['/api/orders/2', '/api/preorders/2026-10-20/2']) {
-    await as(request(app).put(route), user).send({ items: [manual] }).expect(200);
+    await as(request(app).put(route), user).send(await referenceFor(route, { items: [manual] }, user)).expect(200);
   }
   await as(request(app).put('/api/settings/manual-order')).send({ locked: true }).expect(200);
   for (const route of ['/api/orders/2', '/api/preorders/2026-10-20/2']) {
-    await as(request(app).put(route), user).send({ items: [{ ...manual, qty: 2 }] }).expect(403);
-    await as(request(app).put(route), user).send({ items: [] }).expect(403);
-    await as(request(app).put(route), user).send({ items: [manual, item] }).expect(200);
+    await as(request(app).put(route), user).send(await referenceFor(route, { items: [{ ...manual, qty: 2 }] }, user)).expect(403);
+    await as(request(app).put(route), user).send(await referenceFor(route, { items: [] }, user)).expect(403);
+    await as(request(app).put(route), user).send(await referenceFor(route, { items: [manual, item] }, user)).expect(200);
     const saved = await as(request(app).get(route), user).expect(200);
     assert.equal(saved.body.items.length, 2);
-    await as(request(app).put(route)).send({ items: [{ ...manual, qty: 2 }] }).expect(200);
+    await as(request(app).put(route)).send(await referenceFor(route, { items: [{ ...manual, qty: 2 }] }, admin)).expect(200);
   }
   await as(request(app).put('/api/settings/manual-order')).send({ locked: false }).expect(200);
-  await as(request(app).put('/api/orders/2'), user).send({ items: [] }).expect(200);
+  await as(request(app).put('/api/orders/2'), user).send(await referenceFor('/api/orders/2', { items: [] }, user)).expect(200);
 });
 
 test("image uploads reject forged MIME types and oversized multipart files", async () => {
@@ -448,7 +463,7 @@ test("failed login attempts are throttled without affecting normal successful lo
 
 test("new account and password changes reject short passwords without replacing existing credentials", async () => {
   await as(request(app).post('/api/users')).send({ username: 'new-local-user', password: 'short', role: 'user' }).expect(400);
-  await as(request(app).put('/api/users/2/password')).send({ newPassword: 'short' }).expect(400);
+  await as(request(app).put('/api/users/2/password'), user).send({ oldPassword: 'test-password', newPassword: 'short' }).expect(400);
   await as(request(app).get('/api/auth/me'), user).expect(200);
 });
 
@@ -468,14 +483,14 @@ test('pentest: an administrator revoked after middleware cannot finish creating 
   let revoked = false;
   pool.query = async (sql, args) => {
     const result = await query(sql, args);
-    if (!revoked && sql.startsWith('select id, username, role, status, password_hash, auth_version from users') && args[0] === 3) {
+    if (!revoked && sql.startsWith('select id, username, role, status, password_hash, auth_version') && args[0] === 3) {
       revoked = true;
       await query("update users set role='user',auth_version=auth_version+1 where id=3");
     }
     return result;
   };
   try {
-    const result = await as(request(app).post('/api/users'), token3).send({ username: 'revoked-admin-canary', password: 'isolated-pentest-long-password' });
+    const result = await as(request(app).post('/api/users'), token3).send({ username: 'revoked-admin-canary' });
     assert.ok([401, 403].includes(result.status), `revoked administrator returned ${result.status}`);
     assert.equal(db.public.one("select count(*) n from users where username='revoked-admin-canary'").n, 0);
   } finally { pool.query = query; }
@@ -496,55 +511,73 @@ test('pentest: a delayed self password change cannot overwrite a newer administr
   try {
     delayed = as(request(app).put('/api/users/2/password'), user).send({ oldPassword: 'test-password', newPassword: stalePassword }).then(result => result);
     await enteredGate;
-    await as(request(app).put('/api/users/2/password')).send({ newPassword: 'isolated-new-admin-reset-password' }).expect(200);
+    const reset = await as(request(app).put('/api/users/2/password')).send({ resetTemporary: true, actorPassword: 'test-password' }).expect(200);
     release();
     const result = await delayed;
     assert.ok([401, 409].includes(result.status), `outdated credential write returned ${result.status}`);
     const current = db.public.one('select password_hash from users where id=2');
-    assert.ok(await bcrypt.compare('isolated-new-admin-reset-password', current.password_hash));
+    assert.ok(await bcrypt.compare(reset.body.initialPassword, current.password_hash));
   } finally { release(); bcrypt.hash = originalHash; if (delayed) await delayed; }
 });
 
 const readOrder = async (route = '/api/orders/2') => (await as(request(app).get(route)).expect(200)).body;
 const markPaid = (route, order, paid = true) => as(request(app).put(route + '/paid')).send({ ...order, paid });
+const createActivatedUser = async (username, password = 'abcdef', role = 'user') => {
+  const created = await as(request(app).post('/api/users')).send({ username, role }).expect(200);
+  assert.equal(created.body.mustChangePassword, true);
+  assert.equal(typeof created.body.initialPassword, 'string');
+  assert.ok(created.body.initialPassword.length >= 24);
+  const initial = await request(app).post('/api/auth/login').send({ username: created.body.username, password: created.body.initialPassword }).expect(200);
+  assert.equal(initial.body.user.mustChangePassword, true);
+  await as(request(app).put(`/api/users/${created.body.id}/password`), initial.body.token)
+    .send({ oldPassword: created.body.initialPassword, newPassword: password }).expect(200);
+  await as(request(app).get('/api/auth/me'), initial.body.token).expect(401);
+  const login = await request(app).post('/api/auth/login').send({ username: created.body.username, password }).expect(200);
+  assert.equal(login.body.user.mustChangePassword, false);
+  return { created, login };
+};
 
-test('ordinary account passwords accept six through thirteen characters; five is rejected', async () => {
+
+test('ordinary account chosen passwords accept six through thirteen characters; five is rejected', async () => {
   const before = db.public.one('select count(*) as n from users').n;
-  const rejected = await as(request(app).post('/api/users')).send({ username: 'pw5', password: 'abcde' }).expect(400);
+  const rejected = await as(request(app).put('/api/users/2/password'), user).send({ oldPassword: 'test-password', newPassword: 'abcde' }).expect(400);
   assert.match(rejected.body.message, /6 個字元/);
   for (let length = 6; length <= 13; length++) {
     const username = `pw${length}`, password = 'x'.repeat(length);
-    const created = await as(request(app).post('/api/users')).send({ username, password, role: 'user' }).expect(200);
+    const { created, login } = await createActivatedUser(username, password);
     assert.equal(created.body.status, 'active');
     assert.equal('password_hash' in created.body, false);
-    const login = await request(app).post('/api/auth/login').send({ username, password }).expect(200);
     assert.equal(login.body.user.id, created.body.id);
     const list = await as(request(app).get('/api/users?pageSize=100')).expect(200);
     assert.ok(list.body.users.some(u => u.id === created.body.id));
+    assert.ok(list.body.users.every(u => !('initialPassword' in u)));
   }
   assert.equal(db.public.one('select count(*) as n from users').n, before + 8);
 });
 
-test('password resets and self changes use the target role policy and revoke old sessions', async () => {
-  const failed = await as(request(app).put('/api/users/2/password')).send({ newPassword: '12345' }).expect(400);
+test('temporary resets and chosen passwords enforce role policy and revoke old sessions', async () => {
+  const failed = await as(request(app).put('/api/users/2/password'), user).send({ oldPassword: 'test-password', newPassword: '12345' }).expect(400);
   assert.match(failed.body.message, /6 個字元/);
-  for (const newPassword of ['123456', '1234567', '12345678', '123456789', '1234567890', '12345678901', '123456789012', '1234567890123']) {
-    await as(request(app).put('/api/users/2/password')).send({ newPassword }).expect(200);
-    await request(app).post('/api/auth/login').send({ username: '2', password: newPassword }).expect(200);
-  }
-  const login = await request(app).post('/api/auth/login').send({ username: '2', password: '1234567890123' }).expect(200);
-  await as(request(app).put('/api/users/2/password'), login.body.token).send({ oldPassword: '1234567890123', newPassword: 'abcdef' }).expect(200);
+  const reset = await as(request(app).put('/api/users/2/password')).send({ resetTemporary: true, actorPassword: 'test-password' }).expect(200);
+  await as(request(app).get('/api/auth/me'), user).expect(401);
+  const initial = await request(app).post('/api/auth/login').send({ username: '2', password: reset.body.initialPassword }).expect(200);
+  await as(request(app).put('/api/users/2/password'), initial.body.token).send({ oldPassword: reset.body.initialPassword, newPassword: 'abcdef' }).expect(200);
+  const login = await request(app).post('/api/auth/login').send({ username: '2', password: 'abcdef' }).expect(200);
+  await as(request(app).put('/api/users/2/password'), login.body.token).send({ oldPassword: 'abcdef', newPassword: 'zyxwvu' }).expect(200);
   await as(request(app).get('/api/auth/me'), login.body.token).expect(401);
-  await request(app).post('/api/auth/login').send({ username: '2', password: 'abcdef' }).expect(200);
-  await as(request(app).put('/api/users/1/password')).send({ newPassword: '123456' }).expect(400);
-  await as(request(app).post('/api/users')).send({ username: 'new-admin', password: '123456', role: 'admin' }).expect(400);
-  await as(request(app).post('/api/users')).send({ username: 'new-admin', password: '123456789012', role: 'admin' }).expect(200);
+  await request(app).post('/api/auth/login').send({ username: '2', password: 'zyxwvu' }).expect(200);
+  const adminShort = await as(request(app).put('/api/users/1/password')).send({ oldPassword: 'test-password', newPassword: '123456' }).expect(400);
+  assert.match(adminShort.body.message, /12 個字元/);
+  const created = await as(request(app).post('/api/users')).send({ username: 'new-admin', role: 'admin', actorPassword: 'test-password' }).expect(200);
+  const temporary = await request(app).post('/api/auth/login').send({ username: 'new-admin', password: created.body.initialPassword }).expect(200);
+  const short = await as(request(app).put(`/api/users/${created.body.id}/password`), temporary.body.token).send({ oldPassword: created.body.initialPassword, newPassword: 'abcdef' }).expect(400);
+  assert.match(short.body.message, /12 個字元/);
+  await as(request(app).put(`/api/users/${created.body.id}/password`), temporary.body.token).send({ oldPassword: created.body.initialPassword, newPassword: '123456789012' }).expect(200);
 });
 
 test('numeric seats beyond 36 join ordering, preorders, reports and payment without changing old orders', async () => {
-  const created = await as(request(app).post('/api/users')).send({ username: '３７', password: 'abcdef' }).expect(200);
+  const { created, login } = await createActivatedUser('３７');
   assert.equal(created.body.username, '37');
-  const login = await request(app).post('/api/auth/login').send({ username: '37', password: 'abcdef' }).expect(200);
   const seats = await as(request(app).get('/api/seats'), login.body.token).expect(200);
   assert.ok(seats.body.seats.includes(37));
   const first = await as(request(app).get('/api/orders/37'), login.body.token).expect(200);
@@ -564,14 +597,14 @@ test('numeric seats beyond 36 join ordering, preorders, reports and payment with
 });
 
 test('duplicate, parallel and numeric-alias creations cannot produce duplicate seat accounts', async () => {
-  const body = { username: '38', password: 'abcdef', role: 'user' };
+  const body = { username: '38', role: 'user' };
   const responses = await Promise.all([as(request(app).post('/api/users')).send(body), as(request(app).post('/api/users')).send(body)]);
   assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
   assert.equal(db.public.one("select count(*) as n from users where username='38'").n, 1);
   for (const username of ['02', '2.0', '2e0', '0x2', '0', '2147483648'])
-    await as(request(app).post('/api/users')).send({ username, password: 'abcdef' }).expect(400);
-  await as(request(app).post('/api/users')).send({ username: '２', password: 'abcdef' }).expect(409);
-  await as(request(app).post('/api/users')).send({ username: 'bad-role', password: 'abcdef', role: 'owner' }).expect(400);
+    await as(request(app).post('/api/users')).send({ username }).expect(400);
+  await as(request(app).post('/api/users')).send({ username: '２' }).expect(409);
+  await as(request(app).post('/api/users')).send({ username: 'bad-role', role: 'owner' }).expect(400);
 });
 
 test('a failed account insert does not leave an account or a success response', async () => {
@@ -582,7 +615,7 @@ test('a failed account insert does not leave an account or a success response', 
   };
   console.error = () => {};
   try {
-    await as(request(app).post('/api/users')).send({ username: 'fail-canary', password: 'abcdef' }).expect(500);
+    await as(request(app).post('/api/users')).send({ username: 'fail-canary' }).expect(500);
     assert.equal(db.public.one("select count(*) as n from users where username='fail-canary'").n, 0);
   } finally { pool.connect = connect; console.error = originalLog; }
 });
@@ -601,7 +634,7 @@ test('user pagination, search, filters and no-store responses cover more than on
 });
 
 test('payment markers persist per order, can be reversed, and record the real administrator', async () => {
-  for (const seat of [2, 3]) await as(request(app).put(`/api/orders/${seat}`)).send({ items: [item] }).expect(200);
+  for (const seat of [2, 3]) await as(request(app).put(`/api/orders/${seat}`)).send(await referenceFor(`/api/orders/${seat}`, { items: [item] }, admin)).expect(200);
   const before = await readOrder();
   const saved = await as(request(app).put('/api/orders/2/paid')).send({ ...before, paid: true, paymentUpdatedBy: 999 }).expect(200);
   assert.equal(saved.body.order.paid, true);
@@ -623,7 +656,7 @@ test('empty seats cannot create orders through the payment API', async () => {
 });
 
 test('payment API rejects unauthenticated users, students, stale versions and forged context', async () => {
-  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  await as(request(app).put('/api/orders/2')).send(await referenceFor('/api/orders/2', { items: [item] }, admin)).expect(200);
   const before = await readOrder();
   await request(app).put('/api/orders/2/paid').send({ ...before, paid: true }).expect(401);
   await as(request(app).put('/api/orders/2/paid'), user).send({ ...before, paid: true }).expect(403);
@@ -639,7 +672,7 @@ test('payment API rejects unauthenticated users, students, stale versions and fo
 });
 
 test('changing order contents invalidates payment; an unchanged save does not', async () => {
-  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  await as(request(app).put('/api/orders/2')).send(await referenceFor('/api/orders/2', { items: [item] }, admin)).expect(200);
   let saved = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
   await as(request(app).put('/api/orders/2')).send(saved).expect(200);
   assert.equal((await readOrder()).paid, true);
@@ -654,7 +687,7 @@ test('changing order contents invalidates payment; an unchanged save does not', 
 });
 
 test('a new round preserves prior orders and payments while rejecting old checkbox requests', async () => {
-  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  await as(request(app).put('/api/orders/2')).send(await referenceFor('/api/orders/2', { items: [item] }, admin)).expect(200);
   const paid = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
   await as(request(app).delete('/api/orders/today')).send({ date: paid.date, batch: paid.batch }).expect(200);
   const current = await readOrder();
@@ -671,7 +704,7 @@ test('a new round preserves prior orders and payments while rejecting old checkb
 });
 
 test('a new business date starts a separate batch without inheriting payment', async () => {
-  await as(request(app).put('/api/orders/2')).send({ items: [item] }).expect(200);
+  await as(request(app).put('/api/orders/2')).send(await referenceFor('/api/orders/2', { items: [item] }, admin)).expect(200);
   const paid = (await markPaid('/api/orders/2', await readOrder()).expect(200)).body.order;
   await pool.query("update settings set order_date='2000-01-01' where id=1");
   await pool.query("update orders set order_date='2000-01-01' where id=$1", [paid.orderId]);
@@ -684,7 +717,7 @@ test('a new business date starts a separate batch without inheriting payment', a
 });
 
 test('preorder payment is isolated by date and invalidates after an order edit', async () => {
-  for (const date of ['2026-10-20', '2026-10-21']) await as(request(app).put(`/api/preorders/${date}/2`)).send({ items: [item] }).expect(200);
+  for (const date of ['2026-10-20', '2026-10-21']) await as(request(app).put(`/api/preorders/${date}/2`)).send(await referenceFor(`/api/preorders/${date}/2`, { items: [item] }, admin)).expect(200);
   const route = '/api/preorders/2026-10-20/2';
   const saved = (await markPaid(route, await readOrder(route)).expect(200)).body.order;
   assert.equal((await readOrder('/api/preorders/2026-10-21/2')).paid, false);

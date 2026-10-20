@@ -91,7 +91,6 @@ const logCategoryHint = document.getElementById('logCategoryHint');
 let logsCache = null;
 
 const newUserName = document.getElementById('newUserName');
-const newUserPass = document.getElementById('newUserPass');
 const newUserRole = document.getElementById('newUserRole');
 const createUserBtn = document.getElementById('createUserBtn');
 const usersTableBody = document.getElementById('usersTableBody');
@@ -331,6 +330,7 @@ function authHeader() {
 function showLogin(options = {}) {
   const { keepLoading = false } = options;
   if (!loginLayer || !app) return;
+  hideInitialPasswordChange();
   setLoginLoading(!!keepLoading);
   loginLayer.classList.remove('hidden');
   loginLayer.style.display = 'flex';
@@ -344,6 +344,7 @@ function showLogin(options = {}) {
   }
 }
 function showApp() {
+  if (state.me?.mustChangePassword) return showInitialPasswordChange();
   if (!loginLayer || !app) return;
   loginLayer.classList.add('hidden');
   loginLayer.style.display = 'none';
@@ -383,6 +384,8 @@ listen(document.getElementById('loginForm'), 'submit', async (event) => {
     token = data.token;
     storeToken(token);
     onLoginUser(data.user);
+    loginPass.value = '';
+    if (data.user?.mustChangePassword) { showInitialPasswordChange(); return; }
     await Promise.all([fetchOpenStatus(), fetchPreSettings()]);
     ensurePreorderUI();          // 初始化預訂頁
     ensureUnpaidUI();            // 注入未付款卡片
@@ -395,13 +398,15 @@ listen(document.getElementById('loginForm'), 'submit', async (event) => {
     setLoginLoading(false);
   }
 });
-logoutBtn.onclick = async () => {
+async function signOut() {
   if (logoutBtn.disabled) return;
   logoutBtn.disabled = true;
   try { await api('/auth/logout', { method: 'POST', timeoutMs: 8000 }); }
   catch { /* Always remove this browser's session if the connection fails. */ }
   finally { clearSession(); showLogin(); logoutBtn.disabled = false; }
-};
+}
+logoutBtn.onclick = signOut;
+listen(document.getElementById('initialPasswordLogout'), 'click', signOut);
 
 /* =========================
    API helper
@@ -434,6 +439,9 @@ async function api(path, options = {}) {
         showLogin();
       }
       if (!res.ok) {
+        if (res.status === 403 && data?.code === 'PASSWORD_CHANGE_REQUIRED' && state.me && requestToken === token) {
+          state.me.mustChangePassword = true; showInitialPasswordChange();
+        }
         const messages = {
           'invalid credentials': '帳號或密碼不正確', 'account disabled': '帳號已停用',
           'invalid token': '登入已過期，請重新登入', 'no token': '請先登入',
@@ -529,6 +537,8 @@ function listen(element, type, handler) {
 function resetClientState() {
   sessionEpoch += 1;
   state.me = null;
+  closeCredentialDialog(true);
+  hideInitialPasswordChange();
   state.seats = baseSeats();
   usersView.rows = []; usersView.generation++; usersView.lastCreated = null;
   for (const id of ['createUserStatus', 'usersLoadStatus']) document.getElementById(id).textContent = '';
@@ -552,7 +562,7 @@ function resetClientState() {
   document.getElementById('paymentContext').textContent = '';
   document.getElementById('preDate').value = '';
   for (const node of [allSeatsGrid, usersTableBody, logsTableBody, aggTableBody, bySeatTBody, orderTableBody, document.querySelector('#preTable tbody')]) node?.replaceChildren();
-  for (const id of ['unpaidOrdersList', 'unpaidPreList', 'missingList', 'newUserPass']) {
+  for (const id of ['unpaidOrdersList', 'unpaidPreList', 'missingList', 'newAdminActorPassword']) {
     const element = document.getElementById(id);
     if (element?.tagName === 'INPUT') element.value = '';
     else if (element) element.textContent = '';
@@ -640,6 +650,7 @@ function onLoginUser(user){
   state.me = user;
   whoami.textContent = `${user.username}（${user.role}）`;
   const admin = isAdmin();
+  document.getElementById('changeMyPasswordBtn').classList.toggle('hidden', !!user.mustChangePassword);
 
   // 顯示/隱藏各頁籤
   tabLogs.classList.toggle('hidden', !admin);
@@ -1020,6 +1031,7 @@ listen(allSeatsGrid, 'change', async (event, requested) => {
    UI 切頁
    ========================= */
 function switchTab(which){
+  if (state.me?.mustChangePassword) return showInitialPasswordChange();
   if (!isAdmin() && ['menus', 'reports', 'logs'].includes(which)) return;
   if (which === 'preorders' && !isAdmin() && !state.pre.settings.enabled) return;
   const map = {
@@ -1996,6 +2008,150 @@ logCategoryFilter?.addEventListener('change', () => {
 
 async function getLogs(){ return api('/logs'); }
 
+// Credentials stay in password inputs only; never persist them with client state.
+let credentialAction = null;
+let credentialReturnFocus = null;
+let credentialSubmitting = false;
+function hideInitialPasswordChange() {
+  const layer = document.getElementById('passwordChangeLayer');
+  layer.classList.add('hidden'); layer.setAttribute('aria-hidden', 'true');
+  document.getElementById('initialPasswordForm').reset();
+  document.getElementById('initialPasswordStatus').textContent = '';
+}
+function showInitialPasswordChange() {
+  closeCredentialDialog(true);
+  loginLayer.classList.add('hidden'); loginLayer.style.display = 'none'; loginLayer.setAttribute('aria-hidden', 'true');
+  app.classList.add('hidden'); app.setAttribute('aria-hidden', 'true'); app.inert = true;
+  const layer = document.getElementById('passwordChangeLayer');
+  layer.classList.remove('hidden'); layer.setAttribute('aria-hidden', 'false');
+  document.getElementById('initialPasswordAccount').textContent = `帳號：${state.me?.username || ''}`;
+  document.getElementById('initialPasswordHint').textContent = passwordHint(state.me?.role) + '新密碼不可與臨時密碼相同。';
+  document.getElementById('initialNewPassword').minLength = isAdmin() ? 12 : 6;
+  document.getElementById('initialPasswordStatus').textContent = '';
+  requestAnimationFrame(() => document.getElementById('initialOldPassword').focus());
+}
+function clearCredentialInputs() {
+  for (const id of ['credentialActorPassword', 'credentialNewPassword', 'credentialConfirmPassword', 'initialCredentialValue', 'newAdminActorPassword']) document.getElementById(id).value = '';
+  document.getElementById('initialCredentialValue').type = 'password';
+  document.getElementById('credentialReveal').textContent = '顯示臨時密碼';
+  document.getElementById('credentialReveal').setAttribute('aria-pressed', 'false');
+}
+function closeCredentialDialog(force = false) {
+  if (credentialSubmitting && !force) return;
+  const dialog = document.getElementById('credentialDialog');
+  clearCredentialInputs(); credentialAction = null; credentialSubmitting = false;
+  document.getElementById('credentialDialogStatus').textContent = '';
+  document.getElementById('credentialActionSubmit').disabled = false;
+  document.getElementById('credentialClose').disabled = false;
+  if (dialog.open && typeof dialog.close === 'function') dialog.close();
+  else dialog.removeAttribute('open');
+  app.inert = false;
+  if (credentialReturnFocus?.isConnected && !app.classList.contains('hidden')) credentialReturnFocus.focus();
+  credentialReturnFocus = null;
+}
+function showCredentialDialog() {
+  const dialog = document.getElementById('credentialDialog');
+  if (!dialog.open) {
+    credentialReturnFocus = document.activeElement;
+    if (typeof dialog.showModal === 'function') dialog.showModal();
+    else dialog.setAttribute('open', '');
+  }
+  app.inert = true;
+}
+function showInitialCredential(user, initialPassword) {
+  clearCredentialInputs(); credentialAction = null;
+  document.getElementById('credentialActionForm').classList.add('hidden');
+  document.getElementById('initialCredentialPanel').classList.remove('hidden');
+  document.getElementById('credentialDialogTitle').textContent = `帳號「${user.username}」的臨時密碼`;
+  document.getElementById('credentialDialogDescription').textContent = '請在私密環境交付給本人。使用者首次登入只能設定個人密碼，完成後才能訂餐或管理。';
+  const valid = typeof initialPassword === 'string' && initialPassword.length > 0;
+  document.getElementById('initialCredentialValue').value = valid ? initialPassword : '';
+  document.getElementById('credentialDialogStatus').textContent = valid ? '關閉後會清除此頁的臨時密碼。' : '未收到可確認的臨時密碼。請勿重複建立帳號；可在清單確認後重新產生。';
+  showCredentialDialog(); document.getElementById('credentialClose').focus();
+}
+function openCredentialAction(kind, user) {
+  if (!state.me || state.me.mustChangePassword) return;
+  if (kind === 'self' ? user.id !== Number(state.me.id) : !isAdmin()) return;
+  clearCredentialInputs();
+  credentialAction = { kind, user: { id: user.id, username: user.username, role: user.role } };
+  const self = kind === 'self', promote = kind === 'promote';
+  document.getElementById('initialCredentialPanel').classList.add('hidden');
+  document.getElementById('credentialActionForm').classList.remove('hidden');
+  document.getElementById('credentialNewPasswordFields').classList.toggle('hidden', !self && !promote);
+  for (const id of ['credentialNewPassword', 'credentialConfirmPassword']) document.getElementById(id).required = self || promote;
+  document.getElementById('credentialNewPassword').minLength = promote || user.role === 'admin' ? 12 : 6;
+  document.getElementById('credentialActorPasswordLabel').textContent = self ? '你的目前密碼' : '你的目前管理員密碼';
+  document.getElementById('credentialPasswordHint').textContent = passwordHint(promote ? 'admin' : user.role);
+  document.getElementById('credentialDialogTitle').textContent = `${self ? '變更我的密碼' : promote ? '升為管理員' : '產生臨時密碼'}：${user.username}`;
+  document.getElementById('credentialDialogDescription').textContent = self ? '變更成功後，所有裝置須使用新密碼重新登入。' : promote ? '請先確認本人身份及升權需求。需要新的管理員密碼；完成後舊密碼與既有登入均失效。' : '請先核對本人身份。此操作會立即撤銷對方登入，產生個別臨時密碼，並要求本人設定個人密碼。';
+  document.getElementById('credentialActionSubmit').textContent = promote ? '確認升為管理員' : self ? '變更密碼' : '產生個別臨時密碼';
+  document.getElementById('credentialDialogStatus').textContent = '';
+  showCredentialDialog(); document.getElementById('credentialActorPassword').focus();
+}
+listen(document.getElementById('changeMyPasswordBtn'), 'click', () => { if (state.me) openCredentialAction('self', state.me); });
+listen(document.getElementById('credentialClose'), 'click', () => closeCredentialDialog());
+listen(document.getElementById('credentialReveal'), 'click', () => {
+  const input = document.getElementById('initialCredentialValue');
+  const reveal = input.type === 'password'; input.type = reveal ? 'text' : 'password';
+  document.getElementById('credentialReveal').textContent = reveal ? '隱藏臨時密碼' : '顯示臨時密碼';
+  document.getElementById('credentialReveal').setAttribute('aria-pressed', String(reveal));
+});
+document.getElementById('credentialDialog').addEventListener('cancel', event => { event.preventDefault(); closeCredentialDialog(); });
+document.getElementById('credentialDialog').addEventListener('close', clearCredentialInputs);
+listen(document.getElementById('initialPasswordForm'), 'submit', async () => {
+  const oldPassword = normalizePassword(document.getElementById('initialOldPassword').value);
+  const newPassword = normalizePassword(document.getElementById('initialNewPassword').value);
+  const confirmation = normalizePassword(document.getElementById('initialConfirmPassword').value);
+  const message = document.getElementById('initialPasswordStatus');
+  const error = accountPasswordError(newPassword, state.me?.role);
+  if (!oldPassword || error || newPassword !== confirmation || oldPassword === newPassword) {
+    message.textContent = !oldPassword ? '請輸入目前臨時密碼' : error || (newPassword !== confirmation ? '兩次新密碼不一致' : '新密碼不可與臨時密碼相同'); return;
+  }
+  const button = document.getElementById('initialPasswordSubmit'); button.disabled = true;
+  const username = state.me?.username;
+  try {
+    await resetPasswordSelf(Number(state.me?.id), oldPassword, newPassword);
+    clearSession(); showLogin(); loginUser.value = username || '';
+    loginMsg.textContent = '個人密碼已設定，請使用新密碼重新登入。';
+  } catch (error) { message.textContent = '設定失敗：' + error.message; }
+  finally { button.disabled = false; }
+});
+listen(document.getElementById('credentialActionForm'), 'submit', async () => {
+  if (!credentialAction || credentialSubmitting || !state.me || state.me.mustChangePassword) return;
+  const action = credentialAction;
+  if (action.kind === 'self' ? action.user.id !== Number(state.me.id) : !isAdmin()) return;
+  const actorPassword = normalizePassword(document.getElementById('credentialActorPassword').value);
+  const newPassword = normalizePassword(document.getElementById('credentialNewPassword').value);
+  const confirmation = normalizePassword(document.getElementById('credentialConfirmPassword').value);
+  const message = document.getElementById('credentialDialogStatus');
+  if (!actorPassword) { message.textContent = '請輸入你的目前密碼'; return; }
+  if (action.kind !== 'reset') {
+    const error = accountPasswordError(newPassword, action.kind === 'promote' ? 'admin' : action.user.role);
+    if (error || newPassword !== confirmation) { message.textContent = error || '兩次新密碼不一致'; return; }
+  }
+  credentialSubmitting = true;
+  document.getElementById('credentialActionSubmit').disabled = true;
+  document.getElementById('credentialClose').disabled = true;
+  try {
+    if (action.kind === 'reset') {
+      const result = await resetPasswordAdmin(action.user.id, actorPassword);
+      clearCredentialInputs(); showInitialCredential(action.user, result.initialPassword); delete result.initialPassword;
+      await loadUsers();
+    } else if (action.kind === 'self') {
+      await resetPasswordSelf(action.user.id, actorPassword, newPassword);
+      clearSession(); showLogin(); loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。';
+    } else {
+      await api(`/users/${action.user.id}/role`, { method: 'PATCH', body: JSON.stringify({ role: 'admin', actorPassword, newPassword }) });
+      closeCredentialDialog(true); await loadUsers(); notify('管理員角色與密碼已更新，對方須重新登入。');
+    }
+  } catch (error) { message.textContent = '操作失敗：' + error.message; document.getElementById('credentialActorPassword').value = ''; }
+  finally {
+    credentialSubmitting = false;
+    document.getElementById('credentialActionSubmit').disabled = false;
+    document.getElementById('credentialClose').disabled = false;
+  }
+});
+
 /* =========================
    使用者頁（抓全部分頁）
    ========================= */
@@ -2010,10 +2166,11 @@ function passwordHint(role) {
   return `${role === 'admin' ? '管理員' : '一般使用者'}密碼至少需要 ${role === 'admin' ? 12 : 6} 個字元；最多 72 個 UTF-8 位元組，前後空白不列入。`;
 }
 function updateCreatePasswordHint() {
-  const role = newUserRole.value;
-  newUserPass.minLength = role === 'admin' ? 12 : 6;
-  newUserPass.placeholder = `${role === 'admin' ? '管理員' : ''}密碼至少需要 ${newUserPass.minLength} 個字元`;
-  document.getElementById('newUserPasswordHint').textContent = passwordHint(role);
+  const admin = newUserRole.value === 'admin';
+  const input = document.getElementById('newAdminActorPassword');
+  input.value = ''; input.required = admin; input.disabled = !admin;
+  document.getElementById('newAdminActorPasswordFields').classList.toggle('hidden', !admin);
+  document.getElementById('newUserPasswordHint').textContent = '系統會個別產生臨時密碼，僅向你顯示一次；使用者首次登入須設定自己的密碼。' + passwordHint(newUserRole.value);
 }
 newUserRole.addEventListener('change', updateCreatePasswordHint);
 updateCreatePasswordHint();
@@ -2038,11 +2195,11 @@ async function fetchAllUsers() {
   }
   throw new Error('使用者清單過大，請聯絡管理員');
 }
-async function createUser(username, password, role){
-  return api('/users', { method:'POST', body: JSON.stringify({ username, password, role })});
+async function createUser(username, role, actorPassword){
+  return api('/users', { method:'POST', body: JSON.stringify({ username, role, ...(role === 'admin' ? { actorPassword } : {}) })});
 }
-async function resetPasswordAdmin(userId, newPassword){
-  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ newPassword })});
+async function resetPasswordAdmin(userId, actorPassword){
+  return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ resetTemporary: true, actorPassword })});
 }
 async function resetPasswordSelf(userId, oldPassword, newPassword){
   return api(`/users/${userId}/password`, { method:'PUT', body: JSON.stringify({ oldPassword, newPassword })});
@@ -2054,7 +2211,6 @@ function userMatchesFilters(user) {
   return user.username.toLocaleLowerCase().includes(search) && (!role || user.role === role) && (!status || user.status === status);
 }
 function renderUsersList() {
-  const drafts = new Map([...usersTableBody.querySelectorAll('input[type="password"]')].map(input => [input.id, input.value]));
   const visible = usersView.rows.filter(userMatchesFilters);
   document.getElementById('usersListTitle').textContent = `使用者列表（顯示 ${visible.length}／共 ${usersView.rows.length} 筆）`;
   const fragment = document.createDocumentFragment();
@@ -2067,18 +2223,16 @@ function renderUsersList() {
     }
     const action = document.createElement('td'); action.dataset.label = '操作';
     const row = document.createElement('div'); row.className = 'row user-actions';
-    const input = document.createElement('input');
-    input.type = 'password'; input.autocomplete = 'new-password'; input.minLength = u.role === 'admin' ? 12 : 6;
-    input.placeholder = `新密碼（至少 ${input.minLength} 個字元）`; input.id = `reset_${u.id}`;
-    input.setAttribute('aria-label', `重設 ${u.username} 的密碼`);
-    input.setAttribute('aria-describedby', `password-hint-${u.id}`);
-    input.value = drafts.get(input.id) || '';
-    row.appendChild(input);
-    const reset = document.createElement('button'); reset.className = 'resetPwd'; reset.dataset.id = u.id; reset.textContent = '重設'; row.appendChild(reset);
+    const self = u.id === Number(state.me?.id);
+    const reset = document.createElement('button'); reset.className = self ? 'changeOwnPwd' : 'resetPwd'; reset.dataset.id = u.id;
+    reset.textContent = self ? '變更我的密碼' : '產生臨時密碼'; row.appendChild(reset);
+    const changeRole = document.createElement('button'); changeRole.className = 'changeRole'; changeRole.dataset.id = u.id;
+    changeRole.textContent = u.role === 'admin' ? '降為一般使用者' : '升為管理員'; changeRole.disabled = self; row.appendChild(changeRole);
     const del = document.createElement('button'); del.className = 'danger delUser'; del.dataset.id = u.id; del.textContent = '刪除';
-    if (u.id === Number(state.me?.id)) { del.disabled = true; del.title = '不可刪除自己'; }
+    if (self) { del.disabled = true; del.title = '不可刪除自己'; }
     row.appendChild(del);
-    const hint = document.createElement('p'); hint.id = `password-hint-${u.id}`; hint.className = 'small muted'; hint.textContent = passwordHint(u.role);
+    const hint = document.createElement('p'); hint.className = 'small muted';
+    hint.textContent = u.mustChangePassword ? '等待本人設定個人密碼；目前僅能變更密碼或登出。' : '重設將撤銷既有登入，並要求本人設定新密碼。';
     action.append(row, hint); tr.appendChild(action); fragment.appendChild(tr);
   }
   if (!visible.length) {
@@ -2130,17 +2284,20 @@ for (const id of ['userSearch', 'userRoleFilter', 'userStatusFilter'])
 listen(document.getElementById('refreshUsers'), 'click', () => loadUsers());
 listen(createUserBtn, 'click', async () => {
   if (!isAdmin()) return;
-  const username = normalizeUsername(newUserName.value), password = normalizePassword(newUserPass.value), role = newUserRole.value;
+  const username = normalizeUsername(newUserName.value), role = newUserRole.value;
+  const actorPassword = normalizePassword(document.getElementById('newAdminActorPassword').value);
   const message = document.getElementById('createUserStatus');
-  const error = accountPasswordError(password, role);
-  if (!username || error) { message.textContent = !username ? '請輸入帳號' : error; return; }
+  if (!username) { message.textContent = '請輸入帳號'; return; }
+  if (role === 'admin' && !actorPassword) { message.textContent = '建立管理員前，請輸入你的目前管理員密碼'; return; }
   usersView.lastCreated = null; usersView.generation++;
   createUserBtn.disabled = true; createUserBtn.textContent = '建立中…'; message.textContent = '正在建立帳號…';
   try {
-    const created = await createUser(username, password, role);
+    const created = await createUser(username, role, actorPassword);
     if (!Number.isInteger(created?.id) || created.username !== username || created.role !== role) throw new Error('帳號建立回應無法確認，請查詢清單');
-    usersView.lastCreated = created;
-    newUserName.value = ''; newUserPass.value = '';
+    usersView.lastCreated = { id: created.id, username: created.username, role: created.role };
+    showInitialCredential(created, created.initialPassword);
+    delete created.initialPassword;
+    newUserName.value = '';
     const loaded = await loadUsers();
     if (!loaded || !usersView.rows.some(u => u.id === created.id)) {
       message.textContent = `帳號「${created.username}」（ID ${created.id}）已建立，但清單尚未同步，請按「更新清單」；不要重複建立。`;
@@ -2151,22 +2308,24 @@ listen(createUserBtn, 'click', async () => {
     const uncertain = !e.status || e.status >= 500;
     if (uncertain) await loadUsers();
     message.textContent = uncertain ? `新增結果尚未確認：${e.message}。請先在清單查詢「${username}」，不要重複送出。` : `建立失敗：${e.message}`;
-  } finally { createUserBtn.disabled = false; createUserBtn.textContent = '建立'; }
+  } finally { document.getElementById('newAdminActorPassword').value = ''; createUserBtn.disabled = false; createUserBtn.textContent = '建立'; }
 });
 listen(usersTableBody, 'click', async e => {
   const t = e.target.closest('button'); if (!t) return;
-  if (t.classList.contains('resetPwd')) {
-    const id = Number(t.dataset.id), input = document.getElementById(`reset_${id}`), user = usersView.rows.find(u => u.id === id);
-    if (!user) return;
-    const pwd = normalizePassword(input.value), error = accountPasswordError(pwd, user.role);
-    if (error) { notify(error, true); return; }
-    t.disabled = true;
-    try {
-      await resetPasswordAdmin(id, pwd); input.value = '';
-      if (id === Number(state.me?.id)) { clearSession(); showLogin(); loginMsg.textContent = '密碼已更新，請使用新密碼重新登入。'; }
-      else notify(`已重設「${user.username}」的密碼`);
-    } catch (err) { notify('重設失敗：' + err.message, true); }
-    finally { t.disabled = false; }
+  if (t.classList.contains('resetPwd') || t.classList.contains('changeOwnPwd')) {
+    const user = usersView.rows.find(u => u.id === Number(t.dataset.id));
+    if (user) openCredentialAction(t.classList.contains('changeOwnPwd') ? 'self' : 'reset', user);
+  }
+  if (t.classList.contains('changeRole')) {
+    const user = usersView.rows.find(u => u.id === Number(t.dataset.id));
+    if (!user || user.id === Number(state.me?.id)) return;
+    if (user.role === 'user') openCredentialAction('promote', user);
+    else if (confirm('確定將這個管理員降為一般使用者？其既有登入會失效。')) {
+      t.disabled = true;
+      try { await api(`/users/${user.id}/role`, { method: 'PATCH', body: JSON.stringify({ role: 'user' }) }); await loadUsers(); notify('角色已更新，既有登入已失效。'); }
+      catch (error) { notify('角色更新失敗：' + error.message, true); }
+      finally { t.disabled = false; }
+    }
   }
   if (t.classList.contains('delUser')) {
     const id = Number(t.dataset.id);
@@ -2772,6 +2931,7 @@ listen(document.getElementById('manualOrderLocked'), 'change', async () => {
 });
 
 async function initApp(){
+  if (state.me?.mustChangePassword) return showInitialPasswordChange();
   await Promise.all([loadMenus(), fetchManualPolicy(), fetchSeats()]);
   renderActiveMenu();
   renderMenuPage();
@@ -2789,7 +2949,7 @@ async function initApp(){
 
 let refreshingView = false;
 async function refreshVisibleView() {
-  if (!token || !state.me || document.hidden || refreshingView || orderQueues.size || paymentPending.size || purgingOrders) return;
+  if (!token || !state.me || state.me.mustChangePassword || document.hidden || refreshingView || orderQueues.size || paymentPending.size || purgingOrders) return;
   if (!pageMenus.classList.contains('hidden') || !pageReports.classList.contains('hidden')) return;
   refreshingView = true;
   const epoch = sessionEpoch;
@@ -2807,7 +2967,7 @@ async function refreshVisibleView() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) runTask(refreshVisibleView); });
 setInterval(() => runTask(refreshVisibleView), 60_000);
 setInterval(() => {
-  if (isAdmin() && token && !document.hidden && !pageOrders.classList.contains('hidden') && !refreshingView && !paymentPending.size && !orderQueues.size && !purgingOrders) runTask(() => renderAllSeatsAdmin(true));
+  if (isAdmin() && !state.me?.mustChangePassword && token && !document.hidden && !pageOrders.classList.contains('hidden') && !refreshingView && !paymentPending.size && !orderQueues.size && !purgingOrders) runTask(() => renderAllSeatsAdmin(true));
 }, 15_000);
 
 // 自動登入驗證（✅ /auth/me 現在統一回傳 { id, username, role }）
@@ -2829,6 +2989,7 @@ setInterval(() => {
     showLogin({ keepLoading: true });
     const me = await api('/auth/me');
     onLoginUser(me.user);
+    if (me.user?.mustChangePassword) return showInitialPasswordChange();
     await Promise.all([fetchOpenStatus(), fetchPreSettings()]);
     ensurePreorderUI();
     ensureUnpaidUI();

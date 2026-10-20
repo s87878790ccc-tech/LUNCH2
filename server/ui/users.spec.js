@@ -9,14 +9,15 @@ test('user creation synchronizes list, count, filters and numeric seats across n
   await expect(page.locator('#usersListTitle')).toContainText('共 37 筆');
   await page.locator('#userRoleFilter').selectOption('admin');
   await page.locator('#newUserName').fill('37');
-  await page.locator('#newUserPass').fill('abcde');
-  await page.locator('#createUserBtn').click();
-  await expect(page.locator('#createUserStatus')).toContainText('6 個字元');
-  expect(model.creates).toBe(0);
-  await page.locator('#newUserPass').fill('abcdef');
+  await expect(page.locator('#newUserPass')).toHaveCount(0);
   await page.locator('#createUserBtn').click();
   await expect(page.locator('#createUserStatus')).toContainText('已建立帳號「37」');
   await expect(page.locator('#createUserStatus')).toContainText('篩選條件未包含');
+  await expect(page.locator('#initialCredentialValue')).toHaveAttribute('type', 'password');
+  await expect(page.locator('#initialCredentialValue')).toHaveValue(model.lastInitialPassword);
+  expect((await page.locator('#usersTableBody').textContent()).includes(model.lastInitialPassword)).toBe(false);
+  await page.locator('#credentialClose').click();
+  await expect(page.locator('#initialCredentialValue')).toHaveValue('');
   await expect(page.locator('#userRoleFilter')).toHaveValue('admin');
   await expect(page.locator('#usersListTitle')).toContainText('共 38 筆');
   await page.locator('#userRoleFilter').selectOption('user');
@@ -50,12 +51,12 @@ test('create errors preserve inputs; a committed account with a list error has a
   const model = await fixture(page);
   await page.locator('#tabUsers').click();
   await expect(page.locator('#usersListTitle')).toContainText('共 37 筆');
-  await page.locator('#newUserName').fill('38'); await page.locator('#newUserPass').fill('abcdef');
+  await page.locator('#newUserName').fill('38');
   model.createFail = true;
   await page.locator('#createUserBtn').click();
   await expect(page.locator('#createUserStatus')).toContainText('建立失敗');
   await expect(page.locator('#newUserName')).toHaveValue('38');
-  await expect(page.locator('#newUserPass')).toHaveValue('abcdef');
+  await expect(page.locator('#newUserPass')).toHaveCount(0);
   expect(model.users.some(u => u.username === '38')).toBe(false);
   model.createFail = false; model.failListAfterCreate = true;
   let release; model.createGate = new Promise(resolve => { release = resolve; });
@@ -65,9 +66,31 @@ test('create errors preserve inputs; a committed account with a list error has a
   await expect(page.locator('#createUserStatus')).toContainText('已建立，但清單尚未同步');
   await expect(page.locator('#createUserBtn')).toBeEnabled();
   expect(model.creates).toBe(2);
+  await page.locator('#credentialClose').click();
   model.userListFail = false;
   await page.locator('#refreshUsers').click();
   await page.locator('#userSearch').fill('38');
   await expect(page.locator('#usersTableBody tr')).toHaveCount(1);
   await expect(page.locator('#usersTableBody')).toContainText('38');
+});
+
+
+test('first login chooses a six-character user password before any business request', async ({ page }) => {
+  const model = await fixture(page, 'https://127.0.0.1:4173', { role: 'user', mustChangePassword: true });
+  expect(model.calls.filter(call => !['/auth/login', '/auth/me'].includes(call.path))).toEqual([]);
+  await expect(page.locator('#app')).toBeHidden();
+  await page.locator('#initialOldPassword').fill(model.initialPassword);
+  await page.locator('#initialNewPassword').fill('abcde');
+  await page.locator('#initialConfirmPassword').fill('abcde');
+  await page.locator('#initialPasswordSubmit').click();
+  expect(model.calls.filter(call => call.path === '/users/3/password')).toHaveLength(0);
+  await page.locator('#initialNewPassword').fill('abcdef');
+  await page.locator('#initialConfirmPassword').fill('abcdef');
+  await page.locator('#initialPasswordSubmit').click();
+  await expect(page.locator('#passwordChangeLayer')).toBeHidden();
+  await expect(page.locator('#loginLayer')).toBeVisible();
+  expect(model.calls.filter(call => call.path === '/users/3/password')).toHaveLength(1);
+  await expect(page.locator('#initialOldPassword')).toHaveValue('');
+  await expect(page.locator('#initialNewPassword')).toHaveValue('');
+  expect(await page.evaluate(() => sessionStorage.getItem('jwt'))).toBeNull();
 });

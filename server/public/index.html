@@ -11,7 +11,7 @@
     <meta name="referrer" content="no-referrer" />
     <meta name="description" content="班級午餐訂餐、預訂及付款管理系統" />
     <title>班級午餐訂單系統</title>
-    <link rel="stylesheet" href="styles.css?v=4d8a796cf262" />
+    <link rel="stylesheet" href="styles.css?v=fb5c8cfdd895" />
   </head>
   <body>
     <!-- 登入層 -->
@@ -57,6 +57,23 @@
       </form>
     </div>
 
+    <section id="passwordChangeLayer" class="layer hidden" aria-labelledby="initialPasswordTitle" aria-hidden="true">
+      <form id="initialPasswordForm" class="card w400 login-card">
+        <h1 id="initialPasswordTitle">設定個人密碼</h1>
+        <p id="initialPasswordAccount"></p>
+        <p class="muted">這個帳號使用臨時密碼。請先設定只有自己知道的新密碼，再開始使用系統。</p>
+        <label for="initialOldPassword">目前的臨時密碼</label>
+        <input id="initialOldPassword" type="password" autocomplete="current-password" required maxlength="256" />
+        <label for="initialNewPassword">新密碼</label>
+        <input id="initialNewPassword" type="password" autocomplete="new-password" required minlength="6" maxlength="256" aria-describedby="initialPasswordHint" />
+        <label for="initialConfirmPassword">再次輸入新密碼</label>
+        <input id="initialConfirmPassword" type="password" autocomplete="new-password" required maxlength="256" />
+        <p id="initialPasswordHint" class="small muted"></p>
+        <p id="initialPasswordStatus" role="status" aria-live="polite"></p>
+        <div class="row"><button id="initialPasswordSubmit" type="submit" class="primary">設定新密碼</button><button id="initialPasswordLogout" type="button">登出</button></div>
+      </form>
+    </section>
+
     <!-- 主畫面 -->
     <div id="app" class="hidden">
       <header class="topbar">
@@ -66,6 +83,7 @@
         </div>
         <div class="account">
           <span id="whoami" class="pill"></span>
+          <button id="changeMyPasswordBtn" type="button" class="hidden">變更我的密碼</button>
           <button id="logoutBtn" title="登出會結束此帳號所有裝置的登入">登出</button>
         </div>
         <nav class="right" aria-label="主要功能">
@@ -608,22 +626,17 @@
           <h3>新增使用者</h3>
           <div class="row user-create-row">
             <input id="newUserName" placeholder="帳號" aria-label="帳號" />
-            <input
-              id="newUserPass"
-              placeholder="密碼至少需要 6 個字元"
-              type="password"
-              autocomplete="new-password"
-              minlength="6"
-              aria-label="新使用者密碼"
-              aria-describedby="newUserPasswordHint"
-            />
             <select id="newUserRole" aria-label="新使用者角色">
               <option value="user">user</option>
               <option value="admin">admin</option>
             </select>
+            <div id="newAdminActorPasswordFields" class="hidden">
+              <label for="newAdminActorPassword">目前管理員密碼</label>
+              <input id="newAdminActorPassword" type="password" autocomplete="current-password" maxlength="256" aria-describedby="newUserPasswordHint" />
+            </div>
             <button id="createUserBtn" class="primary">建立</button>
           </div>
-          <p id="newUserPasswordHint" class="small muted">一般使用者密碼至少需要 6 個字元；管理員至少 12 個字元。最多 72 個 UTF-8 位元組，前後空白不列入。</p>
+          <p id="newUserPasswordHint" class="small muted">系統為每個新帳號個別產生臨時密碼，僅向目前管理員顯示一次；使用者首次登入須自行設定密碼。一般使用者至少 6 個字元，管理員至少 12 個字元。</p>
           <p class="small muted">數字帳號即為座號，建立後同步加入點餐、預訂與全部座號；其他帳號可登入，但未對應訂餐座號。</p>
           <p id="createUserStatus" role="status" aria-live="polite"></p>
         </div>
@@ -666,6 +679,32 @@
       role="status"
       aria-live="polite"
     ></div>
+    <dialog id="credentialDialog" class="credential-dialog" aria-labelledby="credentialDialogTitle">
+      <div class="card">
+        <h2 id="credentialDialogTitle"></h2>
+        <p id="credentialDialogDescription"></p>
+        <form id="credentialActionForm" class="hidden">
+          <label for="credentialActorPassword" id="credentialActorPasswordLabel">你的目前管理員密碼</label>
+          <input id="credentialActorPassword" type="password" autocomplete="current-password" maxlength="256" required />
+          <div id="credentialNewPasswordFields" class="hidden">
+            <label for="credentialNewPassword">新的個人密碼</label>
+            <input id="credentialNewPassword" type="password" autocomplete="new-password" maxlength="256" />
+            <label for="credentialConfirmPassword">再次輸入新密碼</label>
+            <input id="credentialConfirmPassword" type="password" autocomplete="new-password" maxlength="256" />
+            <p id="credentialPasswordHint" class="small muted"></p>
+          </div>
+          <button id="credentialActionSubmit" type="submit" class="primary">確認</button>
+        </form>
+        <div id="initialCredentialPanel" class="hidden">
+          <label for="initialCredentialValue">僅顯示這一次的臨時密碼</label>
+          <input id="initialCredentialValue" type="password" autocomplete="off" readonly spellcheck="false" />
+          <button id="credentialReveal" type="button" aria-pressed="false">顯示臨時密碼</button>
+          <p class="small muted">請私下交給已核對身份的本人，勿貼至群組或公開文件。關閉後無法再次查看；遺失時須重新產生。</p>
+        </div>
+        <p id="credentialDialogStatus" role="status" aria-live="polite"></p>
+        <button id="credentialClose" type="button">關閉</button>
+      </div>
+    </dialog>
     <div
       id="imageLightbox"
       class="image-lightbox hidden"
@@ -685,6 +724,6 @@
       </div>
     </div>
 
-    <script src="app.js?v=c1bba27052b1"></script>
+    <script src="app.js?v=51f2fe3732ab"></script>
   </body>
 </html>
