@@ -11,5 +11,5 @@ module.exports = defineConfig({
     { name: 'webkit-mobile', use: { browserName: 'webkit', viewport: { width: 390, height: 1000 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 } },
     { name: 'mobile', use: { browserName: 'chromium', viewport: { width: 390, height: 1000 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 } },
   ],
-  webServer: { command: 'node scripts/serve-ui-test.js', url: 'https://127.0.0.1:4173', reuseExistingServer: false },
+  webServer: { ignoreHTTPSErrors: true, command: 'node scripts/serve-ui-test.js', url: 'https://127.0.0.1:4173', reuseExistingServer: false },
 });
