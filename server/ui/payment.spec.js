@@ -14,7 +14,7 @@ test('one-click payment and cancellation work on desktop and touch-sized screens
   await expect(page.locator('#seat-paid-3')).toBeDisabled();
   const box = await label.boundingBox();
   expect(box.height).toBeGreaterThanOrEqual(44);
-  const act = () => info.project.name === 'mobile' ? label.tap() : label.click();
+  const act = () => Boolean(info.project.use.hasTouch) ? label.tap() : label.click();
   await act(); await expect(checkbox).toBeChecked(); await expect(checkbox).toBeEnabled();
   await expect(label).toContainText('已付款');
   await expect(page.locator('#paymentSummary > div').nth(4)).toContainText('NT$ 290');

@@ -11,6 +11,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const multer = require('multer');
+const { PostgresRateStore, pruneRateLimits } = require('./rate-store');
 const { MAX_PRICE, badRequest, integer, validDate, booleanField, orderItems, inOpenWindow } = require('./validation');
 const { issueToken, verifyToken, sessionMatches, databaseConnectionConfig } = require('./security');
 const { currentContext, orderJSON, joinedOrders, assertReference, contentChanged, updatePayment } = require('./payments');
@@ -77,6 +78,7 @@ const SEAT_PASS_CONFIG = ensurePasswordFromEnv('SEAT_DEFAULT_PASS', {
 // 允許的前端網域（GitHub Pages）
 const ALLOW_ORIGINS = [
   'https://s87878790ccc-tech.github.io',
+  PUBLIC_BASE_URL,
   ...(process.env.CORS_ORIGINS || '').split(',').map(origin => origin.trim()).filter(Boolean),
 ];
 
@@ -157,16 +159,31 @@ function normalizePasswordInput(value = '') {
   return value.replace(/\u3000/g, ' ').trim();
 }
 
+// Normal server startup always uses the shared database. Imported isolated
+// tests retain memory stores unless explicitly testing the PostgreSQL adapter.
+const durableLimits = require.main === module || process.env.RATE_LIMIT_STORE === 'postgres';
+function protectedRateOptions(namespace, rawKey = req => req.ip) {
+  const options = {
+    handler(req, res, _next, settings) {
+      if (req.rateLimit.used === req.rateLimit.limit + 1) console.warn(JSON.stringify({ event: 'security.rate_limit', scope: namespace, status: 429 }));
+      res.status(429).json(settings.message);
+    },
+  };
+  if (!durableLimits) return { ...options, keyGenerator: rawKey };
+  const store = new PostgresRateStore((sql, params) => pool.query(sql, params), namespace, JWT_SECRET);
+  return { ...options, store, keyGenerator: req => store.key(rawKey(req)), passOnStoreError: false };
+}
 const loginLimiter = rateLimit({
   windowMs: 60_000,
   limit: 5,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
   message: { message: 'too many login attempts, please try again shortly' },
-  keyGenerator: req => `${req.ip}:${normalizeUsernameInput(getBody(req).username)}`,
+  ...protectedRateOptions('login-pair', req => `${req.ip}:${normalizeUsernameInput(getBody(req).username)}`),
   skipSuccessfulRequests: true,
 });
 const loginIpLimiter = rateLimit({
+  ...protectedRateOptions('login-ip'),
   windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false,
   skipSuccessfulRequests: true,
   message: { message: 'too many login attempts, please try again shortly' },
@@ -174,15 +191,15 @@ const loginIpLimiter = rateLimit({
 const loginAccountLimiter = rateLimit({
   windowMs: 60_000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false,
   skipSuccessfulRequests: true,
-  keyGenerator: req => crypto.createHash('sha256').update(normalizeUsernameInput(getBody(req).username)).digest('hex'),
+  ...protectedRateOptions('login-account', req => normalizeUsernameInput(getBody(req).username)),
   message: { message: 'too many login attempts, please try again shortly' },
 });
-const uploadLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
+const uploadLimiter = rateLimit({ ...protectedRateOptions('upload'), windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false });
 // The old-password check is another authentication surface. Key it to the
 // verified account, so changing IPs or target IDs cannot reset its allowance.
 const passwordChangeLimiter = rateLimit({
   windowMs: 60_000, limit: req => req.user.role === 'admin' ? 60 : 5,
-  keyGenerator: req => String(req.user.uid), standardHeaders: 'draft-7', legacyHeaders: false,
+  ...protectedRateOptions('password', req => String(req.user.uid)), standardHeaders: 'draft-7', legacyHeaders: false,
   message: { message: '密碼操作過於頻繁，請一分鐘後再試' },
 });
 const dummyPasswordHash = bcrypt.hashSync(crypto.randomBytes(32).toString('hex'), 10);
@@ -1421,10 +1438,24 @@ app.get('/api/logs', auth(), requireAdmin, asyncRoute(async (req, res) => {
   res.json({ logs: rows });
 }));
 
-// Root
-app.get('/', (req, res) => {
-  res.type('text').send('Lunch Orders API is running.\nTry GET /api/menus');
+// Serve the existing UI with real HTTP CSP / anti-framing headers. Only these
+// public assets are reachable; never expose the repository or server directory.
+const UI_DIR = path.join(__dirname, 'public');
+const uiSecurity = helmet({
+  frameguard: { action: 'deny' },
+  contentSecurityPolicy: { useDefaults: false, directives: {
+    defaultSrc: ["'none'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"],
+    connectSrc: ["'self'", PUBLIC_BASE_URL], imgSrc: ["'self'", PUBLIC_BASE_URL],
+    baseUri: ["'none'"], objectSrc: ["'none'"], formAction: ["'none'"], frameAncestors: ["'none'"],
+  } },
+  crossOriginEmbedderPolicy: false,
 });
+for (const [route, file] of [['/', 'index.html'], ['/index.html', 'index.html'], ['/app.js', 'app.js'], ['/styles.css', 'styles.css']]) {
+  app.get(route, uiSecurity, (_req, res) => {
+    res.set('Cache-Control', 'no-cache');
+    res.sendFile(path.join(UI_DIR, file));
+  });
+}
 
 app.use('/api', (_req, res) => res.status(404).json({ message: '找不到此 API' }));
 app.use((err, _req, res, next) => {
@@ -1455,6 +1486,13 @@ async function start() {
     // The versioned, non-destructive migration must be applied before release.
     await q('select order_date, order_batch, revision, payment_updated_at, payment_updated_by from orders limit 0');
     await q('select revision, payment_updated_at, payment_updated_by from preorders limit 0');
+    if (durableLimits) {
+      await q('select bucket, hits, expires_at from lunch_security.rate_limits limit 0');
+      const prune = () => pruneRateLimits((sql, params) => pool.query(sql, params))
+        .catch(() => console.warn('[security] rate_counter_cleanup_failed'));
+      await prune();
+      setInterval(prune, 60_000).unref();
+    }
     await seed();
     console.log('[tz check]', zonedNowInfo());
     return app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));

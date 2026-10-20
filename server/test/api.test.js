@@ -693,3 +693,21 @@ test('preorder payment is isolated by date and invalidates after an order edit',
   assert.equal((await readOrder(route)).paid, false);
   await as(request(app).put(route + '/paid'), user).send({ ...saved, paid: true }).expect(403);
 });
+
+
+test('existing UI is served with enforcing HTTP CSP and cannot expose server files', async () => {
+  const page = await request(app).get('/').expect(200);
+  assert.match(page.text, /班級午餐訂單系統/);
+  assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/);
+  assert.match(page.headers['content-security-policy'], /script-src 'self'/);
+  assert.doesNotMatch(page.headers['content-security-policy'], /sandbox/);
+  assert.equal(page.headers['x-frame-options'], 'DENY');
+  assert.equal(page.headers['cache-control'], 'no-cache');
+  await request(app).get('/app.js').expect(200);
+  await request(app).get('/styles.css').expect(200);
+  for (const url of ['/server.js', '/rate-store.js', '/package.json', '/.env', '/supabase/migrations']) {
+    await request(app).get(url).expect(404);
+  }
+  const preflight = await request(app).options('/api/auth/login').set('Origin', 'https://lunch2.onrender.com').set('Access-Control-Request-Method', 'POST').expect(204);
+  assert.equal(preflight.headers['access-control-allow-origin'], 'https://lunch2.onrender.com');
+});

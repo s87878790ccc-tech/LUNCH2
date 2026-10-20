@@ -1,16 +1,16 @@
 'use strict';
 const { expect } = require('@playwright/test');
-async function fixture(page) {
+async function fixture(page, origin = 'https://127.0.0.1:4173') {
   const date = '2026-10-19', batch = 'isolated-browser-batch';
   const empty = seat => ({ seat, orderId: seat, version: 0, date, batch, submitted: false, internalOnly: false, paid: false, items: [] });
   const model = { users: [{ id: 1, username: 'admin', role: 'admin', status: 'active' }, ...Array.from({ length: 36 }, (_, n) => ({ id: n+2, username: String(n+1), role: 'user', status: 'active' }))], creates: 0, fail: false, writes: 0, orders: Array.from({ length: 36 }, (_, i) => empty(i + 1)) };
   model.orders[0] = { ...empty(1), submitted: true, items: [{ id: 1, name: '測試雞腿飯', unitPrice: 95, qty: 2 }] };
   model.orders[1] = { ...empty(2), submitted: true, paid: true, items: [{ id: 2, name: '測試排骨飯', unitPrice: 100, qty: 1 }] };
   const user = { id: 1, username: 'admin', role: 'admin' };
-  const cors = { 'access-control-allow-origin': 'http://127.0.0.1:4173', 'access-control-allow-headers': 'authorization,content-type', 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS' };
+  const cors = { 'access-control-allow-origin': origin, 'access-control-allow-headers': 'authorization,content-type', 'access-control-allow-methods': 'GET,POST,PUT,DELETE,OPTIONS' };
   await page.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url());
-    if (url.origin === 'http://127.0.0.1:4173') return route.continue();
+    if (url.origin === origin) return route.continue();
     if (url.origin !== 'https://lunch2.onrender.com') return route.abort();
     const method = request.method(), path = url.pathname.replace(/^\/api/, '');
     if (method === 'OPTIONS') return route.fulfill({ status: 204, headers: cors });
@@ -57,7 +57,7 @@ async function fixture(page) {
     else return route.fulfill({ status: 500, json: { message: 'Unmocked isolated route: ' + path }, headers: cors });
     return route.fulfill({ json: structuredClone(response), headers: cors });
   });
-  await page.goto('/');
+  await page.goto(origin + '/');
   await page.locator('#loginUser').fill('admin');
   await page.locator('#loginPass').fill('isolated-browser-password');
   await page.getByRole('button', { name: '登入', exact: true }).click();

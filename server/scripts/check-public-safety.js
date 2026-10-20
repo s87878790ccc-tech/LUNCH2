@@ -19,6 +19,10 @@ for (const file of files.filter(name => /\.[cm]?[jt]s$/.test(name) && !name.star
   for (const match of source.matchAll(fallback)) unsafeDefaults.push(`${file}:${source.slice(0, match.index).split('\n').length}`);
 }
 const staleAssets = [];
+for (const asset of ['index.html', 'app.js', 'styles.css']) {
+  if (files.includes(`server/public/${asset}`) && !fs.readFileSync(path.join(root, 'docs', asset)).equals(fs.readFileSync(path.join(root, 'server/public', asset)))) staleAssets.push(`server/public/${asset}`);
+}
+
 if (files.includes('docs/index.html')) {
   const html = fs.readFileSync(path.join(root, 'docs/index.html'), 'utf8');
   for (const asset of ['app.js', 'styles.css']) {
