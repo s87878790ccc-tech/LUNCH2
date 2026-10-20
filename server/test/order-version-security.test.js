@@ -101,7 +101,11 @@ for (const route of ['/api/orders/2', '/api/preorders/' + date + '/2']) {
     if (route.startsWith('/api/preorders/')) assert.equal(initial.batch, null);
     await put(route, { ...initial, items: [item] }).expect(200);
     const first = await read(route);
-    for (const patch of [{ orderId: null }, { version: 0 }, { date: '2026-10-21' }, { batch: 'another-round' }])
+    // Derive a valid different day from this snapshot, not the wall clock or a
+    // fixed date. UTC handles leap/year boundaries; keep the upper date bound.
+    const differentDay = new Date(first.date + 'T00:00:00Z');
+    differentDay.setUTCDate(differentDay.getUTCDate() + (first.date === '9999-12-31' ? -1 : 1));
+    for (const patch of [{ orderId: null }, { version: 0 }, { date: differentDay.toISOString().slice(0, 10) }, { batch: 'another-round' }])
       await put(route, { ...first, ...patch, items: [{ ...item, qty: 9 }] }).expect(409);
     await put(route, { ...first, items: [{ ...item, qty: 2 }] }).expect(200);
     await put(route, { ...first, items: [{ ...item, qty: 3 }] }).expect(409);
@@ -140,8 +144,11 @@ test('L2-004: seat, payment, manual-price and order-window authorization remains
   assert.equal(saved.paid, true);
   await as(request(app).put('/api/settings/manual-order'), admin).send({ locked: true }).expect(200);
   await put(route, { ...saved, items: [{ ...item, unitPrice: 1 }] }).expect(403);
+  // Exclude this business day instead of assuming 00:00-00:00 is closed;
+  // the policy intentionally includes that exact minute at midnight.
+  const closedDay = new Date(saved.date + 'T00:00:00Z').getUTCDay();
   await as(request(app).put('/api/settings/open-window'), admin)
-    .send({ openDays: [0, 1, 2, 3, 4, 5, 6], openStart: '00:00', openEnd: '00:00' }).expect(200);
+    .send({ openDays: [(closedDay + 1) % 7], openStart: '00:00', openEnd: '23:59' }).expect(200);
   await put(route, { ...saved, items: [item] }).expect(403);
   saved = await read(route);
   assert.equal(saved.paid, true);
